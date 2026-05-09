@@ -106,53 +106,24 @@ nodes:
 
   - id: validate-yaml-frontmatter
     depends_on: [generate-symphony-content]
-    bash: |
-      #!/bin/bash
-      set -e
+    script: |
+      import { readFileSync } from 'fs';
 
-      if [ ! -f symphony.md ]; then
-        echo "ERROR: symphony.md was not created"
-        exit 1
-      fi
+      const content = readFileSync('symphony.md', 'utf-8');
+      const match = content.match(/^---\n([\s\S]*?)\n---/);
+      if (!match) throw new Error('No YAML front matter block found in symphony.md');
 
-      echo "symphony.md exists. Extracting YAML front matter..."
+      const fm = match[1];
+      const required = ['name', 'description', 'default_workflow', 'components', 'available_workflows'];
+      const missing = required.filter(f => !new RegExp(`^${f}:`, 'm').test(fm));
+      if (missing.length > 0) throw new Error(`Missing required fields: ${missing.join(', ')}`);
 
-      # Extract content between the first pair of --- delimiters
-      FRONTMATTER=$(awk 'BEGIN{found=0} /^---$/{if(found==1){exit} found=1; next} found{print}' symphony.md)
+      const nameMatch = fm.match(/^name:\s*(.+)/m);
+      const componentsCount = (fm.match(/^\s*- name:/gm) || []).length;
+      const workflowsCount = (fm.match(/^\s*- symphony\//gm) || []).length;
 
-      if [ -z "$FRONTMATTER" ]; then
-        echo "ERROR: No YAML front matter block found in symphony.md"
-        exit 1
-      fi
-
-      echo "--- extracted front matter ---"
-      echo "$FRONTMATTER"
-      echo "-----------------------------"
-      echo ""
-
-      if command -v python3 &>/dev/null; then
-        echo "$FRONTMATTER" | python3 - <<'PYEOF'
-      import sys, yaml
-      data = yaml.safe_load(sys.stdin.read())
-      required = ['name', 'description', 'default_workflow', 'components', 'available_workflows']
-      missing = [f for f in required if f not in data]
-      if missing:
-          print(f'ERROR: Missing required fields: {missing}')
-          sys.exit(1)
-      print('YAML front matter is valid!')
-      print(f'  name:                {data.get("name")}')
-      print(f'  components:          {len(data.get("components", []))} defined')
-      print(f'  available_workflows: {len(data.get("available_workflows", []))} defined')
-      PYEOF
-      else
-        echo "python3 not available — running field presence checks..."
-        for field in name description default_workflow components available_workflows; do
-          echo "$FRONTMATTER" | grep -q "^${field}:" \
-            && echo "OK  $field present" \
-            || { echo "ERROR: $field field missing"; exit 1; }
-        done
-        echo "Basic field validation passed."
-      fi
-
-      echo ""
-      echo "symphony.md generated and validated successfully."
+      console.log('symphony.md front matter validated successfully!');
+      console.log(`  name:                ${nameMatch?.[1]?.trim()}`);
+      console.log(`  components:          ${componentsCount} defined`);
+      console.log(`  available_workflows: ${workflowsCount} defined`);
+    runtime: bun
