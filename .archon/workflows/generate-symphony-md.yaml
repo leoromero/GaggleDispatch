@@ -1,12 +1,13 @@
 name: generate-symphony-md
 description: |
-  Use when: You need to create or regenerate the symphony.md self-description for any repository.
+  Use when: You need to create or regenerate the symphony.md routing document for any repository.
   Triggers: "generate symphony", "create symphony.md", "analyze repository and generate symphony",
             "build repository symphony documentation", "create repo symphony", "update symphony.md".
-  Does: Takes a language-agnostic snapshot of the repository root, then runs a Claude agent
-        that deeply explores the codebase using Read/Glob tools to understand all components,
-        their purposes, and their communication patterns — then generates a spec-compliant
-        symphony.md with YAML front matter and a Markdown narrative body.
+  Does: Takes a language-agnostic snapshot of the repo, then runs a Claude agent that reads key
+        source files to understand the repo's architecture and external integrations — and produces
+        a spec-compliant symphony.md focused on routing context: what does this repo do, what are
+        its meaningful functional components, and what external systems does it talk to. Internal
+        modules and implementation details are intentionally excluded.
   NOT for: Creating GitHub pull requests, pushing to remote repositories, or any GitHub-dependent workflows.
 
 nodes:
@@ -46,19 +47,29 @@ nodes:
     model: sonnet
     allowed_tools: [Read, Write, Glob]
     prompt: |
-      You are a senior engineer generating a `symphony.md` self-description file for this
-      repository. The file will be consumed by an automated orchestration system called
-      Symphony to route AI agent work to the right repositories.
+      You are generating a `symphony.md` self-description file for this repository.
 
-      Your job is to:
-      1. Use the repository snapshot below to identify what kind of codebase this is and
-         where the important files are.
-      2. Use the Read and Glob tools to explore the repository deeply enough to understand
-         every meaningful component, its purpose, and how it communicates with other systems.
-      3. Write a spec-compliant symphony.md to the repository root.
+      ## PURPOSE — READ THIS FIRST
 
-      Be thorough. Read source files, not just manifests. The output quality depends on how
-      well you understand the actual code.
+      `symphony.md` is NOT a developer handbook. It is a routing document consumed by an
+      automated Issue Analyzer (Claude) that decides: *"does this issue belong in this repo?"*
+
+      The Issue Analyzer reads every registered repo's `symphony.md` and picks which repos
+      should receive a given Linear issue. It needs to know:
+      - What problem does this repo solve?
+      - What are its major functional areas (components)?
+      - What external systems does it integrate with?
+
+      **What to include:** the repo's responsibility, its functional components at an
+      architectural level, and its external integrations.
+
+      **What to exclude:** build commands, test strategy, internal implementation details,
+      configuration file formats, lock file mechanics, internal helper modules. Internal
+      modules that are not meaningful routing targets should be grouped into their parent
+      component, not listed separately.
+
+      A good rule of thumb: if a Linear issue would never specifically target a component
+      in isolation, don't list it as a separate component.
 
       ---
 
@@ -70,77 +81,69 @@ nodes:
 
       ## SYMPHONY.MD SPECIFICATION
 
-      The `symphony.md` file has two parts:
+      The file has two parts:
 
-      ### PART 1 — YAML FRONT MATTER (required, machine-parsed)
+      ### PART 1 — YAML FRONT MATTER (machine-parsed by the Repo Syncer)
 
-      Delimited by `---` at the top of the file. Contains structured metadata.
+      Delimited by `---` at the top of the file.
 
       **Required fields:**
 
       - `name` (string)
-        A globally unique kebab-case alias for this repo within the Symphony system.
-        Derived from the project name in the manifest file (package.json, Cargo.toml,
-        go.mod, pyproject.toml, pom.xml, etc.) or the directory name if no manifest exists.
-        Pattern: `[a-z0-9][a-z0-9-]*[a-z0-9]` — lowercase, hyphens only, no leading/trailing hyphens.
+        Globally unique kebab-case alias. Derived from the project name in the manifest
+        (package.json `name`, go.mod module path leaf, Cargo.toml `[package] name`,
+        pyproject.toml `[project] name`, etc.) or the directory name if no manifest.
+        Pattern: `[a-z0-9][a-z0-9-]*[a-z0-9]`
 
       - `description` (string)
-        One to three dense sentences: what does this repo do and what is its role in the
-        broader system? This is the primary text the Issue Analyzer reads to decide if an
-        issue belongs here. Be informative, not generic.
+        1–3 dense sentences. What does this repo do and what is its role in the broader
+        system? This is the primary signal the Issue Analyzer uses. Make it specific.
 
       - `default_workflow` (string)
-        Always `symphony/symphony-fix-issue` unless you have specific knowledge of a
-        different workflow name for this repo.
+        Use `symphony/symphony-fix-issue` unless you have evidence of a different name.
 
-      - `components` (list)
-        Every meaningful deployable unit, library, service, worker, CLI, API, or data store
-        owned by this repository. At least one is required. Each component has:
+      - `components` (list, at least one required)
+        The repo's meaningful functional units — services, workers, CLIs, APIs, databases,
+        queues. Each has:
 
         - `name` (string, REQUIRED)
-          Globally unique kebab-case name. Will be referenced by other repos in their
-          `communicates_with` entries. Use a name that reflects the component's identity
-          in the broader system (e.g., `patient-ingestion-api`, `auth-worker`, `billing-db`).
+          Globally unique kebab-case. Other repos reference this name in their own
+          `communicates_with` entries. Use a name that identifies the component's role
+          in the broader system.
 
         - `description` (string, REQUIRED)
-          What this component does. Include enough context for the Issue Analyzer to
-          understand which issues affect it.
+          What this component does and why it exists. Write for the Issue Analyzer:
+          enough context to understand which issues affect this component.
 
         - `component_type` (string, RECOMMENDED)
-          Choose the best fit from: `ecs_service`, `lambda`, `sqs_queue`, `eventbridge_bus`,
-          `redshift`, `healthlake`, `rds`, `shared_lib`, `api_gateway`, `cli`, `worker`,
-          `frontend`, `backend`, `other`.
-          You may use additional values — they are preserved verbatim.
+          `ecs_service` | `lambda` | `sqs_queue` | `eventbridge_bus` | `redshift` |
+          `healthlake` | `rds` | `shared_lib` | `api_gateway` | `cli` | `worker` |
+          `frontend` | `backend` | `other`
 
         - `communicates_with` (list, RECOMMENDED)
-          How this component talks to other components or external systems. Each entry:
-          - `component` (string, REQUIRED) — kebab-case name of the target component.
-            For external systems (AWS services, third-party APIs), use descriptive names
-            like `linear-graphql-api`, `anthropic-claude-api`, `sqs-ingestion-queue`.
-          - `method` (string, REQUIRED) — mechanism: `sqs`, `http`, `grpc`, `eventbridge`,
-            `kinesis`, `library`, `database`, `s3`, `graphql`, `subprocess`, etc.
-          - `direction` (string, REQUIRED) — one of:
-            `produces`, `consumes`, `reads`, `writes`, `depends_on`, `bidirectional`.
+          External systems and other registered repos' components this component talks to.
+          Do NOT list internal library dependencies between modules in the same repo.
+          Each entry requires:
+          - `component`: kebab-case target name (use descriptive names for external systems:
+            `linear-graphql-api`, `anthropic-claude-api`, `sqs-patient-queue`, etc.)
+          - `method`: `sqs` | `http` | `grpc` | `eventbridge` | `kinesis` | `graphql` |
+            `database` | `s3` | `subprocess` | `library` | etc.
+          - `direction`: `produces` | `consumes` | `reads` | `writes` | `depends_on` | `bidirectional`
 
-        - `default_workflow` (string, OPTIONAL)
-          Per-component workflow override. Set only if this component needs a different
-          workflow than the repo-level default.
-
-      **Optional repo-level fields:**
+      **Optional fields:**
 
       - `available_workflows` (list of strings)
-        All Archon workflows available for this repo. Include `symphony/symphony-fix-issue`
-        plus any others you know about.
+        All Archon workflows available. Include `symphony/symphony-fix-issue` plus any others.
 
-      **Example front matter:**
+      **Example:**
 
       ```yaml
       ---
       name: patient-ingestion-service
       description: >
         Receives HL7 FHIR messages over HTTPS, validates them against schema rules, and
-        publishes inbound events to downstream queues for further processing.
-        Entry point for all patient data entering the system.
+        publishes inbound events to downstream processing queues. Entry point for all
+        patient data entering the system.
       default_workflow: symphony/symphony-fix-issue
       available_workflows:
         - symphony/symphony-fix-issue
@@ -149,9 +152,8 @@ nodes:
         - name: patient-ingestion-api
           component_type: ecs_service
           description: >
-            REST API surface that accepts FHIR payloads from external senders.
-            Handles authentication, rate limiting, and initial schema validation
-            before forwarding to the ingestion queue.
+            REST API that accepts FHIR payloads, handles auth and rate limiting,
+            and validates schema before forwarding to the ingestion queue.
           communicates_with:
             - component: ingestion-queue
               method: sqs
@@ -162,8 +164,8 @@ nodes:
         - name: ingestion-queue
           component_type: sqs_queue
           description: >
-            SQS queue that buffers validated inbound FHIR messages between the
-            ingestion API and the downstream processing workers.
+            Buffers validated inbound FHIR messages between the ingestion API
+            and downstream processing workers.
           communicates_with:
             - component: fhir-processor-worker
               method: sqs
@@ -171,42 +173,40 @@ nodes:
       ---
       ```
 
-      ### PART 2 — MARKDOWN BODY (required, read verbatim by the Issue Analyzer)
+      ### PART 2 — MARKDOWN BODY (read verbatim by the Issue Analyzer)
 
-      After the closing `---`, write a Markdown narrative covering:
+      After the closing `---`, write a focused architecture narrative:
 
-      - The repository's role and purpose in the broader system
-      - Key architectural decisions and patterns visible in the code
-      - How components interact with each other and with external systems
-      - Anything an AI agent needs to know to work effectively in this repo
-        (build commands, test strategy, important conventions, gotchas)
+      - The repo's role in the broader system and why it exists
+      - How its major components relate to each other
+      - What external systems it integrates with and why
+      - Any architectural constraints or boundaries that affect issue routing
+        (e.g. "this repo never writes to the database directly — all writes go through X")
 
-      This body is passed verbatim to Claude during issue analysis. Write it as if
-      briefing a new senior engineer who will be making changes here.
+      Keep it concise. 3–6 paragraphs. This is context for routing decisions, not
+      onboarding documentation.
 
       ---
 
       ## INSTRUCTIONS
 
-      1. Start by reading the most informative files first:
-         - Manifest files (package.json, Cargo.toml, go.mod, pyproject.toml, pom.xml,
-           build.gradle, mix.exs, etc.) for project name, dependencies, and scripts
-         - README or docs at the root
-         - Entry-point files (main.ts, main.go, main.py, src/index.ts, cmd/, etc.)
-         - Source directory structure to identify modules/services
+      1. Read the most informative files to understand the repo's architecture:
+         - Manifest files (package.json, go.mod, Cargo.toml, pyproject.toml, etc.)
+           for the project name and a sense of dependencies
+         - README at the root (if present)
+         - Entry-point files and top-level module structure
 
-      2. Read enough source files to accurately identify:
-         - All distinct components (services, workers, CLIs, libraries, queues, databases)
-         - What each component does (its responsibility, not just its name)
-         - How components communicate (HTTP calls, queue producers/consumers, imports,
-           subprocess spawns, database reads/writes, event emissions, etc.)
-         - What external systems or APIs the repo integrates with
+      2. Read enough source to identify the repo's functional components and external
+         integrations. You do not need to read every file — stop when you have a clear
+         picture of what the repo does, what it owns, and what it talks to externally.
 
-      3. Do NOT guess or hallucinate components. Only document what you can verify by
-         reading actual source files or configuration.
+      3. Apply the routing-document principle throughout:
+         - Group internal helpers/utilities/config under the component they serve
+         - Only surface components that are meaningful dispatch targets
+         - Only list `communicates_with` entries for external systems or other registered
+           repos — not for imports between modules within this repo
 
-      4. Write the final symphony.md using the Write tool to the file `symphony.md` in
-         the current working directory.
+      4. Write `symphony.md` to the working directory root using the Write tool.
 
   - id: validate-yaml-frontmatter
     depends_on: [analyze-and-generate]
