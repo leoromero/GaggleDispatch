@@ -108,8 +108,18 @@ function stateToJson(workspaceName: string, state: OrchestratorState): unknown {
       due_at_ms: r.due_at_ms,
       error: r.error,
     })),
-    claimed: Array.from(state.claimed),
-    completed_count: state.completed.size,
+    claimed: (() => {
+      const out: string[] = [];
+      for (const [pid, sm] of state.parent_machine_states) {
+        if (sm === 'analyzing' || sm === 'claimed') out.push(pid);
+      }
+      return out;
+    })(),
+    completed_count: (() => {
+      let n = 0;
+      for (const [, sm] of state.target_machine_states) if (sm === 'succeeded') n++;
+      return n;
+    })(),
     claude_totals: state.claude_totals,
     detached_archon_runs: Array.from(state.detached_archon_runs.entries()).map(([key, d]) => ({
       worker_key: key,

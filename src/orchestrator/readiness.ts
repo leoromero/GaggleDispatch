@@ -67,8 +67,8 @@ export function repoTargetReady(
     const subId = subMap?.get(upstreamAlias) ?? null;
 
     if (subId === null) {
-      // Upstream not dispatched yet
-      if (readyWhen === 'merged' && state.completed.has(workerKey(parent_issue_id, upstreamAlias))) {
+      // Upstream not dispatched yet — but its SM state may already be succeeded.
+      if (readyWhen === 'merged' && state.target_machine_states.get(workerKey(parent_issue_id, upstreamAlias)) === 'succeeded') {
         continue;
       }
       return false;

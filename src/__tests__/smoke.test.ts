@@ -383,9 +383,9 @@ describe('readiness predicate', () => {
       expect(repoTargetReady(makeTarget(['be']), 'p1', state, mergedCfg)).toBe(false);
     });
 
-    test('returns true when upstream already in state.completed (no sibling entry needed)', () => {
+    test('returns true when upstream is in target_machine_states succeeded (no sibling entry needed)', () => {
       const state = createInitialState({ polling: { interval_ms: 1 }, agent: { max_concurrent_agents: 2 } } as unknown as ServiceConfig);
-      state.completed.add(workerKey('p1', 'be'));
+      state.target_machine_states.set(workerKey('p1', 'be'), 'succeeded');
       // No sibling_subissues — relies on completed set
       expect(repoTargetReady(makeTarget(['be']), 'p1', state, mergedCfg)).toBe(true);
     });
@@ -394,7 +394,7 @@ describe('readiness predicate', () => {
       const deployedTarget = makeTarget(['be'], 'deployed');
       const state = createInitialState({ polling: { interval_ms: 1 }, agent: { max_concurrent_agents: 2 } } as unknown as ServiceConfig);
       // Key in completed but no sibling entry or snapshot → ready_when=deployed does NOT short-circuit
-      state.completed.add(workerKey('p1', 'be'));
+      state.target_machine_states.set(workerKey('p1', 'be'), 'succeeded');
       expect(repoTargetReady(deployedTarget, 'p1', state, baseCfg)).toBe(false);
     });
 
