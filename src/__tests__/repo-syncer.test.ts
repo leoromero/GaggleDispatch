@@ -97,19 +97,19 @@ process.exit(2);
   }
 }
 
-const SYMPHONY_MD_OK = `---
+const GAGGLE_MD_OK = `---
 name: test-repo
 description: A test repo.
-default_workflow: symphony/symphony-fix-issue
+default_workflow: gaggle/gaggle-fix-issue
 available_workflows:
-  - symphony/symphony-fix-issue
+  - gaggle/gaggle-fix-issue
 components:
   - name: test-api
     description: API service.
     component_type: ecs_service
 ---
 
-Body of the symphony.md.
+Body of the gaggle.md.
 `;
 
 let gitOk = false;
@@ -139,13 +139,13 @@ afterAll(() => {
 });
 
 describe('Repo Syncer integration', () => {
-  test('end-to-end: clones, parses symphony.md, writes registry.synced.yaml', async () => {
+  test('end-to-end: clones, parses gaggle.md, writes registry.synced.yaml', async () => {
     if (!gitOk || !nodeOk) {
       // Cannot run without git + node available in PATH
       return;
     }
 
-    const { bare, sha } = await makeBareWithFiles({ 'symphony.md': SYMPHONY_MD_OK });
+    const { bare, sha } = await makeBareWithFiles({ 'gaggle.md': GAGGLE_MD_OK });
 
     const shimDir = resolve(tmp('gaggle-shim-'));
     writeGhShim(shimDir, { 'test-org/test-repo': sha });
@@ -156,7 +156,7 @@ describe('Repo Syncer integration', () => {
         base_folder: baseFolder,
         sync_interval_ms: 0,
         sync_on_startup: false,
-        analysis_cache_ttl_ms: 0,
+        analysis_cache_ttl_ms: 0, auto_scaffold: false,
       },
       repositories: [{ url: 'https://github.com/test-org/test-repo', default_branch: 'main' }],
     });
@@ -183,42 +183,42 @@ describe('Repo Syncer integration', () => {
     expect(existsSync(syncedRegistryPath(baseFolder))).toBe(true);
   });
 
-  test('end-to-end: missing symphony.md results in sync_status=missing_symphony_md', async () => {
+  test('end-to-end: missing gaggle.md results in sync_status=missing_gaggle_md', async () => {
     if (!gitOk || !nodeOk) return;
 
     const { bare, sha } = await makeBareWithFiles({ 'README.md': '# only a readme' });
     const shimDir = resolve(tmp('gaggle-shim-'));
-    writeGhShim(shimDir, { 'test-org/no-symphony': sha });
+    writeGhShim(shimDir, { 'test-org/no-gaggle': sha });
 
     const baseFolder = resolve(tmp('gaggle-base-'));
     const cfg = makeServiceConfig({
-      registry: { base_folder: baseFolder, sync_interval_ms: 0, sync_on_startup: false, analysis_cache_ttl_ms: 0 },
-      repositories: [{ url: 'https://github.com/test-org/no-symphony', default_branch: 'main' }],
+      registry: { base_folder: baseFolder, sync_interval_ms: 0, sync_on_startup: false, analysis_cache_ttl_ms: 0, auto_scaffold: false },
+      repositories: [{ url: 'https://github.com/test-org/no-gaggle', default_branch: 'main' }],
     });
 
     const sep = process.platform === 'win32' ? ';' : ':';
     process.env.PATH = `${shimDir}${sep}${savedPath}`;
     process.env.GIT_CONFIG_COUNT = '1';
     process.env.GIT_CONFIG_KEY_0 = 'url.' + asUnixPath(bare) + '.insteadOf';
-    process.env.GIT_CONFIG_VALUE_0 = 'https://github.com/test-org/no-symphony';
+    process.env.GIT_CONFIG_VALUE_0 = 'https://github.com/test-org/no-gaggle';
 
     const result = await runSyncPass(cfg, { quiet: true });
     expect(result.missing).toBe(1);
-    expect(result.per_repo[0]!.sync_status).toBe('missing_symphony_md');
-    expect(result.per_repo[0]!.sync_error).toMatch(/No symphony.md/i);
+    expect(result.per_repo[0]!.sync_status).toBe('missing_gaggle_md');
+    expect(result.per_repo[0]!.sync_error).toMatch(/No gaggle.md/i);
   });
 
   test('end-to-end: gh failure → sync_status=error and other repos still processed', async () => {
     if (!gitOk || !nodeOk) return;
 
-    const okBuild = await makeBareWithFiles({ 'symphony.md': SYMPHONY_MD_OK });
+    const okBuild = await makeBareWithFiles({ 'gaggle.md': GAGGLE_MD_OK });
     // Second repo: gh shim DELIBERATELY does not include this repo's mapping → exits 2.
     const shimDir = resolve(tmp('gaggle-shim-'));
     writeGhShim(shimDir, { 'test-org/test-repo': okBuild.sha });
 
     const baseFolder = resolve(tmp('gaggle-base-'));
     const cfg = makeServiceConfig({
-      registry: { base_folder: baseFolder, sync_interval_ms: 0, sync_on_startup: false, analysis_cache_ttl_ms: 0 },
+      registry: { base_folder: baseFolder, sync_interval_ms: 0, sync_on_startup: false, analysis_cache_ttl_ms: 0, auto_scaffold: false },
       repositories: [
         { url: 'https://github.com/test-org/test-repo', default_branch: 'main' },
         { url: 'https://github.com/test-org/missing-repo', default_branch: 'main' },
@@ -245,7 +245,7 @@ describe('Repo Syncer integration', () => {
     // But ensureGhAvailable is called first and would succeed (real gh in PATH).
     const baseFolder = resolve(tmp('gaggle-base-'));
     const cfg = makeServiceConfig({
-      registry: { base_folder: baseFolder, sync_interval_ms: 0, sync_on_startup: false, analysis_cache_ttl_ms: 0 },
+      registry: { base_folder: baseFolder, sync_interval_ms: 0, sync_on_startup: false, analysis_cache_ttl_ms: 0, auto_scaffold: false },
       repositories: [
         { url: 'https://github.com/org-a/dup', default_branch: 'main' },
         { url: 'https://github.com/org-b/dup', default_branch: 'main' },
@@ -263,11 +263,11 @@ describe('applyNameCollisions edge cases', () => {
   test('passes through entries that are not status=ok', () => {
     const entries: SyncedRegistryRepoEntry[] = [
       makeSyncedEntry({ slug: 'a', sync_status: 'error', frontmatter: null }),
-      makeSyncedEntry({ slug: 'b', sync_status: 'missing_symphony_md', frontmatter: null }),
+      makeSyncedEntry({ slug: 'b', sync_status: 'missing_gaggle_md', frontmatter: null }),
     ];
     const out = applyNameCollisions(entries);
     expect(out[0]!.sync_status).toBe('error');
-    expect(out[1]!.sync_status).toBe('missing_symphony_md');
+    expect(out[1]!.sync_status).toBe('missing_gaggle_md');
   });
 
   test('flags only the LATER duplicate when two repos share a name', () => {

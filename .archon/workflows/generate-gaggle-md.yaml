@@ -1,11 +1,11 @@
-name: generate-symphony-md
+name: generate-gaggle-md
 description: |
-  Use when: You need to create or regenerate the symphony.md routing document for any repository.
-  Triggers: "generate symphony", "create symphony.md", "analyze repository and generate symphony",
-            "build repository symphony documentation", "create repo symphony", "update symphony.md".
+  Use when: You need to create or regenerate the gaggle.md routing document for any repository.
+  Triggers: "generate gaggle", "create gaggle.md", "analyze repository and generate gaggle",
+            "build repository gaggle documentation", "create repo gaggle", "update gaggle.md".
   Does: Takes a language-agnostic snapshot of the repo, then runs a Claude agent that reads key
         source files to understand the repo's architecture and external integrations — and produces
-        a spec-compliant symphony.md focused on routing context: what does this repo do, what are
+        a spec-compliant gaggle.md focused on routing context: what does this repo do, what are
         its meaningful functional components, and what external systems does it talk to. Internal
         modules and implementation details are intentionally excluded.
   NOT for: Creating GitHub pull requests, pushing to remote repositories, or any GitHub-dependent workflows.
@@ -47,14 +47,14 @@ nodes:
     model: sonnet
     allowed_tools: [Read, Write, Glob]
     prompt: |
-      You are generating a `symphony.md` self-description file for this repository.
+      You are generating a `gaggle.md` self-description file for this repository.
 
       ## PURPOSE — READ THIS FIRST
 
-      `symphony.md` is NOT a developer handbook. It is a routing document consumed by an
+      `gaggle.md` is NOT a developer handbook. It is a routing document consumed by an
       automated Issue Analyzer (Claude) that decides: *"does this issue belong in this repo?"*
 
-      The Issue Analyzer reads every registered repo's `symphony.md` and picks which repos
+      The Issue Analyzer reads every registered repo's `gaggle.md` and picks which repos
       should receive a given Linear issue. It needs to know:
       - What problem does this repo solve?
       - What are its major functional areas (components)?
@@ -79,7 +79,7 @@ nodes:
 
       ---
 
-      ## SYMPHONY.MD SPECIFICATION
+      ## GAGGLE.MD SPECIFICATION
 
       The file has two parts:
 
@@ -100,7 +100,7 @@ nodes:
         system? This is the primary signal the Issue Analyzer uses. Make it specific.
 
       - `default_workflow` (string)
-        Use `symphony/symphony-fix-issue` unless you have evidence of a different name.
+        Use `gaggle/gaggle-fix-issue` unless you have evidence of a different name.
 
       - `components` (list, at least one required)
         The repo's meaningful functional units — services, workers, CLIs, APIs, databases,
@@ -133,7 +133,7 @@ nodes:
       **Optional fields:**
 
       - `available_workflows` (list of strings)
-        All Archon workflows available. Include `symphony/symphony-fix-issue` plus any others.
+        All Archon workflows available. Include `gaggle/gaggle-fix-issue` plus any others.
 
       **Example:**
 
@@ -144,10 +144,10 @@ nodes:
         Receives HL7 FHIR messages over HTTPS, validates them against schema rules, and
         publishes inbound events to downstream processing queues. Entry point for all
         patient data entering the system.
-      default_workflow: symphony/symphony-fix-issue
+      default_workflow: gaggle/gaggle-fix-issue
       available_workflows:
-        - symphony/symphony-fix-issue
-        - symphony/symphony-supervised
+        - gaggle/gaggle-fix-issue
+        - gaggle/gaggle-supervised
       components:
         - name: patient-ingestion-api
           component_type: ecs_service
@@ -206,16 +206,16 @@ nodes:
          - Only list `communicates_with` entries for external systems or other registered
            repos — not for imports between modules within this repo
 
-      4. Write `symphony.md` to the working directory root using the Write tool.
+      4. Write `gaggle.md` to the working directory root using the Write tool.
 
   - id: validate-yaml-frontmatter
     depends_on: [analyze-and-generate]
     script: |
       import { readFileSync } from 'fs';
 
-      const content = readFileSync('symphony.md', 'utf-8');
+      const content = readFileSync('gaggle.md', 'utf-8');
       const match = content.match(/^---\n([\s\S]*?)\n---/);
-      if (!match) throw new Error('No YAML front matter block found in symphony.md');
+      if (!match) throw new Error('No YAML front matter block found in gaggle.md');
 
       const fm = match[1];
       const required = ['name', 'description', 'default_workflow', 'components'];
@@ -231,11 +231,11 @@ nodes:
       const componentsCount = (fm.match(/^\s{2}-\s+name:/gm) || []).length;
       if (componentsCount === 0) throw new Error('components list is empty — at least one component is required');
 
-      const workflowsCount = (fm.match(/^\s*-\s+symphony\//gm) || []).length;
+      const workflowsCount = (fm.match(/^\s*-\s+gaggle\//gm) || []).length;
       const hasBody = content.split(/\n---\n/)[1]?.trim().length > 0;
       if (!hasBody) throw new Error('Markdown body after front matter is empty');
 
-      console.log('symphony.md validated successfully');
+      console.log('gaggle.md validated successfully');
       console.log(`  name:                ${name}`);
       console.log(`  components:          ${componentsCount}`);
       console.log(`  available_workflows: ${workflowsCount}`);

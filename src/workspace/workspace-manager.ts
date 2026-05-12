@@ -15,7 +15,7 @@ import type { Issue, RepoTarget, ServiceConfig } from '../domain/types.ts';
 import { logger } from '../util/logger.ts';
 import { isInside, sanitizeId } from '../util/paths.ts';
 import { run, runOrThrow } from '../util/subprocess.ts';
-import { reposBaseDir } from '../registry/synced-registry.ts';
+import { resolveReposDir } from '../registry/synced-registry.ts';
 import { syncWorkflowTemplates } from './templates.ts';
 
 export class WorkspaceManager {
@@ -25,7 +25,7 @@ export class WorkspaceManager {
     if (!target.local_path) {
       throw new InvalidWorkspaceCwd(`RepoTarget '${target.repo_alias}' has empty local_path`);
     }
-    const baseRepos = reposBaseDir(this.cfg.registry.base_folder);
+    const baseRepos = resolveReposDir(this.cfg);
     if (!isInside(target.local_path, baseRepos)) {
       throw new InvalidWorkspaceCwd(
         `RepoTarget.local_path (${target.local_path}) MUST be inside ${baseRepos}`,
@@ -66,13 +66,11 @@ export class WorkspaceManager {
     if (!script || !script.trim()) return;
 
     const env: Record<string, string> = {
-      SYMPHONY_REPO_ALIAS: target.repo_alias,
-      SYMPHONY_REPO_URL: target.repo_url,
-      SYMPHONY_ISSUE_ID: issue.id,
-      SYMPHONY_ISSUE_IDENTIFIER: issue.identifier,
-      SYMPHONY_ATTEMPT: attempt === null ? 'first' : String(attempt),
       GAGGLE_REPO_ALIAS: target.repo_alias,
+      GAGGLE_REPO_URL: target.repo_url,
+      GAGGLE_ISSUE_ID: issue.id,
       GAGGLE_ISSUE_IDENTIFIER: issue.identifier,
+      GAGGLE_ATTEMPT: attempt === null ? 'first' : String(attempt),
     };
 
     const shell = process.platform === 'win32' ? ['cmd', '/c'] : ['/bin/sh', '-c'];

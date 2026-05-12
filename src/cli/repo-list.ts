@@ -45,7 +45,7 @@ export async function runRepoList(opts: { cwd?: string; json?: boolean }): Promi
   for (const r of rows) {
     const statusColor =
       r.status === 'ok' ? chalk.green :
-      r.status === 'missing_symphony_md' ? chalk.yellow :
+      r.status === 'missing_gaggle_md' ? chalk.yellow :
       r.status === 'error' ? chalk.red :
       chalk.gray;
     console.log(

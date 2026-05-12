@@ -13,14 +13,22 @@ import { runRepoRemove } from './repo-remove.ts';
 import { runRepoList } from './repo-list.ts';
 import { runRepoScaffold, runScaffoldStatus, runScaffoldCancel } from './scaffold.ts';
 import { runSync } from './sync.ts';
-import { runStatus } from './status.ts';
+import { runStatus, runPs } from './status.ts';
 import { runStart } from './start.ts';
+import { runTemplatesUpdate } from './templates-update.ts';
+import {
+  runHubAdd,
+  runHubInit,
+  runHubList,
+  runHubRemove,
+  runHubStart,
+  runHubStatus,
+} from './hub.ts';
 import { GaggleError } from '../domain/errors.ts';
 
 const program = new Command();
 program
   .name('gaggle')
-  .alias('symphony')
   .description('GaggleDispatch — federated multi-repo AI coding orchestrator')
   .version('0.1.0')
   .option('--cwd <path>', 'working directory containing WORKFLOW.md');
@@ -76,7 +84,7 @@ repo
 
 repo
   .command('scaffold <url>')
-  .description('Generate a draft symphony.md PR via Archon (blocking; --async to detach)')
+  .description('Generate a draft gaggle.md PR via Archon (blocking; --async to detach)')
   .option('--async', 'detach and return immediately')
   .option('--branch <name>', 'override the working branch')
   .option('--message <text>', 'override the user message passed to Archon')
@@ -131,12 +139,88 @@ program
     await runStatus({ cwd: program.opts().cwd, json: opts.json });
   });
 
+// ── ps ──────────────────────────────────────────────────────────────────────
+program
+  .command('ps')
+  .description('Show live orchestrator state by querying Linear gaggle labels')
+  .action(async () => {
+    await runPs({ cwd: program.opts().cwd });
+  });
+
+// ── templates ───────────────────────────────────────────────────────────────
+const templates = program.command('templates').description('Manage workflow templates');
+
+templates
+  .command('update')
+  .description('Overwrite workflow templates with the bundled defaults')
+  .option('--dry-run', 'show what would change without writing anything')
+  .action(async (opts: { dryRun?: boolean }) => {
+    await runTemplatesUpdate({ cwd: program.opts().cwd, dry: opts.dryRun });
+  });
+
 // ── start ───────────────────────────────────────────────────────────────────
 program
   .command('start')
   .description('Start the orchestrator service')
+  .option('--api-port <port>', 'expose the local HTTP API on this port (0 = auto)')
+  .option('--workspace-name <name>', 'workspace name reported via the API (defaults to project dir name)')
+  .action(async (opts: { apiPort?: string; workspaceName?: string }) => {
+    const apiPort = opts.apiPort !== undefined ? Number(opts.apiPort) : undefined;
+    if (apiPort !== undefined && !Number.isFinite(apiPort)) {
+      console.error(chalk.red(`✗ --api-port must be a number`));
+      process.exit(1);
+    }
+    await runStart({ cwd: program.opts().cwd, apiPort, workspaceName: opts.workspaceName });
+  });
+
+// ── hub ─────────────────────────────────────────────────────────────────────
+const hub = program.command('hub').description('Manage multiple gaggles and the dashboard UI');
+
+hub
+  .command('init')
+  .description('Create the hub config file at ~/.config/gaggle/hub.yaml')
   .action(async () => {
-    await runStart({ cwd: program.opts().cwd });
+    await runHubInit();
+  });
+
+hub
+  .command('add <path>')
+  .description('Register a gaggle workspace (a directory containing WORKFLOW.md)')
+  .option('--name <name>', 'override the workspace name (defaults to directory name)')
+  .option('--color <hex>', 'override the assigned color (e.g. #4f9cf9)')
+  .action(async (path: string, opts: { name?: string; color?: string }) => {
+    await runHubAdd({ path, name: opts.name, color: opts.color });
+  });
+
+hub
+  .command('remove <name>')
+  .description('Unregister a gaggle workspace')
+  .action(async (name: string) => {
+    await runHubRemove({ name });
+  });
+
+hub
+  .command('list')
+  .description('List registered workspaces and their live status')
+  .option('--json', 'machine-readable output')
+  .action(async (opts: { json?: boolean }) => {
+    await runHubList({ json: opts.json });
+  });
+
+hub
+  .command('status')
+  .description('Show status of each workspace (via sidecar files; hub need not be running)')
+  .option('--json', 'machine-readable output')
+  .action(async (opts: { json?: boolean }) => {
+    await runHubStatus({ json: opts.json });
+  });
+
+hub
+  .command('start')
+  .description('Start every registered workspace + the dashboard UI')
+  .option('--only <names...>', 'only start the named workspaces')
+  .action(async (opts: { only?: string[] }) => {
+    await runHubStart({ only: opts.only });
   });
 
 program.parseAsync(process.argv).catch((err) => {

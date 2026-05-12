@@ -9,7 +9,7 @@ import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import * as YAML from 'yaml';
 import { SyncedRegistryParseError } from '../domain/errors.ts';
-import type { SyncedRegistry } from '../domain/types.ts';
+import type { ServiceConfig, SyncedRegistry } from '../domain/types.ts';
 import { writeFileAtomic } from '../util/fs.ts';
 
 export function syncedRegistryPath(baseFolder: string): string {
@@ -18,6 +18,14 @@ export function syncedRegistryPath(baseFolder: string): string {
 
 export function reposBaseDir(baseFolder: string): string {
   return join(baseFolder, 'repos');
+}
+
+/**
+ * Resolve the directory where repo checkouts live, honouring `registry.repos_path`
+ * when set (allows reuse of existing developer checkouts without duplicate clones).
+ */
+export function resolveReposDir(cfg: ServiceConfig): string {
+  return cfg.registry.repos_path ?? reposBaseDir(cfg.registry.base_folder);
 }
 
 export function loadSyncedRegistry(baseFolder: string): SyncedRegistry | null {

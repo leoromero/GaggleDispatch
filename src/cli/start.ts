@@ -3,6 +3,7 @@
  */
 
 import chalk from 'chalk';
+import { basename } from 'node:path';
 import { commandExists } from '../util/subprocess.ts';
 import { loadConfig, fatal } from './common.ts';
 import { runSyncPass, startPeriodicSyncer } from '../registry/repo-syncer.ts';
@@ -13,20 +14,27 @@ import { WorkspaceManager } from '../workspace/workspace-manager.ts';
 import { Orchestrator } from '../orchestrator/orchestrator.ts';
 import { logger } from '../util/logger.ts';
 import { watchFile } from '../config/watcher.ts';
+import { startGaggleApi } from '../hub/gaggle-api.ts';
+import { writeSidecar, removeSidecar } from '../hub/sidecar.ts';
 
-export async function runStart(opts: { cwd?: string }): Promise<void> {
+export async function runStart(opts: {
+  cwd?: string;
+  apiPort?: number;
+  workspaceName?: string;
+}): Promise<void> {
   const cfg = loadConfig({ cwd: opts.cwd });
 
   console.log(chalk.cyan('Preflight checks…'));
   if (!(await commandExists('gh'))) fatal(`'gh' CLI not found in PATH.`);
   if (!(await commandExists('git'))) fatal(`'git' not found in PATH.`);
   if (!cfg.tracker.api_key) fatal(`tracker.api_key (LINEAR_API_KEY) is empty after $VAR resolution.`);
-  if (!cfg.claude.api_key) fatal(`claude.api_key (ANTHROPIC_API_KEY) is empty after $VAR resolution.`);
+  // Claude auth is handled by the subprocess env (CLAUDE_API_KEY / CLAUDE_CODE_OAUTH_TOKEN /
+  // CLAUDE_USE_GLOBAL_AUTH). No preflight check needed here — auth failures surface at analysis time.
 
   // Startup warnings (Section 6.3)
   if (cfg.tracker.gate_waiting_state && cfg.tracker.active_states.includes(cfg.tracker.gate_waiting_state)) {
     logger.warn(
-      `gate_waiting_state "${cfg.tracker.gate_waiting_state}" is also listed in active_states; gated issues will re-surface as dispatch candidates and rely solely on the symphony:claimed label to avoid re-dispatch — configure a state outside active_states for a true parked lane.`,
+      `gate_waiting_state "${cfg.tracker.gate_waiting_state}" is also listed in active_states; gated issues will re-surface as dispatch candidates and rely solely on the gaggle:claimed label to avoid re-dispatch — configure a state outside active_states for a true parked lane.`,
     );
   }
   if (cfg.tracker.gate_resume_state && !cfg.tracker.active_states.includes(cfg.tracker.gate_resume_state)) {
@@ -43,7 +51,7 @@ export async function runStart(opts: { cwd?: string }): Promise<void> {
   const registry = startRegistryLoader(cfg);
   const ctx = registry.getContext();
   if (ctx.repositories.length === 0) {
-    fatal('Registry context has no repositories with sync_status=ok. Add a symphony.md to at least one registered repo.');
+    fatal('Registry context has no repositories with sync_status=ok. Add a gaggle.md to at least one registered repo.');
   }
 
   const tracker = new LinearClient(cfg);
@@ -62,11 +70,38 @@ export async function runStart(opts: { cwd?: string }): Promise<void> {
     orchestrator.invalidateAnalysisCache();
   });
 
+  // Optional local HTTP API server (used by the hub or when running standalone
+  // and wanting the dashboard). Started when --api-port is passed (0 = auto).
+  const wantApi = opts.apiPort !== undefined;
+  const apiHandle = wantApi
+    ? startGaggleApi({
+        port: opts.apiPort ?? 0,
+        workspaceName: opts.workspaceName ?? basename(cfg.project_dir),
+        getState: () => orchestrator.getState(),
+      })
+    : null;
+
+  if (apiHandle) {
+    writeSidecar(cfg.project_dir, {
+      pid: process.pid,
+      api_port: apiHandle.port,
+      api_url: apiHandle.url,
+      workspace_name: opts.workspaceName ?? basename(cfg.project_dir),
+      workflow_md_path: cfg.workflow_md_path,
+      started_at: new Date().toISOString(),
+    });
+    console.log(chalk.cyan(`API server listening at ${apiHandle.url}`));
+  }
+
   let shuttingDown = false;
   const shutdown = async (signal: string) => {
     if (shuttingDown) return;
     shuttingDown = true;
     console.log(chalk.yellow(`\nReceived ${signal}, shutting down…`));
+    if (apiHandle) {
+      await apiHandle.stop();
+      removeSidecar(cfg.project_dir);
+    }
     syncer.stop();
     await wfWatch.close();
     await registry.close();

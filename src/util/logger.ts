@@ -58,6 +58,21 @@ function now(): string {
   return new Date().toISOString();
 }
 
+export interface LogEvent {
+  ts: string;
+  level: LogLevel;
+  message: string;
+  context: LogContext;
+}
+
+type LogSubscriber = (ev: LogEvent) => void;
+const subscribers = new Set<LogSubscriber>();
+
+export function subscribeLogs(fn: LogSubscriber): () => void {
+  subscribers.add(fn);
+  return () => subscribers.delete(fn);
+}
+
 function emit(level: LogLevel, msg: string, ctx: LogContext): void {
   if (LEVELS[level] < LEVELS[DEFAULT_LEVEL]) return;
   const ts = now();
@@ -73,6 +88,17 @@ function emit(level: LogLevel, msg: string, ctx: LogContext): void {
       appendFileSync(LOG_FILE, line + '\n', 'utf8');
     } catch {
       /* ignore */
+    }
+  }
+
+  if (subscribers.size > 0) {
+    const ev: LogEvent = { ts, level, message: msg, context: ctx };
+    for (const sub of subscribers) {
+      try {
+        sub(ev);
+      } catch {
+        /* ignore subscriber errors */
+      }
     }
   }
 }

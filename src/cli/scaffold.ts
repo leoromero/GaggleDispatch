@@ -10,26 +10,49 @@ import { withLock } from '../util/lock.ts';
 import { run } from '../util/subprocess.ts';
 import { deriveRepoSlug, parseGithubOwnerRepo } from '../util/paths.ts';
 import { runSyncPass } from '../registry/repo-syncer.ts';
-import { reposBaseDir } from '../registry/synced-registry.ts';
+import { resolveReposDir } from '../registry/synced-registry.ts';
 import { loadScaffoldJobs, removeJobBySlug, upsertJob, writeScaffoldJobs } from '../registry/scaffold-jobs.ts';
 import type { ScaffoldJob } from '../domain/types.ts';
-import { archonAbandon } from '../executor/archon.ts';
+import { ArchonClient } from '../executor/archon-client.ts';
+import { syncWorkflowTemplates } from '../workspace/templates.ts';
 
-const DEFAULT_SCAFFOLD_WORKFLOW = 'symphony/symphony-scaffold';
+const DEFAULT_SCAFFOLD_WORKFLOW = 'gaggle/gaggle-scaffold';
 
-const DEFAULT_PROMPT = `You are bootstrapping a new repository for the GaggleDispatch system.
+const DEFAULT_PROMPT = `You are bootstrapping a new repository for the GaggleDispatch AI routing system.
+Your goal is to produce a concise self-description so an AI orchestrator can decide which repos to involve when an issue arrives.
 
-Inspect this repository (look at README.md, package layout, language, frameworks, AWS service references in code or infra). Produce a draft \`symphony.md\` at the repository root with valid YAML front matter as defined by the GaggleDispatch spec (Section 5.4):
+STEP 1 — Inspect ONLY files that belong to this repo:
+- README.md and top-level directory layout.
+- Build/package file (package.json, pyproject.toml, Cargo.toml, go.mod, *.csproj/sln).
+- CI/CD workflows (.github/workflows/).
+- Infrastructure files (Dockerfile, docker-compose, ecs/, cdk/).
+- List external service names from config/env files (do NOT read external service source code).
 
-- name (lowercase-with-hyphens, REQUIRED)
-- description (1-3 sentences, REQUIRED)
-- default_workflow: symphony/symphony-fix-issue (REQUIRED)
-- available_workflows: list of allowed Archon workflows (RECOMMENDED)
-- components: at least one component with name + description + (RECOMMENDED) component_type and communicates_with edges
+Answer: (a) what deployable artifacts THIS repo produces, (b) what external services it calls (names only), (c) deployment target and trigger, (d) what kinds of changes land here.
 
-Then write a Markdown narrative body that explains how this repo is assembled, deployed, and what kinds of changes it typically receives.
+STEP 2 — Produce \`gaggle.md\` at the repo root with:
 
-Open a pull request titled "Add symphony.md (GaggleDispatch self-description)". Do NOT commit directly to the default branch.`;
+YAML front matter:
+- name: lowercase-with-hyphens slug (REQUIRED)
+- description: 2-3 sentences on what this repo does and why (REQUIRED)
+- default_workflow: gaggle/gaggle-fix-issue (REQUIRED)
+- available_workflows: [gaggle/gaggle-fix-issue, gaggle/gaggle-supervised]
+- components: one entry per deployable artifact THIS REPO PRODUCES (REQUIRED)
+
+CRITICAL components ownership rule:
+- A component entry belongs here ONLY if its code lives in and is deployed from THIS REPO.
+- External services, databases, cloud APIs, and other repos are NOT components — even if this repo talks to them constantly.
+- Reference every external dependency ONLY as a plain string inside that component's \`communicates_with\` list.
+- WRONG: adding a \`postgresql\` or \`trialmatch-api\` component block.
+- RIGHT: \`communicates_with: [postgresql, trialmatch-api]\` inside the component that calls them.
+
+Narrative body (Markdown after the front matter):
+- Focus on THIS repo only: how it is built, tested, and deployed.
+- Describe external dependencies from THIS repo's perspective (e.g. "calls the TrialMatch API at NEXT_PUBLIC_API_URL") — do NOT describe how those external systems work internally.
+- Include: source layout, deployment pipeline, and a table of typical change classes.
+- Keep it concise — this is routing context, not a tutorial.
+
+Open a pull request titled "Add gaggle.md (GaggleDispatch self-description)". Do NOT commit directly to the default branch.`;
 
 export interface ScaffoldArgs {
   url: string;
@@ -48,7 +71,7 @@ export async function runRepoScaffold(args: ScaffoldArgs): Promise<void> {
   }
 
   // Ensure local checkout exists; if not, sync this single repo.
-  const checkout = join(reposBaseDir(cfg.registry.base_folder), slug);
+  const checkout = join(resolveReposDir(cfg), slug);
   if (!existsSync(checkout)) {
     info(`Local checkout for ${slug} not found; syncing this repo first.`);
     await runSyncPass(cfg, { onlySlug: slug, quiet: true });
@@ -64,8 +87,15 @@ export async function runRepoScaffold(args: ScaffoldArgs): Promise<void> {
     );
   }
 
-  const branch = args.branch ?? `symphony/scaffold-${Math.floor(Date.now() / 1000)}`;
+  const branch = args.branch ?? `gaggle/scaffold-${Math.floor(Date.now() / 1000)}`;
   const message = args.message ?? DEFAULT_PROMPT;
+
+  // Sync workflow templates into the checkout so Archon can find gaggle/gaggle-scaffold.
+  const { copied, targetDir } = syncWorkflowTemplates(cfg, checkout);
+  if (copied > 0) {
+    info(`Synced ${copied} workflow template(s) to ${targetDir}`);
+  }
+
   const archonArgs = parseArchonCmd(cfg.archon.command, DEFAULT_SCAFFOLD_WORKFLOW, checkout, message);
 
   if (args.async) {
@@ -216,7 +246,7 @@ export async function runScaffoldCancel(args: { slug: string; cwd?: string }): P
     if (!job) fatal(`No scaffold job for slug '${args.slug}'.`);
     if (job!.archon_run_id) {
       try {
-        await archonAbandon(cfg.archon.command, job!.archon_run_id);
+        await new ArchonClient(cfg.archon.api_url).abandonRun(job!.archon_run_id);
         info(`Sent abandon to Archon run ${job!.archon_run_id}.`);
       } catch (err) {
         console.log(chalk.yellow(`  Could not abandon run: ${(err as Error).message}`));

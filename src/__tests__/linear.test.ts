@@ -56,6 +56,75 @@ afterEach(() => {
   restoreFetch();
 });
 
+describe('LinearClient.query', () => {
+  test('throws LinearError on non-OK HTTP status', async () => {
+    const c = new LinearClient(makeServiceConfig());
+    // Override stubFetch to return a 401
+    globalThis.fetch = async () => new Response('Unauthorized', { status: 401 });
+    await expect(c.resolveViewerId()).rejects.toThrow('Linear HTTP 401');
+  });
+
+  test('throws LinearError on GraphQL errors array', async () => {
+    const c = new LinearClient(makeServiceConfig());
+    enqueue({ errors: [{ message: 'Field not found' }] });
+    await expect(c.resolveViewerId()).rejects.toThrow('Linear GraphQL errors: Field not found');
+  });
+
+  test('throws LinearError when response has no data field', async () => {
+    const c = new LinearClient(makeServiceConfig());
+    enqueue({ });
+    await expect(c.resolveViewerId()).rejects.toThrow('Linear response missing data');
+  });
+});
+
+describe('LinearClient constructor', () => {
+  test('throws when api_key is empty', () => {
+    const cfg = makeServiceConfig();
+    cfg.tracker.api_key = '';
+    expect(() => new LinearClient(cfg)).toThrow('LINEAR_API_KEY is missing or empty');
+  });
+});
+
+describe('LinearClient.resolveTeam', () => {
+  test('falls back to name match when key query returns empty', async () => {
+    const c = new LinearClient(makeServiceConfig());
+    // First query (key match) returns empty nodes
+    enqueue({ data: { teams: { nodes: [] } } });
+    // Second query (name match) returns the team
+    enqueue({ data: { teams: { nodes: [{ id: 'team-1', key: 'SYM', name: 'Symphony' }] } } });
+    const team = await c.resolveTeam();
+    expect(team.id).toBe('team-1');
+    expect(fetchCalls.length).toBe(2);
+  });
+
+  test('throws when both key and name queries return empty', async () => {
+    const c = new LinearClient(makeServiceConfig());
+    enqueue({ data: { teams: { nodes: [] } } });
+    enqueue({ data: { teams: { nodes: [] } } });
+    await expect(c.resolveTeam()).rejects.toThrow("No Linear team matched project_slug='SYM'");
+  });
+});
+
+describe('LinearClient.resolveStateId', () => {
+  test('throws LinearError when state name is not found', async () => {
+    const c = new LinearClient(makeServiceConfig());
+    enqueue({ data: { workflowStates: { nodes: [] } } });
+    await expect(
+      (c as unknown as { resolveStateId(t: string, n: string): Promise<string> }).resolveStateId('team-1', 'UnknownState'),
+    ).rejects.toThrow("No Linear workflow state named 'UnknownState'");
+  });
+
+  test('caches state id on second call (no second fetch)', async () => {
+    const c = new LinearClient(makeServiceConfig());
+    enqueue({ data: { workflowStates: { nodes: [{ id: 'ws-1', name: 'Done', type: 'completed' }] } } });
+    const id1 = await (c as unknown as { resolveStateId(t: string, n: string): Promise<string> }).resolveStateId('team-1', 'Done');
+    const id2 = await (c as unknown as { resolveStateId(t: string, n: string): Promise<string> }).resolveStateId('team-1', 'Done');
+    expect(id1).toBe('ws-1');
+    expect(id2).toBe('ws-1');
+    expect(fetchCalls.length).toBe(1); // second call served from cache
+  });
+});
+
 describe('LinearClient.resolveViewerId', () => {
   test('returns viewer.id and caches', async () => {
     const c = new LinearClient(makeServiceConfig());
@@ -218,18 +287,18 @@ describe('LinearClient sub-issue + state + comment + label ops', () => {
     enqueue({ data: { issueLabels: { nodes: [] } } }); // no existing label
     enqueue({ data: { issueLabelCreate: { success: true, issueLabel: { id: 'lbl1' } } } });
     enqueue({ data: { issueAddLabel: { success: true } } });
-    await c.applyLabel('i1', 'symphony:running');
+    await c.applyLabel('i1', 'gaggle:running');
     expect(fetchCalls[fetchCalls.length - 1]!.body.query).toContain('issueAddLabel');
   });
 
   test('applyLabel uses cached label id on second call', async () => {
     const c = new LinearClient(makeServiceConfig());
     enqueue(...teamResolution());
-    enqueue({ data: { issueLabels: { nodes: [{ id: 'lbl1', name: 'symphony:claimed' }] } } });
+    enqueue({ data: { issueLabels: { nodes: [{ id: 'lbl1', name: 'gaggle:claimed' }] } } });
     enqueue({ data: { issueAddLabel: { success: true } } });
-    await c.applyLabel('i1', 'symphony:claimed');
+    await c.applyLabel('i1', 'gaggle:claimed');
     enqueue({ data: { issueAddLabel: { success: true } } }); // no additional label fetch
-    await c.applyLabel('i2', 'symphony:claimed');
+    await c.applyLabel('i2', 'gaggle:claimed');
     // 4 calls total: team, label fetch, add, add
     expect(fetchCalls.length).toBe(4);
   });
@@ -237,9 +306,9 @@ describe('LinearClient sub-issue + state + comment + label ops', () => {
   test('removeLabel issues issueRemoveLabel', async () => {
     const c = new LinearClient(makeServiceConfig());
     enqueue(...teamResolution());
-    enqueue({ data: { issueLabels: { nodes: [{ id: 'lbl1', name: 'symphony:running' }] } } });
+    enqueue({ data: { issueLabels: { nodes: [{ id: 'lbl1', name: 'gaggle:running' }] } } });
     enqueue({ data: { issueRemoveLabel: { success: true } } });
-    await c.removeLabel('i1', 'symphony:running');
+    await c.removeLabel('i1', 'gaggle:running');
     expect(fetchCalls[2]!.body.query).toContain('issueRemoveLabel');
   });
 });
@@ -303,7 +372,7 @@ describe('LinearClient.fetchIssuesByLabel', () => {
               priority: null,
               url: null,
               state: { name: 'In Progress' },
-              labels: { nodes: [{ name: 'symphony:running' }] },
+              labels: { nodes: [{ name: 'gaggle:running' }] },
               parent: { id: 'parent-1' },
               createdAt: null,
               updatedAt: null,
@@ -313,13 +382,13 @@ describe('LinearClient.fetchIssuesByLabel', () => {
         },
       },
     });
-    const r = await c.fetchIssuesByLabel('symphony:running');
+    const r = await c.fetchIssuesByLabel('gaggle:running');
     expect(r.length).toBe(1);
     expect(r[0]!.parent_id).toBe('parent-1');
   });
 });
 
-describe('LinearClient.ensureSymphonyLabels', () => {
+describe('LinearClient.ensureGaggleLabels', () => {
   test('creates all four labels when none exist', async () => {
     const c = new LinearClient(makeServiceConfig());
     enqueue(...teamResolution()); // team
@@ -328,7 +397,22 @@ describe('LinearClient.ensureSymphonyLabels', () => {
       enqueue({ data: { issueLabels: { nodes: [] } } });
       enqueue({ data: { issueLabelCreate: { success: true, issueLabel: { id: `lbl${i}` } } } });
     }
-    await c.ensureSymphonyLabels();
+    await c.ensureGaggleLabels();
     expect(fetchCalls.length).toBe(9); // 1 team + 8 label
+  });
+});
+
+describe('LinearClient.createBlockerRelation', () => {
+  test('calls issueRelationCreate with type=blocks', async () => {
+    const c = new LinearClient(makeServiceConfig());
+    enqueue({ data: { issueRelationCreate: { success: true } } });
+    await c.createBlockerRelation('upstream-id', 'downstream-id');
+    expect(fetchCalls.length).toBe(1);
+    const q = fetchCalls[0]!.body.query;
+    expect(q).toContain('issueRelationCreate');
+    const vars = fetchCalls[0]!.body.variables as { input: { issueId: string; relatedIssueId: string; type: string } };
+    expect(vars.input.issueId).toBe('upstream-id');
+    expect(vars.input.relatedIssueId).toBe('downstream-id');
+    expect(vars.input.type).toBe('blocks');
   });
 });

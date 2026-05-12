@@ -158,6 +158,7 @@ export class LinearClient {
   async createSubIssue(args: {
     parent_id: string;
     title: string;
+    description?: string;
     assignee_id: string | null;
     state_name: string;
   }): Promise<{ id: string; identifier: string }> {
@@ -176,6 +177,7 @@ export class LinearClient {
         input: {
           parentId: args.parent_id,
           title: args.title,
+          description: args.description ?? undefined,
           teamId: team.id,
           assigneeId: args.assignee_id ?? undefined,
           stateId,
@@ -186,6 +188,52 @@ export class LinearClient {
       throw new LinearError(`Failed to create sub-issue under ${args.parent_id}`);
     }
     return data.issueCreate.issue;
+  }
+
+  // ── create_issue: top-level issue with optional priority + assignee ─────────
+  async createIssue(args: {
+    title: string;
+    description?: string;
+    priority?: number | null;
+    assignee_id?: string | null;
+    state_name: string;
+  }): Promise<{ id: string; identifier: string; url: string | null }> {
+    const team = await this.resolveTeam();
+    const stateId = await this.resolveStateId(team.id, args.state_name);
+    const data = await this.query<{
+      issueCreate: { success: boolean; issue: { id: string; identifier: string; url: string | null } | null };
+    }>(
+      `mutation($input: IssueCreateInput!) {
+        issueCreate(input: $input) {
+          success
+          issue { id identifier url }
+        }
+      }`,
+      {
+        input: {
+          title: args.title,
+          description: args.description ?? undefined,
+          teamId: team.id,
+          stateId,
+          priority: args.priority ?? undefined,
+          assigneeId: args.assignee_id ?? undefined,
+        },
+      },
+    );
+    if (!data.issueCreate.success || !data.issueCreate.issue) {
+      throw new LinearError(`Failed to create issue: ${args.title}`);
+    }
+    return data.issueCreate.issue;
+  }
+
+  // ── create_blocker_relation: upstreamId BLOCKS downstreamId ───────────────
+  async createBlockerRelation(upstreamId: string, downstreamId: string): Promise<void> {
+    await this.query<{ issueRelationCreate: { success: boolean } }>(
+      `mutation($input: IssueRelationCreateInput!) {
+        issueRelationCreate(input: $input) { success }
+      }`,
+      { input: { issueId: upstreamId, relatedIssueId: downstreamId, type: 'blocks' } },
+    );
   }
 
   // ── 12.1 #5: update_issue_state ───────────────────────────────────────────
@@ -283,6 +331,26 @@ export class LinearClient {
     }));
   }
 
+  // ── pr link attachments ───────────────────────────────────────────────────
+  async fetchIssuePRLinks(issue_id: string): Promise<string[]> {
+    const data = await this.query<{
+      issue: { attachments: { nodes: Array<{ url: string | null }> } } | null;
+    }>(
+      `query($id: String!) {
+        issue(id: $id) {
+          attachments(first: 50) {
+            nodes { url }
+          }
+        }
+      }`,
+      { id: issue_id },
+    );
+    if (!data.issue) return [];
+    return data.issue.attachments.nodes
+      .map((a) => a.url ?? '')
+      .filter((url) => /github\.com\/[^/]+\/[^/]+\/pull\/\d+/.test(url));
+  }
+
   // ── label and state caching ───────────────────────────────────────────────
   async ensureLabelExists(teamId: string, name: string): Promise<string> {
     const cacheKey = `${teamId}:${name}`;
@@ -334,13 +402,13 @@ export class LinearClient {
   }
 
   /** Eagerly create the four state-machine labels (Section 12.4). */
-  async ensureSymphonyLabels(): Promise<void> {
+  async ensureGaggleLabels(): Promise<void> {
     const team = await this.resolveTeam();
     for (const label of [
-      this.cfg.tracker.symphony_labels.claimed,
-      this.cfg.tracker.symphony_labels.queued,
-      this.cfg.tracker.symphony_labels.running,
-      this.cfg.tracker.symphony_labels.waiting_human,
+      this.cfg.tracker.gaggle_labels.claimed,
+      this.cfg.tracker.gaggle_labels.queued,
+      this.cfg.tracker.gaggle_labels.running,
+      this.cfg.tracker.gaggle_labels.waiting_human,
     ]) {
       await this.ensureLabelExists(team.id, label);
     }

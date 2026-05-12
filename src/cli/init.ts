@@ -118,14 +118,14 @@ export async function runInit(opts: { cwd?: string }): Promise<void> {
       console.log(chalk.red('  Base folder must resolve to an absolute path.'));
       continue;
     }
-    if (isInside(baseFolderResolved, cwd)) {
-      console.log(chalk.red('  Base folder MUST NOT be inside the GaggleDispatch project directory.'));
+    if (isInside(baseFolderResolved, cwd) && resolvePath(baseFolderResolved) !== resolvePath(cwd)) {
+      console.log(chalk.red('  Base folder must not be a subdirectory of the project directory. Use the project directory itself or a separate path.'));
       continue;
     }
     break;
   }
 
-  const defaultWorkflow = await readLine('Default Archon workflow', 'symphony/symphony-fix-issue');
+  const defaultWorkflow = await readLine('Default Archon workflow', 'gaggle/gaggle-fix-issue');
   const analyzerModel = await readLine('Claude analyzer model', 'claude-sonnet-4-5');
 
   const config: Record<string, unknown> = {
@@ -159,7 +159,7 @@ export async function runInit(opts: { cwd?: string }): Promise<void> {
     },
     workflow_templates: {
       path: 'workflow_templates/',
-      target_subdir: 'symphony',
+      target_subdir: 'gaggle',
       sync_on_dispatch: true,
       reload_on_change: true,
     },
@@ -206,7 +206,7 @@ export async function runInit(opts: { cwd?: string }): Promise<void> {
   console.log('');
   info('Next steps:');
   console.log('  1. gaggle setup     # configure LINEAR_API_KEY and ANTHROPIC_API_KEY');
-  console.log('  2. gaggle sync      # clone repos and parse symphony.md files');
+  console.log('  2. gaggle sync      # clone repos and parse gaggle.md files');
   console.log('  3. gaggle start     # start the orchestrator');
 
   closeRl();

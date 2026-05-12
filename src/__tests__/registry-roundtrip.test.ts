@@ -90,7 +90,7 @@ describe('scaffold-jobs round-trip', () => {
       url: 'https://github.com/o/repo',
       checkout_path: '/tmp/checkouts/repo',
       archon_run_id: null,
-      workflow_name: 'symphony/symphony-scaffold',
+      workflow_name: 'gaggle/gaggle-scaffold',
       branch: 'main',
       started_at: '2026-05-09T00:00:00Z',
       last_polled_at: null,

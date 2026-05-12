@@ -13,7 +13,7 @@ import type {
 import { logger } from '../util/logger.ts';
 import { startArchon, type ArchonEvent } from '../executor/archon.ts';
 import { WorkspaceManager } from '../workspace/workspace-manager.ts';
-import { buildIssueMessage, buildSymphonyEnv } from '../workspace/message.ts';
+import { buildIssueMessage, buildGaggleEnv } from '../workspace/message.ts';
 
 export interface WorkerExitEvent {
   type: 'archon_succeeded' | 'archon_failed' | 'archon_timed_out' | 'archon_stalled' | 'archon_cancelled';
@@ -25,6 +25,8 @@ export interface WorkerCallbacks {
   onOutput: (line: string) => void;
   onGatePaused: (run_id: string, gate_message: string) => void;
   onExit: (event: WorkerExitEvent) => void;
+  /** Called once when Archon logs the workflowRunId (DB run id). */
+  onRunId?: (db_run_id: string) => void;
 }
 
 export interface WorkerStartArgs {
@@ -35,6 +37,8 @@ export interface WorkerStartArgs {
   analysis: IssueAnalysis;
   attempt: number | null;
   source_branch: string;
+  /** When set, used as the Archon message instead of building one from issue+target. */
+  message_override?: string;
 }
 
 export interface RunningWorker {
@@ -62,8 +66,8 @@ export async function spawnWorker(args: WorkerStartArgs, cb: WorkerCallbacks): P
     return { cancel: () => {}, done: Promise.resolve() };
   }
 
-  const message = buildIssueMessage({ issue, repo_target, analysis, attempt });
-  const env = buildSymphonyEnv({ issue, repo_target, analysis, attempt });
+  const message = args.message_override ?? buildIssueMessage({ issue, repo_target, analysis, attempt });
+  const env = buildGaggleEnv({ issue, repo_target, analysis, attempt });
 
   log.info('Launching Archon workflow', {
     archon_workflow: repo_target.archon_workflow,
@@ -87,6 +91,9 @@ export async function spawnWorker(args: WorkerStartArgs, cb: WorkerCallbacks): P
           break;
         case 'archon_output':
           cb.onOutput(e.line);
+          break;
+        case 'archon_run_id':
+          cb.onRunId?.(e.db_run_id);
           break;
         case 'archon_gate_paused':
           cb.onGatePaused(e.run_id, e.gate_message);
@@ -133,6 +140,7 @@ export function buildLiveSession(args: {
     repo_target,
     sub_issue_id,
     archon_pid: null,
+    archon_db_run_id: null,
     archon_workflow: repo_target.archon_workflow,
     last_archon_event: null,
     last_archon_timestamp: null,

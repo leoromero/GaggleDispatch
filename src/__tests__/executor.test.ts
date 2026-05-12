@@ -9,6 +9,7 @@ import {
   detectGatePause,
   PAUSE_REGEX,
   RUN_ID_REGEX,
+  WORKFLOW_RUN_ID_REGEX,
   tokenizeArchonCommand,
 } from '../executor/archon.ts';
 
@@ -21,6 +22,26 @@ describe('RUN_ID_REGEX', () => {
   test('does not match malformed UUIDs', () => {
     expect('11111111-2222-3333-4444-55555555555X'.match(RUN_ID_REGEX)).toBeNull();
     expect('11111111-2222-3333-4444-55555555'.match(RUN_ID_REGEX)).toBeNull();
+  });
+});
+
+describe('WORKFLOW_RUN_ID_REGEX', () => {
+  const SAMPLE_LINE =
+    '{"level":30,"time":1778375493895,"pid":8104,"hostname":"Leo-Fligo","module":"workflow.executor",' +
+    '"workflowName":"gaggle/gaggle-fix-issue","workflowRunId":"9136a16135d082cb9f0ac75523b3b56e",' +
+    '"hasIssueContext":false,"issueContextLength":0,"msg":"workflow_starting"}';
+
+  test('extracts the 32-char hex run id from a workflow_starting log line', () => {
+    expect(SAMPLE_LINE.match(WORKFLOW_RUN_ID_REGEX)?.[1]).toBe('9136a16135d082cb9f0ac75523b3b56e');
+  });
+
+  test('does not match lines that have no workflowRunId field', () => {
+    expect('{"level":30,"msg":"db.sqlite_schema_initialized"}'.match(WORKFLOW_RUN_ID_REGEX)).toBeNull();
+  });
+
+  test('does not match a UUID-format gate run id (dashes not supported)', () => {
+    const uuidLine = '{"workflowRunId":"aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"}';
+    expect(uuidLine.match(WORKFLOW_RUN_ID_REGEX)).toBeNull();
   });
 });
 
@@ -84,12 +105,12 @@ describe('tokenizeArchonCommand', () => {
 
 describe('buildArchonRunArgv', () => {
   test('appends workflow + --cwd + message in the correct order', () => {
-    const argv = buildArchonRunArgv('archon workflow run', 'symphony/symphony-fix-issue', '/repos/x', 'msg');
+    const argv = buildArchonRunArgv('archon workflow run', 'gaggle/gaggle-fix-issue', '/repos/x', 'msg');
     expect(argv).toEqual([
       'archon',
       'workflow',
       'run',
-      'symphony/symphony-fix-issue',
+      'gaggle/gaggle-fix-issue',
       '--cwd',
       '/repos/x',
       'msg',

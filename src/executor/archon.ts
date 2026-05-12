@@ -1,8 +1,13 @@
 /**
  * Archon Workflow Executor (Section 11).
  *
- * Spawns `archon workflow run <workflow> --cwd <checkout> "<message>"`.
- * Streams stderr; emits typed events; detects gate-pause and stall.
+ * Spawns `archon workflow run <workflow> --cwd <checkout> "<message>"`,
+ * streams stdout+stderr, captures the DB run-id, and detects gate-pause
+ * from log output (fast path — the poller is the authoritative source).
+ *
+ * Approve / reject / cancel / status-query are handled by ArchonClient
+ * (HTTP API). The stall timer lives in ArchonRunPoller. This file owns
+ * only: process lifecycle, output streaming, and early event detection.
  */
 
 import { logger } from '../util/logger.ts';
@@ -11,11 +16,19 @@ export type ArchonEvent =
   | { type: 'archon_started'; pid: number }
   | { type: 'archon_output'; line: string }
   | { type: 'archon_gate_paused'; run_id: string; gate_message: string; raw: string }
+  /** Emitted once when Archon logs the workflowRunId — use this to correlate with the DB. */
+  | { type: 'archon_run_id'; db_run_id: string }
   | { type: 'archon_succeeded' }
   | { type: 'archon_failed'; exit_code: number }
   | { type: 'archon_timed_out' }
   | { type: 'archon_stalled' }
   | { type: 'archon_cancelled' };
+
+/**
+ * Matches Archon's `workflow_starting` log line to extract the DB run id.
+ * Example line: {"level":30,...,"workflowRunId":"9136a16135d082cb9f0ac75523b3b56e","msg":"workflow_starting"}
+ */
+export const WORKFLOW_RUN_ID_REGEX = /"workflowRunId":"([0-9a-f]{32})"/;
 
 export interface ExecutorOptions {
   archonCommand: string; // e.g. "archon workflow run"
@@ -24,7 +37,8 @@ export interface ExecutorOptions {
   message: string;
   env?: Record<string, string | undefined>;
   turnTimeoutMs: number;
-  stallTimeoutMs: number;
+  /** @deprecated Stall detection is handled by ArchonRunPoller. Kept for back-compat; ignored. */
+  stallTimeoutMs?: number;
 }
 
 export interface RunHandle {
@@ -63,6 +77,31 @@ export function buildArchonRunArgv(commandStr: string, workflow: string, cwd: st
   return [...tokenizeArchonCommand(commandStr), workflow, '--cwd', cwd, message];
 }
 
+/**
+ * Build the argv for `archon workflow approve <runId> [comment]`.
+ * Uses the same binary prefix as the run command ("archon workflow").
+ * The CLI approve command stores the approval AND auto-resumes via
+ * workflowRunCommand(..., { resume: true }), preserving the comment as
+ * $<gate-id>.output for downstream nodes.
+ */
+export function buildArchonApproveArgv(commandStr: string, runId: string, comment?: string): string[] {
+  const parts = tokenizeArchonCommand(commandStr);
+  const argv = [...parts.slice(0, 2), 'approve', runId];
+  if (comment) argv.push(comment);
+  return argv;
+}
+
+/**
+ * Build the argv for `archon workflow resume <runId>`.
+ * commandStr is the same `archon workflow run` string — we reuse the prefix
+ * ("archon workflow") and replace the subcommand with "resume".
+ */
+export function buildArchonResumeArgv(commandStr: string, runId: string): string[] {
+  const parts = tokenizeArchonCommand(commandStr);
+  // parts = ["archon", "workflow", "run"] → take first two, swap last for "resume"
+  return [...parts.slice(0, 2), 'resume', runId];
+}
+
 export function startArchon(opts: ExecutorOptions, onEvent: (e: ArchonEvent) => void): RunHandle {
   const argv = parseArchonCommand(opts.archonCommand, opts.workflowName, opts.cwd, opts.message);
 
@@ -81,29 +120,12 @@ export function startArchon(opts: ExecutorOptions, onEvent: (e: ArchonEvent) => 
   }
 
   let capturedRunId: string | null = null;
-  let stallTimer: ReturnType<typeof setTimeout> | null = null;
   let cancelled = false;
   let timedOut = false;
   let resolveDone: () => void = () => {};
   const done = new Promise<void>((res) => {
     resolveDone = res;
   });
-
-  const armStallTimer = () => {
-    if (opts.stallTimeoutMs <= 0) return;
-    if (stallTimer) clearTimeout(stallTimer);
-    stallTimer = setTimeout(() => {
-      logger.warn('Archon run stalled — killing', { pid: proc.pid });
-      onEvent({ type: 'archon_stalled' });
-      try {
-        proc.kill();
-      } catch {
-        /* ignore */
-      }
-    }, opts.stallTimeoutMs);
-  };
-
-  armStallTimer();
 
   const turnTimer = setTimeout(() => {
     if (proc.exitCode === undefined) {
@@ -118,10 +140,20 @@ export function startArchon(opts: ExecutorOptions, onEvent: (e: ArchonEvent) => 
     }
   }, opts.turnTimeoutMs);
 
+  let capturedDbRunId: string | null = null;
+
   const handleStderrLine = (line: string) => {
     if (!line.trim()) return;
     onEvent({ type: 'archon_output', line });
-    armStallTimer();
+
+    // Capture the Archon DB run id from the workflow_starting log line.
+    if (capturedDbRunId === null) {
+      const m = line.match(WORKFLOW_RUN_ID_REGEX);
+      if (m?.[1]) {
+        capturedDbRunId = m[1];
+        onEvent({ type: 'archon_run_id', db_run_id: capturedDbRunId });
+      }
+    }
 
     if (capturedRunId === null) {
       const detected = detectGatePause(line);
@@ -137,15 +169,15 @@ export function startArchon(opts: ExecutorOptions, onEvent: (e: ArchonEvent) => 
     }
   };
 
-  // Stream stderr line-by-line.
+  // Stream both stderr and stdout line-by-line. Archon's pino logger writes
+  // structured JSON (including the `workflowRunId` we need) to stdout, while
+  // the human-readable progress lines go to stderr. We need both.
   void streamLines(proc.stderr, handleStderrLine);
-  // Also drain stdout so the pipe doesn't fill (but we don't parse it).
-  void drain(proc.stdout);
+  void streamLines(proc.stdout, handleStderrLine);
 
   void (async () => {
     try {
       const exitCode = await proc.exited;
-      if (stallTimer) clearTimeout(stallTimer);
       clearTimeout(turnTimer);
 
       if (cancelled) {
@@ -178,12 +210,105 @@ export function startArchon(opts: ExecutorOptions, onEvent: (e: ArchonEvent) => 
   };
 }
 
+/**
+ * Approve a paused Archon gate and immediately resume the workflow.
+ *
+ * Calls `archon workflow approve <runId> [comment]` which (1) stores the
+ * approval with the comment as $<gate-id>.output for downstream nodes, then
+ * (2) auto-resumes via workflowRunCommand(..., { resume: true }).
+ *
+ * This is the correct path for supervised gates — the raw HTTP approveRun API
+ * only stores the approval without resuming, losing the human comment.
+ */
+export function approveAndResumeArchon(
+  archonCommand: string,
+  runId: string,
+  comment: string | undefined,
+  turnTimeoutMs: number,
+  onEvent: (e: ArchonEvent) => void,
+): RunHandle {
+  const argv = buildArchonApproveArgv(archonCommand, runId, comment);
+
+  const proc = Bun.spawn(argv, {
+    env: process.env as Record<string, string>,
+    stdout: 'pipe',
+    stderr: 'pipe',
+    stdin: 'ignore',
+  });
+
+  if (proc.pid) {
+    onEvent({ type: 'archon_started', pid: proc.pid });
+  }
+
+  let capturedDbRunId: string | null = null;
+  let capturedRunId: string | null = null;
+  let cancelled = false;
+  let timedOut = false;
+  let resolveDone: () => void = () => {};
+  const done = new Promise<void>((res) => { resolveDone = res; });
+
+  const turnTimer = setTimeout(() => {
+    if (proc.exitCode === undefined) {
+      timedOut = true;
+      logger.warn('Archon approve+resume turn timeout — killing', { pid: proc.pid, runId });
+      onEvent({ type: 'archon_timed_out' });
+      try { proc.kill(); } catch { /* ignore */ }
+    }
+  }, turnTimeoutMs);
+
+  const handleLine = (line: string) => {
+    if (!line.trim()) return;
+    onEvent({ type: 'archon_output', line });
+    if (capturedDbRunId === null) {
+      const m = line.match(WORKFLOW_RUN_ID_REGEX);
+      if (m?.[1]) {
+        capturedDbRunId = m[1];
+        onEvent({ type: 'archon_run_id', db_run_id: capturedDbRunId });
+      }
+    }
+    if (capturedRunId === null) {
+      const detected = detectGatePause(line);
+      if (detected) {
+        capturedRunId = detected.run_id;
+        onEvent({ type: 'archon_gate_paused', run_id: capturedRunId, gate_message: line.trim(), raw: line });
+      }
+    }
+  };
+
+  void streamLines(proc.stderr, handleLine);
+  void streamLines(proc.stdout, handleLine);
+
+  void (async () => {
+    try {
+      const exitCode = await proc.exited;
+      clearTimeout(turnTimer);
+      if (cancelled) {
+        onEvent({ type: 'archon_cancelled' });
+      } else if (!timedOut) {
+        if (exitCode === 0) onEvent({ type: 'archon_succeeded' });
+        else onEvent({ type: 'archon_failed', exit_code: exitCode ?? -1 });
+      }
+    } finally {
+      resolveDone();
+    }
+  })();
+
+  return {
+    pid: proc.pid ?? null,
+    cancel: (reason?: string) => {
+      if (cancelled) return;
+      cancelled = true;
+      logger.info('Cancelling Archon approve+resume', { pid: proc.pid, runId, reason });
+      try { proc.kill(); } catch { /* ignore */ }
+    },
+    done,
+  };
+}
+
 /** Parse the archon command string into argv with workflow + flags + message. */
 function parseArchonCommand(commandStr: string, workflow: string, cwd: string, message: string): string[] {
   return buildArchonRunArgv(commandStr, workflow, cwd, message);
 }
-
-const tokenize = tokenizeArchonCommand;
 
 async function streamLines(stream: ReadableStream<Uint8Array>, onLine: (line: string) => void): Promise<void> {
   const reader = stream.getReader();
@@ -209,45 +334,8 @@ async function streamLines(stream: ReadableStream<Uint8Array>, onLine: (line: st
   }
 }
 
-async function drain(stream: ReadableStream<Uint8Array>): Promise<void> {
-  const reader = stream.getReader();
-  try {
-    for (;;) {
-      const { done } = await reader.read();
-      if (done) return;
-    }
-  } catch {
-    /* ignore */
-  }
-}
-
-/** Call `archon workflow approve <run-id> --comment "<text>"`. */
-export async function archonApprove(commandStr: string, runId: string, comment: string): Promise<void> {
-  const baseTokens = tokenize(commandStr);
-  // commandStr is "archon workflow run" — replace last token with "approve"
-  const argv = [...baseTokens.slice(0, -1), 'approve', runId, '--comment', comment];
-  const proc = Bun.spawn(argv, { stdout: 'inherit', stderr: 'inherit' });
-  const code = await proc.exited;
-  if (code !== 0) {
-    logger.warn('archon approve exited non-zero', { run_id: runId, exit_code: code });
-  }
-}
-
-/** Call `archon workflow reject <run-id> --reason "<text>"`. */
-export async function archonReject(commandStr: string, runId: string, reason: string): Promise<void> {
-  const baseTokens = tokenize(commandStr);
-  const argv = [...baseTokens.slice(0, -1), 'reject', runId, '--reason', reason];
-  const proc = Bun.spawn(argv, { stdout: 'inherit', stderr: 'inherit' });
-  const code = await proc.exited;
-  if (code !== 0) {
-    logger.warn('archon reject exited non-zero', { run_id: runId, exit_code: code });
-  }
-}
-
-/** Call `archon workflow abandon <run-id>`. */
-export async function archonAbandon(commandStr: string, runId: string): Promise<void> {
-  const baseTokens = tokenize(commandStr);
-  const argv = [...baseTokens.slice(0, -1), 'abandon', runId];
-  const proc = Bun.spawn(argv, { stdout: 'inherit', stderr: 'inherit' });
-  await proc.exited;
-}
+// ─── re-exports for callers that imported from here ───────────────────────────
+// ArchonRunRecord and findArchonRunForRepo live in archon-client.ts now.
+// These re-exports keep existing imports from breaking during migration.
+export type { ArchonRunRecord } from './archon-client.ts';
+export { findArchonRunForRepo } from './archon-client.ts';

@@ -54,12 +54,17 @@ export function deriveRepoSlug(url: string): string {
   return last.replace(/\.git$/i, '');
 }
 
-/** Parse owner/repo from a GitHub HTTPS URL. */
+/** Parse owner/repo from a GitHub HTTPS or SSH URL (including custom SSH host aliases). */
 export function parseGithubOwnerRepo(url: string): { owner: string; repo: string } {
-  // accepted: https://github.com/owner/repo[.git]
-  const match = url.match(/^https?:\/\/(?:www\.)?github\.com\/([^/]+)\/([^/]+?)(?:\.git)?\/?$/i);
-  if (!match || !match[1] || !match[2]) {
-    throw new Error(`Invalid GitHub HTTPS URL: ${url}`);
+  // HTTPS: https://github.com/owner/repo[.git]
+  const httpsMatch = url.match(/^https?:\/\/(?:www\.)?github\.com\/([^/]+)\/([^/]+?)(?:\.git)?\/?$/i);
+  if (httpsMatch?.[1] && httpsMatch[2]) {
+    return { owner: httpsMatch[1], repo: httpsMatch[2] };
   }
-  return { owner: match[1], repo: match[2] };
+  // SSH: git@<host>:owner/repo[.git]  (host may be a custom alias like github-trabajo)
+  const sshMatch = url.match(/^git@[^:]+:([^/]+)\/([^/]+?)(?:\.git)?\/?$/i);
+  if (sshMatch?.[1] && sshMatch[2]) {
+    return { owner: sshMatch[1], repo: sshMatch[2] };
+  }
+  throw new Error(`Invalid GitHub URL (expected HTTPS or SSH git@host:owner/repo): ${url}`);
 }

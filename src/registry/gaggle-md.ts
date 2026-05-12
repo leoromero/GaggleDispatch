@@ -1,5 +1,5 @@
 /**
- * symphony.md parser (Section 5.4).
+ * gaggle.md parser (Section 5.4).
  *
  * Front matter is REQUIRED. The Markdown body following the closing `---` is the
  * `narrative` consumed verbatim by the Issue Analyzer.
@@ -12,12 +12,12 @@ import type { RepoFrontmatter } from '../domain/types.ts';
 
 const NAME_RE = /^[a-z0-9][a-z0-9-]*[a-z0-9]$|^[a-z0-9]$/;
 
-export interface ParsedSymphonyMd {
+export interface ParsedGaggleMd {
   frontmatter: RepoFrontmatter;
   narrative: string;
 }
 
-export function parseSymphonyMd(text: string, source: string): ParsedSymphonyMd {
+export function parseGaggleMd(text: string, source: string): ParsedGaggleMd {
   const split = splitFrontMatter(text);
   if (!split) {
     throw new RepoSyncError(`${source}: missing YAML front matter (must start with '---')`);
@@ -89,10 +89,10 @@ export function parseSymphonyMd(text: string, source: string): ParsedSymphonyMd 
   };
 }
 
-export function readSymphonyMdAt(path: string): ParsedSymphonyMd | null {
+export function readGaggleMdAt(path: string): ParsedGaggleMd | null {
   if (!existsSync(path)) return null;
   const text = readFileSync(path, 'utf8');
-  return parseSymphonyMd(text, path);
+  return parseGaggleMd(text, path);
 }
 
 // ─── helpers ────────────────────────────────────────────────────────────────

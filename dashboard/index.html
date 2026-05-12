@@ -1,0 +1,64 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>GaggleDispatch</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <header id="topbar">
+      <div class="brand">
+        <span class="logo">●</span>
+        <span class="name">GaggleDispatch</span>
+      </div>
+      <div id="ws-tabs" class="ws-tabs"></div>
+      <div class="stats">
+        <span id="slots-stat" class="stat">—</span>
+        <span id="tokens-stat" class="stat">—</span>
+        <a id="archon-chip" class="stat archon-chip" target="_blank" rel="noopener" title="Archon UI"></a>
+        <span id="conn-stat" class="stat conn">●</span>
+      </div>
+    </header>
+
+    <main>
+      <section id="pipeline-panel" class="panel">
+        <h2>Pipeline</h2>
+        <div id="pipeline-summary" class="pipeline-summary"></div>
+        <div id="pipeline-list" class="pipeline-list"></div>
+      </section>
+
+      <section id="workers-panel" class="panel wide">
+        <h2>Active workers</h2>
+        <div id="workers-list" class="workers-list"></div>
+      </section>
+
+      <section id="repos-panel" class="panel">
+        <h2>Workspaces</h2>
+        <div id="workspaces-list" class="workspaces-list"></div>
+      </section>
+
+      <section id="logs-panel" class="panel full">
+        <div class="logs-header">
+          <h2>Logs</h2>
+          <div class="logs-filters">
+            <select id="log-level">
+              <option value="">all levels</option>
+              <option value="debug">debug</option>
+              <option value="info">info</option>
+              <option value="warn">warn</option>
+              <option value="error">error</option>
+            </select>
+            <input id="log-search" type="text" placeholder="filter messages…" />
+            <label class="auto-scroll">
+              <input id="autoscroll" type="checkbox" checked /> auto-scroll
+            </label>
+          </div>
+        </div>
+        <div id="logs-list" class="logs-list"></div>
+      </section>
+    </main>
+
+    <script src="/app.js" type="module"></script>
+  </body>
+</html>

@@ -15,17 +15,17 @@ import type {
 } from '../domain/types.ts';
 import { logger } from '../util/logger.ts';
 import { watchFile, type WatchHandle } from '../config/watcher.ts';
-import { loadSyncedRegistry, syncedRegistryPath } from './synced-registry.ts';
+import { loadSyncedRegistry, resolveReposDir, syncedRegistryPath } from './synced-registry.ts';
 
-function buildContext(entries: SyncedRegistryRepoEntry[], synced_at: string): RegistryContext {
+function buildContext(entries: SyncedRegistryRepoEntry[], synced_at: string, repos_dir: string): RegistryContext {
   const repositories: RegistryRepo[] = [];
   const components: RegistryComponent[] = [];
   const warnings: string[] = [];
 
   for (const e of entries) {
     if (e.sync_status !== 'ok' || !e.frontmatter) {
-      if (e.sync_status === 'missing_symphony_md') {
-        warnings.push(`${e.url}: missing symphony.md (excluded from analysis)`);
+      if (e.sync_status === 'missing_gaggle_md') {
+        warnings.push(`${e.url}: missing gaggle.md (excluded from analysis)`);
       } else if (e.sync_status === 'error' && e.sync_error) {
         warnings.push(`${e.url}: ${e.sync_error}`);
       }
@@ -52,7 +52,7 @@ function buildContext(entries: SyncedRegistryRepoEntry[], synced_at: string): Re
     }
   }
 
-  return { repositories, components, last_synced_at: synced_at, warnings };
+  return { repositories, components, last_synced_at: synced_at, warnings, repos_dir };
 }
 
 export interface RegistryLoaderHandle {
@@ -63,7 +63,7 @@ export interface RegistryLoaderHandle {
 }
 
 export function startRegistryLoader(cfg: ServiceConfig): RegistryLoaderHandle {
-  let lastGood: RegistryContext = { repositories: [], components: [], last_synced_at: new Date(0).toISOString(), warnings: [] };
+  let lastGood: RegistryContext = { repositories: [], components: [], last_synced_at: new Date(0).toISOString(), warnings: [], repos_dir: resolveReposDir(cfg) };
   const subscribers = new Set<(ctx: RegistryContext) => void>();
   let watcher: WatchHandle | null = null;
 
@@ -76,7 +76,7 @@ export function startRegistryLoader(cfg: ServiceConfig): RegistryLoaderHandle {
         });
         return;
       }
-      const ctx = buildContext(data.repositories, data.synced_at);
+      const ctx = buildContext(data.repositories, data.synced_at, resolveReposDir(cfg));
       lastGood = ctx;
       logger.info('Registry context rebuilt', {
         repos_ok: ctx.repositories.length,

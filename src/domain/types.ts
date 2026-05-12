@@ -35,7 +35,7 @@ export interface WorkflowDefinition {
 }
 
 // ─── 4.1.3 Service Config (typed) ───────────────────────────────────────────
-export interface SymphonyLabels {
+export interface GaggleLabels {
   claimed: string;
   queued: string;
   running: string;
@@ -57,7 +57,8 @@ export interface TrackerConfig {
   blocker_default_readiness: 'merged' | 'deployed' | string;
   gate_waiting_state: string | null;
   gate_resume_state: string | null;
-  symphony_labels: SymphonyLabels;
+  pr_ready_state: string | null;
+  gaggle_labels: GaggleLabels;
 }
 
 export interface PollingConfig {
@@ -83,6 +84,10 @@ export interface AgentConfig {
 
 export interface ArchonConfig {
   command: string;
+  /** Base URL of the Archon HTTP API. Default: http://localhost:3090. */
+  api_url: string;
+  /** How often (ms) to poll Archon's API for run status. Default: 5 000. */
+  poll_interval_ms: number;
   turn_timeout_ms: number;
   stall_timeout_ms: number;
   default_workflow: string;
@@ -93,7 +98,7 @@ export interface ClaudeConfig {
   api_key: string;
   analyzer_model: string;
   analyzer_max_tokens: number;
-  analyzer_timeout_ms: number;
+  gate_classifier_model: string;
 }
 
 export interface WorkflowTemplatesConfig {
@@ -105,9 +110,17 @@ export interface WorkflowTemplatesConfig {
 
 export interface RegistryConfig {
   base_folder: string;
+  /**
+   * Optional: absolute path to the directory where repo checkouts live.
+   * Defaults to `<base_folder>/repos`. Use this to point GaggleDispatch at an
+   * existing set of developer checkouts so it does not create duplicate clones.
+   */
+  repos_path?: string;
   sync_interval_ms: number;
   sync_on_startup: boolean;
   analysis_cache_ttl_ms: number;
+  /** Automatically launch an async scaffold job for repos missing gaggle.md after each sync pass. Default: true. */
+  auto_scaffold: boolean;
 }
 
 export interface SourceRegistryEntry {
@@ -156,7 +169,7 @@ export interface RepoFrontmatter {
   [key: string]: unknown;
 }
 
-export type SyncStatus = 'ok' | 'error' | 'missing_symphony_md' | 'pending';
+export type SyncStatus = 'ok' | 'error' | 'missing_gaggle_md' | 'pending';
 
 export interface SyncedRegistryRepoEntry {
   url: string;
@@ -198,6 +211,8 @@ export interface RegistryContext {
   components: RegistryComponent[];
   last_synced_at: string;
   warnings: string[];
+  /** Absolute path to the directory containing all local repo checkouts. */
+  repos_dir: string;
 }
 
 // ─── 4.1.5 Issue Analysis ───────────────────────────────────────────────────
@@ -258,6 +273,8 @@ export interface LiveSession {
   repo_target: RepoTarget;
   sub_issue_id: string | null;
   archon_pid: number | null;
+  /** Archon DB run id captured from the `workflowRunId` log line at startup. */
+  archon_db_run_id: string | null;
   archon_workflow: string;
   last_archon_event: string | null;
   last_archon_timestamp: string | null;
@@ -269,6 +286,8 @@ export interface LiveSession {
   started_at: string;
   attempt: number | null;
   cancel?: () => void;
+  /** Stops the ArchonRunPoller when the session ends. */
+  stopPoller?: () => void;
 }
 
 // ─── 4.1.10 Retry Entry ─────────────────────────────────────────────────────
@@ -299,6 +318,21 @@ export interface SupervisedGateEntry {
   attempt: number | null;
 }
 
+/**
+ * A sub-issue whose Archon process was found still running (or paused) at startup.
+ * We cannot re-attach to its stdout/stderr, so we track it here and poll
+ * `archon workflow status` periodically to detect completion.
+ */
+export interface DetachedArchonRun {
+  /** Archon database run id (hex string from `archon workflow status --json`). */
+  archon_run_id: string;
+  parent_issue: Issue;
+  sub_issue_id: string | null;
+  repo_alias: string;
+  repo_target: RepoTarget;
+  recovered_at: number;
+}
+
 // ─── 4.1.11 Orchestrator Runtime State ──────────────────────────────────────
 export interface OrchestratorState {
   poll_interval_ms: number;
@@ -313,6 +347,11 @@ export interface OrchestratorState {
   analysis_cache: Map<string, CachedAnalysis>;
   sibling_subissues: Map<string, Map<string, string>>;
   subissue_snapshot: Map<string, { state: string; labels: string[]; refreshed_at: number }>;
+  /**
+   * Sub-issues whose Archon process was found still alive at startup recovery.
+   * Keyed by workerKey (parentId__repoAlias). Polled each reconcile tick.
+   */
+  detached_archon_runs: Map<string, DetachedArchonRun>;
   claude_totals: { input_tokens: number; output_tokens: number; total_tokens: number; seconds_running: number };
 }
 

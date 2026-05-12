@@ -46,8 +46,10 @@ export async function runRepoAdd(opts: RepoAddOptions): Promise<void> {
   const wfPath = resolveWorkflowPath({ cwd });
   if (!existsSync(wfPath)) fatal(`WORKFLOW.md not found at ${wfPath}`);
 
-  if (!/^https?:\/\/(?:www\.)?github\.com\//i.test(opts.url)) {
-    fatal(`URL must be an HTTPS GitHub URL (got '${opts.url}')`);
+  const isHttps = /^https?:\/\/(?:www\.)?github\.com\//i.test(opts.url);
+  const isSsh = /^git@[^:]+:[^/]+\//i.test(opts.url);
+  if (!isHttps && !isSsh) {
+    fatal(`URL must be a GitHub HTTPS URL or SSH URL (git@<host>:owner/repo) — got '${opts.url}'`);
   }
   const slug = deriveRepoSlug(opts.url);
   if (!slug) fatal(`Could not derive a slug from URL '${opts.url}'`);
@@ -92,7 +94,7 @@ export async function runRepoAdd(opts: RepoAddOptions): Promise<void> {
 
     success(`Added ${opts.url} (default branch: ${branch}) to Source Registry.`);
     console.log(chalk.gray('Next:'));
-    console.log(chalk.gray(`  gaggle sync                        # clone and parse symphony.md`));
-    console.log(chalk.gray(`  gaggle repo scaffold ${opts.url}   # if no symphony.md exists yet`));
+    console.log(chalk.gray(`  gaggle sync                        # clone and parse gaggle.md`));
+    console.log(chalk.gray(`  gaggle repo scaffold ${opts.url}   # if no gaggle.md exists yet`));
   });
 }

@@ -1,7 +1,7 @@
 /**
  * Advisory file locking (Section 21.10).
  *
- * Lock file: `<base_folder>/.gaggle.lock` (a.k.a. `.symphony.lock`)
+ * Lock file: `<base_folder>/.gaggle.lock`
  * Body: `{pid, command, started_at}` JSON.
  * Acquisition timeout: 10 seconds.
  *
@@ -45,7 +45,7 @@ function writeHolder(lockBodyPath: string, command: string): void {
  * Acquire the advisory lock around `lockTargetPath` (the file or directory being protected).
  * Returns a release function. On timeout throws `LockTimeout` with holder info.
  *
- * `command` should be the human-readable command name e.g. "symphony repo add".
+ * `command` should be the human-readable command name e.g. "gaggle repo add".
  */
 export async function withLock<T>(
   lockTargetPath: string,

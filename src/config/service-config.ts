@@ -16,7 +16,7 @@ import type {
   RegistryConfig,
   ServiceConfig,
   SourceRegistryEntry,
-  SymphonyLabels,
+  GaggleLabels,
   TrackerConfig,
   WorkflowDefinition,
   WorkflowTemplatesConfig,
@@ -97,15 +97,15 @@ export function buildServiceConfig(def: WorkflowDefinition): ServiceConfig {
     throw new ConfigValidationError(`tracker.kind '${trackerKindRaw}' is not supported (only 'linear')`);
   }
 
-  const symphonyLabelsRaw = asObject(trackerRaw.symphony_labels, 'tracker.symphony_labels');
-  const symphony_labels: SymphonyLabels = {
-    claimed: asString(symphonyLabelsRaw.claimed, 'tracker.symphony_labels.claimed', 'symphony:claimed'),
-    queued: asString(symphonyLabelsRaw.queued, 'tracker.symphony_labels.queued', 'symphony:queued'),
-    running: asString(symphonyLabelsRaw.running, 'tracker.symphony_labels.running', 'symphony:running'),
+  const gaggleLabelsRaw = asObject(trackerRaw.gaggle_labels, 'tracker.gaggle_labels');
+  const gaggle_labels: GaggleLabels = {
+    claimed: asString(gaggleLabelsRaw.claimed, 'tracker.gaggle_labels.claimed', 'gaggle:claimed'),
+    queued: asString(gaggleLabelsRaw.queued, 'tracker.gaggle_labels.queued', 'gaggle:queued'),
+    running: asString(gaggleLabelsRaw.running, 'tracker.gaggle_labels.running', 'gaggle:running'),
     waiting_human: asString(
-      symphonyLabelsRaw.waiting_human,
-      'tracker.symphony_labels.waiting_human',
-      'symphony:waiting-human',
+      gaggleLabelsRaw.waiting_human,
+      'tracker.gaggle_labels.waiting_human',
+      'gaggle:waiting-human',
     ),
   };
 
@@ -149,7 +149,8 @@ export function buildServiceConfig(def: WorkflowDefinition): ServiceConfig {
     ),
     gate_waiting_state: asOptionalString(trackerRaw.gate_waiting_state, 'tracker.gate_waiting_state'),
     gate_resume_state: asOptionalString(trackerRaw.gate_resume_state, 'tracker.gate_resume_state'),
-    symphony_labels,
+    pr_ready_state: asOptionalString(trackerRaw.pr_ready_state, 'tracker.pr_ready_state'),
+    gaggle_labels,
   };
 
   // ── polling ──────────────────────────────────────────────────────────────
@@ -160,7 +161,7 @@ export function buildServiceConfig(def: WorkflowDefinition): ServiceConfig {
 
   // ── workspace ────────────────────────────────────────────────────────────
   const workspaceRaw = asObject(root.workspace, 'workspace');
-  const workspaceRootStr = asString(workspaceRaw.root, 'workspace.root', '~/symphony_workspaces');
+  const workspaceRootStr = asString(workspaceRaw.root, 'workspace.root', '~/gaggle_workspaces');
   const workspace: WorkspaceConfig = {
     root: expandPath(workspaceRootStr, projectDir),
   };
@@ -193,9 +194,11 @@ export function buildServiceConfig(def: WorkflowDefinition): ServiceConfig {
   const archonRaw = asObject(root.archon, 'archon');
   const archon: ArchonConfig = {
     command: asString(archonRaw.command, 'archon.command', 'archon workflow run'),
+    api_url: asString(archonRaw.api_url, 'archon.api_url', 'http://localhost:3090'),
+    poll_interval_ms: asPositiveInt(archonRaw.poll_interval_ms, 'archon.poll_interval_ms', 5_000),
     turn_timeout_ms: asPositiveInt(archonRaw.turn_timeout_ms, 'archon.turn_timeout_ms', 3_600_000),
     stall_timeout_ms: asInt(archonRaw.stall_timeout_ms, 'archon.stall_timeout_ms', 300_000),
-    default_workflow: asString(archonRaw.default_workflow, 'archon.default_workflow', 'symphony/symphony-fix-issue'),
+    default_workflow: asString(archonRaw.default_workflow, 'archon.default_workflow', 'gaggle/gaggle-fix-issue'),
     gate_timeout_ms: asInt(archonRaw.gate_timeout_ms, 'archon.gate_timeout_ms', 0),
   };
 
@@ -205,7 +208,7 @@ export function buildServiceConfig(def: WorkflowDefinition): ServiceConfig {
     api_key: resolveSecretOrLiteral(asOptionalString(claudeRaw.api_key, 'claude.api_key') ?? '$ANTHROPIC_API_KEY'),
     analyzer_model: asString(claudeRaw.analyzer_model, 'claude.analyzer_model', 'claude-sonnet-4-5'),
     analyzer_max_tokens: asPositiveInt(claudeRaw.analyzer_max_tokens, 'claude.analyzer_max_tokens', 1024),
-    analyzer_timeout_ms: asPositiveInt(claudeRaw.analyzer_timeout_ms, 'claude.analyzer_timeout_ms', 30_000),
+    gate_classifier_model: asString(claudeRaw.gate_classifier_model, 'claude.gate_classifier_model', 'claude-haiku-4-5-20251001'),
   };
 
   // ── workflow_templates ───────────────────────────────────────────────────
@@ -213,7 +216,7 @@ export function buildServiceConfig(def: WorkflowDefinition): ServiceConfig {
   const wtPathStr = asString(wtRaw.path, 'workflow_templates.path');
   const workflow_templates: WorkflowTemplatesConfig = {
     path: expandPath(wtPathStr, projectDir),
-    target_subdir: asString(wtRaw.target_subdir, 'workflow_templates.target_subdir', 'symphony'),
+    target_subdir: asString(wtRaw.target_subdir, 'workflow_templates.target_subdir', 'gaggle'),
     sync_on_dispatch: asBool(wtRaw.sync_on_dispatch, 'workflow_templates.sync_on_dispatch', true),
     reload_on_change: asBool(wtRaw.reload_on_change, 'workflow_templates.reload_on_change', true),
   };
@@ -225,16 +228,30 @@ export function buildServiceConfig(def: WorkflowDefinition): ServiceConfig {
   if (!isAbsolute(baseFolder)) {
     throw new ConfigValidationError(`registry.base_folder must resolve to an absolute path (got ${baseFolder})`);
   }
-  if (isInside(baseFolder, projectDir)) {
+  // base_folder may equal project_dir (the project dir is a management folder, not source code).
+  // It must not be a strict subdirectory of project_dir (e.g. project_dir/repos would be confusing).
+  if (isInside(baseFolder, projectDir) && resolve(baseFolder) !== resolve(projectDir)) {
     throw new ConfigValidationError(
-      `registry.base_folder (${baseFolder}) MUST NOT be inside the Symphony project directory (${projectDir})`,
+      `registry.base_folder (${baseFolder}) must not be a subdirectory of the project directory (${projectDir}). ` +
+      `Set it to the project directory itself or an entirely separate path.`,
     );
+  }
+  let reposPath: string | undefined;
+  if (regRaw.repos_path !== undefined && regRaw.repos_path !== null) {
+    const raw = asString(regRaw.repos_path, 'registry.repos_path');
+    const resolved = expandPath(raw, projectDir);
+    if (!isAbsolute(resolved)) {
+      throw new ConfigValidationError(`registry.repos_path must resolve to an absolute path (got ${resolved})`);
+    }
+    reposPath = resolved;
   }
   const registry: RegistryConfig = {
     base_folder: baseFolder,
+    ...(reposPath !== undefined ? { repos_path: reposPath } : {}),
     sync_interval_ms: asInt(regRaw.sync_interval_ms, 'registry.sync_interval_ms', 900_000),
     sync_on_startup: asBool(regRaw.sync_on_startup, 'registry.sync_on_startup', true),
     analysis_cache_ttl_ms: asInt(regRaw.analysis_cache_ttl_ms, 'registry.analysis_cache_ttl_ms', 300_000),
+    auto_scaffold: asBool(regRaw.auto_scaffold, 'registry.auto_scaffold', true),
   };
 
   // ── repositories (Source Registry) ───────────────────────────────────────
@@ -249,9 +266,11 @@ export function buildServiceConfig(def: WorkflowDefinition): ServiceConfig {
     const e = entry as Record<string, unknown>;
     const url = asString(e.url, `repositories[${i}].url`);
     const default_branch = asString(e.default_branch, `repositories[${i}].default_branch`, 'main');
-    if (!/^https?:\/\/(?:www\.)?github\.com\//i.test(url)) {
+    const isHttps = /^https?:\/\/(?:www\.)?github\.com\//i.test(url);
+    const isSsh = /^git@[^:]+:[^/]+\//i.test(url);
+    if (!isHttps && !isSsh) {
       throw new ConfigValidationError(
-        `repositories[${i}].url must be an HTTPS GitHub URL (got ${url}); SSH URLs are not supported`,
+        `repositories[${i}].url must be a GitHub HTTPS URL or SSH URL (git@<host>:owner/repo) — got ${url}`,
       );
     }
     return { url, default_branch };
@@ -289,4 +308,10 @@ export function buildServiceConfig(def: WorkflowDefinition): ServiceConfig {
 export function defaultGateResumeState(cfg: ServiceConfig): string {
   if (cfg.tracker.gate_resume_state) return cfg.tracker.gate_resume_state;
   return cfg.tracker.active_states[0] ?? 'In Progress';
+}
+
+/** State to move an issue/sub-issue to when Archon finishes successfully (PR created). */
+export function completedState(cfg: ServiceConfig): string {
+  if (cfg.tracker.pr_ready_state) return cfg.tracker.pr_ready_state;
+  return cfg.tracker.terminal_states[0] ?? 'Done';
 }

@@ -7,8 +7,9 @@
  * `sync_status` and do NOT abort the pass.
  */
 
-import { existsSync, mkdirSync } from 'node:fs';
+import { existsSync, mkdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
+import { chmodSync } from 'node:fs';
 import { RepoSyncError } from '../domain/errors.ts';
 import type {
   ServiceConfig,
@@ -19,8 +20,8 @@ import type {
 import { logger } from '../util/logger.ts';
 import { commandExists, run, runOrThrow } from '../util/subprocess.ts';
 import { deriveRepoSlug, parseGithubOwnerRepo } from '../util/paths.ts';
-import { readSymphonyMdAt } from './symphony-md.ts';
-import { loadSyncedRegistry, reposBaseDir, writeSyncedRegistry } from './synced-registry.ts';
+import { readGaggleMdAt } from './gaggle-md.ts';
+import { loadSyncedRegistry, reposBaseDir, resolveReposDir, writeSyncedRegistry } from './synced-registry.ts';
 import { withLock } from '../util/lock.ts';
 
 export interface SyncOptions {
@@ -58,10 +59,16 @@ async function getRemoteSha(url: string, branch: string): Promise<string> {
 }
 
 async function gitClone(url: string, branch: string, dest: string): Promise<void> {
-  // Use `gh repo clone` so private repositories work with the user's existing
-  // gh auth (SSH or HTTPS, whichever they configured). Falls back to plain
-  // `git clone` when gh is unavailable (e.g. inside test sandboxes that shim
-  // gh to satisfy `gh api` only).
+  // SSH URLs (git@<host>:owner/repo) are cloned directly so the caller's SSH
+  // host alias (e.g. github-trabajo) and its corresponding identity file are
+  // honoured exactly as configured in ~/.ssh/config.
+  if (/^git@/i.test(url)) {
+    await runOrThrow(['git', 'clone', '--branch', branch, url, dest]);
+    return;
+  }
+  // HTTPS: use `gh repo clone` so private repositories work with the user's
+  // existing gh auth. Falls back to plain `git clone` when gh is unavailable
+  // (e.g. inside test sandboxes that shim gh to satisfy `gh api` only).
   const { owner, repo } = parseGithubOwnerRepo(url);
   const ghAvailable = await commandExists('gh');
   if (ghAvailable) {
@@ -73,13 +80,99 @@ async function gitClone(url: string, branch: string, dest: string): Promise<void
 }
 
 async function gitPullFf(checkout: string, branch: string): Promise<void> {
-  await runOrThrow(['git', '-C', checkout, 'pull', '--ff-only', 'origin', branch]);
+  await runOrThrow(['git', '-C', checkout, 'fetch', 'origin', branch]);
+  await runOrThrow(['git', '-C', checkout, 'reset', '--hard', `origin/${branch}`]);
 }
 
 async function gitCurrentSha(checkout: string): Promise<string | null> {
   const r = await run(['git', '-C', checkout, 'rev-parse', 'HEAD']);
   if (r.exitCode !== 0) return null;
   return r.stdout.trim();
+}
+
+function detectStack(localPath: string): 'node' | 'python' | 'rust' | 'go' | 'unknown' {
+  if (existsSync(join(localPath, 'package.json'))) return 'node';
+  if (
+    existsSync(join(localPath, 'pyproject.toml')) ||
+    existsSync(join(localPath, 'setup.py')) ||
+    existsSync(join(localPath, 'requirements.txt'))
+  )
+    return 'python';
+  if (existsSync(join(localPath, 'Cargo.toml'))) return 'rust';
+  if (existsSync(join(localPath, 'go.mod'))) return 'go';
+  return 'unknown';
+}
+
+const VALIDATE_SCRIPTS: Record<string, string> = {
+  node: `#!/usr/bin/env bash
+# .gaggle/validate.sh — run by GaggleDispatch after each Archon implementation.
+# Commit this file so all agents use the same validation commands.
+set -euo pipefail
+if [ -f bun.lockb ]; then runner=bun
+elif [ -f pnpm-lock.yaml ]; then runner=pnpm
+elif [ -f yarn.lock ]; then runner=yarn
+else runner=npm; fi
+echo "[validate] package manager: $runner"
+$runner run type-check 2>/dev/null || $runner run typecheck 2>/dev/null || echo "[validate] no type-check script, skipping"
+$runner run lint 2>/dev/null || echo "[validate] no lint script, skipping"
+$runner test
+`,
+  python: `#!/usr/bin/env bash
+# .gaggle/validate.sh — run by GaggleDispatch after each Archon implementation.
+# Commit this file so all agents use the same validation commands.
+set -euo pipefail
+echo "[validate] running Python tests"
+if command -v pytest &>/dev/null; then
+  pytest
+else
+  python -m pytest
+fi
+`,
+  rust: `#!/usr/bin/env bash
+# .gaggle/validate.sh — run by GaggleDispatch after each Archon implementation.
+# Commit this file so all agents use the same validation commands.
+set -euo pipefail
+echo "[validate] running Rust checks"
+cargo check
+cargo test
+`,
+  go: `#!/usr/bin/env bash
+# .gaggle/validate.sh — run by GaggleDispatch after each Archon implementation.
+# Commit this file so all agents use the same validation commands.
+set -euo pipefail
+echo "[validate] running Go tests"
+go build ./...
+go test ./...
+`,
+  unknown: `#!/usr/bin/env bash
+# .gaggle/validate.sh — run by GaggleDispatch after each Archon implementation.
+# Commit this file and replace this placeholder with your actual test commands.
+set -euo pipefail
+echo "[validate] no stack detected — edit .gaggle/validate.sh with your test commands"
+exit 1
+`,
+};
+
+function ensureValidateScript(localPath: string, slug: string, quiet: boolean): void {
+  const gaggleDir = join(localPath, '.gaggle');
+  const scriptPath = join(gaggleDir, 'validate.sh');
+  if (existsSync(scriptPath)) return;
+
+  const stack = detectStack(localPath);
+  mkdirSync(gaggleDir, { recursive: true });
+  writeFileSync(scriptPath, VALIDATE_SCRIPTS[stack]!, { encoding: 'utf8' });
+  try {
+    chmodSync(scriptPath, 0o755);
+  } catch {
+    // chmod may fail on Windows — non-fatal
+  }
+  logger.info('Created .gaggle/validate.sh', { slug, stack, path: scriptPath });
+  if (!quiet) {
+    console.log(
+      `  ✓ Created .gaggle/validate.sh for ${slug} (stack: ${stack})` +
+        ` — review and commit it to the repo so agents always use the same commands.`,
+    );
+  }
 }
 
 interface ProcessResult {
@@ -93,7 +186,7 @@ async function processRepository(
   quiet: boolean,
 ): Promise<ProcessResult> {
   const slug = deriveRepoSlug(src.url);
-  const local_path = join(reposBaseDir(cfg.registry.base_folder), slug);
+  const local_path = join(resolveReposDir(cfg), slug);
 
   const baseEntry: SyncedRegistryRepoEntry = {
     url: src.url,
@@ -121,7 +214,7 @@ async function processRepository(
     }
 
     if (!existsSync(local_path)) {
-      mkdirSync(reposBaseDir(cfg.registry.base_folder), { recursive: true });
+      mkdirSync(resolveReposDir(cfg), { recursive: true });
       if (!quiet) logger.info('Cloning repository', { url: src.url, branch: src.default_branch, dest: local_path });
       await gitClone(src.url, src.default_branch, local_path);
     } else if (prior?.last_commit_sha !== remoteSha) {
@@ -138,15 +231,15 @@ async function processRepository(
 
     const headSha = (await gitCurrentSha(local_path)) ?? remoteSha;
 
-    const sympPath = join(local_path, 'symphony.md');
-    if (!existsSync(sympPath)) {
+    const gagglePath = join(local_path, 'gaggle.md');
+    if (!existsSync(gagglePath)) {
       return {
         entry: {
           ...baseEntry,
           last_synced_at: new Date().toISOString(),
           last_commit_sha: headSha,
-          sync_status: 'missing_symphony_md',
-          sync_error: 'No symphony.md found at repository root.',
+          sync_status: 'missing_gaggle_md',
+          sync_error: 'No gaggle.md found at repository root.',
           frontmatter: null,
           narrative: null,
         },
@@ -155,7 +248,7 @@ async function processRepository(
 
     let parsed;
     try {
-      parsed = readSymphonyMdAt(sympPath);
+      parsed = readGaggleMdAt(gagglePath);
     } catch (err) {
       const msg = (err as Error).message;
       return {
@@ -174,11 +267,13 @@ async function processRepository(
           ...baseEntry,
           last_synced_at: new Date().toISOString(),
           last_commit_sha: headSha,
-          sync_status: 'missing_symphony_md',
-          sync_error: 'symphony.md present but unreadable',
+          sync_status: 'missing_gaggle_md',
+          sync_error: 'gaggle.md present but unreadable',
         },
       };
     }
+
+    ensureValidateScript(local_path, slug, quiet);
 
     return {
       entry: {
@@ -215,7 +310,7 @@ export function applyNameCollisions(entries: SyncedRegistryRepoEntry[]): SyncedR
       const winner = seenRepoName.get(repoName)!;
       const msg =
         `Repository name collision: "${repoName}" is already used by ${winner} (winner). ` +
-        `Resolution: rename the 'name' field in this repository's symphony.md.`;
+        `Resolution: rename the 'name' field in this repository's gaggle.md.`;
       logger.error(msg, { url: e.url });
       return { ...e, sync_status: 'error', sync_error: msg };
     }
@@ -227,7 +322,7 @@ export function applyNameCollisions(entries: SyncedRegistryRepoEntry[]): SyncedR
         const msg =
           `Component name collision: "${c.name}" is declared by both "${winner}" (winner) and ` +
           `"${e.frontmatter.name}" (this repository, ${e.url}). ` +
-          `Resolution: rename the component in this repository's symphony.md to a unique name.`;
+          `Resolution: rename the component in this repository's gaggle.md to a unique name.`;
         logger.error(msg, { url: e.url });
         return { ...e, sync_status: 'error', sync_error: msg };
       }
@@ -243,7 +338,7 @@ export function applyNameCollisions(entries: SyncedRegistryRepoEntry[]): SyncedR
 export async function runSyncPass(cfg: ServiceConfig, opts: SyncOptions = {}): Promise<SyncResult> {
   await ensureGhAvailable();
   mkdirSync(cfg.registry.base_folder, { recursive: true });
-  mkdirSync(reposBaseDir(cfg.registry.base_folder), { recursive: true });
+  mkdirSync(resolveReposDir(cfg), { recursive: true });
 
   const prior = loadSyncedRegistry(cfg.registry.base_folder);
   const priorBySlug = new Map<string, SyncedRegistryRepoEntry>();
@@ -272,7 +367,7 @@ export async function runSyncPass(cfg: ServiceConfig, opts: SyncOptions = {}): P
           url: src.url,
           default_branch: src.default_branch,
           slug,
-          local_path: join(reposBaseDir(cfg.registry.base_folder), slug),
+          local_path: join(resolveReposDir(cfg), slug),
           last_synced_at: null,
           last_commit_sha: null,
           sync_status: 'pending',
@@ -300,7 +395,7 @@ export async function runSyncPass(cfg: ServiceConfig, opts: SyncOptions = {}): P
 
   const ok = finalEntries.filter((e) => e.sync_status === 'ok').length;
   const errors = finalEntries.filter((e) => e.sync_status === 'error').length;
-  const missing = finalEntries.filter((e) => e.sync_status === 'missing_symphony_md').length;
+  const missing = finalEntries.filter((e) => e.sync_status === 'missing_gaggle_md').length;
 
   if (!opts.quiet) {
     logger.info('Sync pass complete', { ok, errors, missing, total: finalEntries.length });

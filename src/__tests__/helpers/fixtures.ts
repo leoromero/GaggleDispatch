@@ -44,7 +44,7 @@ export function makeRepoTarget(overrides: Partial<RepoTarget> = {}): RepoTarget 
     repo_url: 'https://github.com/o/repo-a',
     repo_alias: 'repo-a',
     local_path: '/tmp/checkouts/repo-a',
-    archon_workflow: 'symphony/symphony-fix-issue',
+    archon_workflow: 'gaggle/gaggle-fix-issue',
     rationale: 'because',
     components: ['comp-a'],
     ...overrides,
@@ -61,8 +61,8 @@ export function makeRegistryRepo(overrides: Partial<RegistryRepo> = {}): Registr
     url: 'https://github.com/o/repo-a',
     local_path: '/tmp/checkouts/repo-a',
     description: 'desc',
-    default_workflow: 'symphony/symphony-fix-issue',
-    available_workflows: ['symphony/symphony-fix-issue', 'symphony/symphony-supervised'],
+    default_workflow: 'gaggle/gaggle-fix-issue',
+    available_workflows: ['gaggle/gaggle-fix-issue', 'gaggle/gaggle-supervised'],
     components: [{ name: 'comp-a', description: 'cmp', component_type: 'ecs_service' }],
     narrative: 'narrative-a',
     ...overrides,
@@ -81,6 +81,7 @@ export function makeRegistryContext(repos: RegistryRepo[] = [makeRegistryRepo()]
     components,
     last_synced_at: new Date().toISOString(),
     warnings: [],
+    repos_dir: '/tmp/checkouts',
   };
 }
 
@@ -101,11 +102,12 @@ export function makeServiceConfig(overrides: Partial<ServiceConfig> = {}): Servi
       blocker_default_readiness: 'deployed',
       gate_waiting_state: null,
       gate_resume_state: null,
-      symphony_labels: {
-        claimed: 'symphony:claimed',
-        queued: 'symphony:queued',
-        running: 'symphony:running',
-        waiting_human: 'symphony:waiting-human',
+      pr_ready_state: null,
+      gaggle_labels: {
+        claimed: 'gaggle:claimed',
+        queued: 'gaggle:queued',
+        running: 'gaggle:running',
+        waiting_human: 'gaggle:waiting-human',
       },
     },
     polling: { interval_ms: 30_000 },
@@ -119,20 +121,22 @@ export function makeServiceConfig(overrides: Partial<ServiceConfig> = {}): Servi
     },
     archon: {
       command: 'archon workflow run',
+      api_url: 'http://localhost:3090',
+      poll_interval_ms: 5_000,
       turn_timeout_ms: 60_000,
       stall_timeout_ms: 30_000,
-      default_workflow: 'symphony/symphony-fix-issue',
+      default_workflow: 'gaggle/gaggle-fix-issue',
       gate_timeout_ms: 0,
     },
     claude: {
-      api_key: 'sk-ant-test',
+      api_key: '',
       analyzer_model: 'claude-sonnet-4-5',
       analyzer_max_tokens: 1024,
-      analyzer_timeout_ms: 30_000,
+      gate_classifier_model: 'claude-haiku-4-5-20251001',
     },
     workflow_templates: {
       path: '/tmp/templates',
-      target_subdir: 'symphony',
+      target_subdir: 'gaggle',
       sync_on_dispatch: false,
       reload_on_change: false,
     },
@@ -141,6 +145,7 @@ export function makeServiceConfig(overrides: Partial<ServiceConfig> = {}): Servi
       sync_interval_ms: 0,
       sync_on_startup: false,
       analysis_cache_ttl_ms: 300_000,
+      auto_scaffold: false,
     },
     repositories: [{ url: 'https://github.com/o/repo-a', default_branch: 'main' }],
     prompt_template: '',
@@ -163,8 +168,8 @@ export function makeSyncedEntry(overrides: Partial<SyncedRegistryRepoEntry> = {}
     frontmatter: {
       name: 'repo-a',
       description: 'd',
-      default_workflow: 'symphony/symphony-fix-issue',
-      available_workflows: ['symphony/symphony-fix-issue'],
+      default_workflow: 'gaggle/gaggle-fix-issue',
+      available_workflows: ['gaggle/gaggle-fix-issue'],
       components: [{ name: 'comp-a', description: 'c' }],
     },
     narrative: 'n',
@@ -172,8 +177,8 @@ export function makeSyncedEntry(overrides: Partial<SyncedRegistryRepoEntry> = {}
   };
 }
 
-/** Write a minimal symphony.md to a path. */
-export function writeSymphonyMd(path: string, opts: { name: string; component?: string } = { name: 'r' }): void {
+/** Write a minimal gaggle.md to a path. */
+export function writeGaggleMd(path: string, opts: { name: string; component?: string } = { name: 'r' }): void {
   mkdirSync(path.replace(/[/\\][^/\\]+$/, ''), { recursive: true });
   const compName = opts.component ?? `${opts.name}-api`;
   writeFileSync(
@@ -181,16 +186,16 @@ export function writeSymphonyMd(path: string, opts: { name: string; component?: 
     `---
 name: ${opts.name}
 description: A test repo.
-default_workflow: symphony/symphony-fix-issue
+default_workflow: gaggle/gaggle-fix-issue
 available_workflows:
-  - symphony/symphony-fix-issue
+  - gaggle/gaggle-fix-issue
 components:
   - name: ${compName}
     description: A component.
     component_type: ecs_service
 ---
 
-Body of the symphony.md.
+Body of the gaggle.md.
 `,
   );
 }

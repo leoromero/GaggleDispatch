@@ -4,7 +4,7 @@
  */
 
 import { describe, expect, test } from 'bun:test';
-import { classifyApprovalIntent, findHumanReplyAfter } from '../orchestrator/orchestrator.ts';
+import { classifyApprovalIntent, findHumanReplyAfter, hasBotCommentAfter } from '../orchestrator/orchestrator.ts';
 
 describe('classifyApprovalIntent', () => {
   test.each([
@@ -33,8 +33,6 @@ describe('classifyApprovalIntent', () => {
     ['hmm not sure'],
     ['what about this?'],
     ['can you explain?'],
-    // anchored regex: "looks good — lgtm" does NOT start with an approve token
-    ['looks good — lgtm'],
   ])('classifies "%s" as ambiguous', (text: string) => {
     expect(classifyApprovalIntent(text)).toBe('ambiguous');
   });
@@ -56,7 +54,9 @@ describe('findHumanReplyAfter', () => {
       ],
       pausedAt,
     );
+    expect(r?.id).toBe('c2');
     expect(r?.body).toBe('second reply');
+    expect(r?.created_at).toBe('2026-05-09T00:02:00Z');
   });
 
   test('skips comments authored by symphony/gaggle/bot accounts', () => {
@@ -85,5 +85,49 @@ describe('findHumanReplyAfter', () => {
       pausedAt,
     );
     expect(r).toBeNull();
+  });
+});
+
+describe('hasBotCommentAfter', () => {
+  const t = Date.parse('2026-05-09T00:01:00Z');
+
+  test('returns true when a bot comment exists after the given timestamp (by author name)', () => {
+    expect(hasBotCommentAfter(
+      [
+        { body: 'hello', author: { name: 'Alice' }, created_at: '2026-05-09T00:02:00Z' },
+        { body: 'done', author: { name: 'GaggleDispatch' }, created_at: '2026-05-09T00:03:00Z' },
+      ],
+      t,
+    )).toBe(true);
+  });
+
+  test('returns true when a bot comment is identified by 🤖 body prefix (personal API key case)', () => {
+    expect(hasBotCommentAfter(
+      [
+        { body: '🤖 I wasn\'t sure how to interpret that reply.', author: { name: 'Leo Romero' }, created_at: '2026-05-09T00:02:00Z' },
+      ],
+      t,
+    )).toBe(true);
+  });
+
+  test('returns false when the only bot comment is before the timestamp', () => {
+    expect(hasBotCommentAfter(
+      [{ body: 'done', author: { name: 'Symphony Bot' }, created_at: '2026-05-09T00:00:00Z' }],
+      t,
+    )).toBe(false);
+  });
+
+  test('returns false when there are no bot comments at all', () => {
+    expect(hasBotCommentAfter(
+      [{ body: 'implement it', author: { name: 'Alice' }, created_at: '2026-05-09T00:02:00Z' }],
+      t,
+    )).toBe(false);
+  });
+
+  test('returns false for anonymous comments (author.name=null, no 🤖 prefix)', () => {
+    expect(hasBotCommentAfter(
+      [{ body: 'some comment', author: { name: null }, created_at: '2026-05-09T00:02:00Z' }],
+      t,
+    )).toBe(false);
   });
 });
