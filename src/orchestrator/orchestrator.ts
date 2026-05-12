@@ -591,11 +591,17 @@ export class Orchestrator {
     }
 
     // Phase 3: Dispatch or queue each target.
+    //
+    // Targets with unsatisfied upstream dependencies or no available slot stay
+    // queued (gaggle:queued label applied; remaining list keeps them for the
+    // next drain). Ready targets transition queued → dispatching via the SM
+    // (apply gaggle:dispatching, spawn_worker hook → launchWorker which
+    // applies gaggle:running and wires the callbacks back into handleWorkerExit
+    // / handleGatePaused which are themselves SM-driven).
     for (const target of targets) {
       const subIssueId = this.state.sibling_subissues.get(issue.id)?.get(target.repo_alias) ?? null;
       const targetId = subIssueId ?? issue.id;
 
-      // Targets with dependencies wait for their upstream siblings.
       if (target.depends_on?.length && !repoTargetReady(target, issue.id, this.state, this.cfg)) {
         try {
           await this.tracker.applyLabel(targetId, this.cfg.tracker.gaggle_labels.queued);
@@ -612,62 +618,25 @@ export class Orchestrator {
         continue;
       }
 
-      try {
-        await this.tracker.applyLabel(targetId, this.cfg.tracker.gaggle_labels.running);
-      } catch (err) {
-        logger.error('Failed to apply running label; skipping dispatch', {
-          issue_id: issue.id,
+      const transition = targetTransition('queued', { kind: 'dispatch_attempted' }, {
+        cfg: this.cfg,
+        identity: {
+          parent_issue_id: issue.id,
           repo_alias: target.repo_alias,
-          error: (err as Error).message,
-        });
-        remaining.push(target);
-        continue;
-      }
-
-      const key = workerKey(issue.id, target.repo_alias);
-      const log = logger.child({
+          target_issue_id: targetId,
+        },
+        parent_issue: issue,
+        target,
+        siblings: new Map(),
+        attempt: 0,
+      });
+      await this.effectApplier.applyAll(transition.effects);
+      logger.info('Worker dispatched via state machine', {
         issue_id: issue.id,
         issue_identifier: issue.identifier,
         repo_alias: target.repo_alias,
-        session_id: buildSessionId(issue.identifier, target.repo_alias, null),
+        workflow: target.archon_workflow,
       });
-
-      try {
-        const branch = this.cfg.repositories.find((r) => r.url === target.repo_url)?.default_branch ?? 'main';
-        const placeholder = buildLiveSession({ issue, repo_target: target, attempt: null, sub_issue_id: subIssueId, cancel: () => {} });
-        this.state.running.set(key, placeholder);
-
-        const handle = await spawnWorker(
-          { cfg: this.cfg, workspace: this.workspace, issue, repo_target: target, analysis, attempt: null, source_branch: branch },
-          {
-            onStarted: (pid) => { const s = this.state.running.get(key); if (s) { s.archon_pid = pid; s.last_archon_timestamp = new Date().toISOString(); } },
-            onOutput: (line) => { const s = this.state.running.get(key); if (s) { s.last_archon_message = line; s.last_archon_timestamp = new Date().toISOString(); s.turn_count += 1; } },
-            onRunId: (db_run_id) => {
-              const s = this.state.running.get(key);
-              if (s) {
-                s.archon_db_run_id = db_run_id;
-                this.attachPoller(key, db_run_id, issue, target, subIssueId, null);
-              }
-              writeRunEntry(this.cfg.registry.base_folder, key, {
-                archon_run_id: db_run_id,
-                parent_issue_id: issue.id,
-                sub_issue_id: subIssueId,
-                repo_alias: target.repo_alias,
-              });
-            },
-            onGatePaused: (run_id, gate_message) => { void this.handleGatePaused(issue, target, subIssueId, run_id, gate_message, null); },
-            onExit: (event) => { void this.handleWorkerExit(issue, target, event, null); },
-          },
-        );
-        const sess = this.state.running.get(key);
-        if (sess) sess.cancel = handle.cancel;
-        log.info('Worker spawned', { workflow: target.archon_workflow });
-      } catch (err) {
-        logger.error('spawnWorker failed', { issue_id: issue.id, repo_alias: target.repo_alias, error: (err as Error).message });
-        this.state.running.delete(key);
-        try { await this.tracker.removeLabel(targetId, this.cfg.tracker.gaggle_labels.running); } catch { /* ignore */ }
-        this.scheduleRetry(issue, target, 1, (err as Error).message);
-      }
     }
 
     this.state.pending_targets.set(issue.id, remaining);
