@@ -52,20 +52,16 @@ export type WorkerKey = string;
 
 // ─── Labels ────────────────────────────────────────────────────────────────
 
-/** Labels owned by the parent state machine. Applied to parent_issue_id only. */
-export type ParentLabel =
-  | 'gaggle:analyzing'
-  | 'gaggle:claimed';
-
-/** Labels owned by the target state machine. Applied to target_issue_id. */
-export type TargetLabel =
-  | 'gaggle:queued'
-  | 'gaggle:dispatching'
-  | 'gaggle:running'
-  | 'gaggle:waiting-human'
-  | 'gaggle:retrying';
-
-export type GaggleLabel = ParentLabel | TargetLabel;
+/**
+ * Semantic label kinds emitted by the state machine. The EffectApplier
+ * translates these to actual Linear label strings via
+ * `cfg.tracker.gaggle_labels[kind]`, so users can customize label names
+ * without the SM caring. The classifier also accepts kind-keyed sets — the
+ * orchestrator translates Linear label strings to kinds before classification.
+ */
+export type ParentLabelKind = 'analyzing' | 'claimed';
+export type TargetLabelKind = 'queued' | 'dispatching' | 'running' | 'waiting_human' | 'retrying';
+export type LabelKind = ParentLabelKind | TargetLabelKind;
 
 // ─── Parent state machine ──────────────────────────────────────────────────
 
@@ -199,8 +195,8 @@ export interface RetryMeta {
  */
 export type Effect =
   // Linear label & state
-  | { kind: 'apply_label'; issue_id: string; label: GaggleLabel }
-  | { kind: 'remove_label'; issue_id: string; label: GaggleLabel }
+  | { kind: 'apply_label'; issue_id: string; label: LabelKind }
+  | { kind: 'remove_label'; issue_id: string; label: LabelKind }
   | { kind: 'set_linear_state'; issue_id: string; state: string }
   | { kind: 'post_comment'; issue_id: string; body: string }
   | { kind: 'create_sub_issue'; parent_id: string; target: RepoTarget }
@@ -300,7 +296,7 @@ export type TargetTransitionFn = (
  */
 export interface ParentRecoveryInputs {
   parent_id: string;
-  parent_labels: Set<ParentLabel>;
+  parent_labels: Set<ParentLabelKind>;
   linear_state: string;
 }
 
@@ -318,7 +314,7 @@ export interface ParentClassification {
  */
 export interface TargetRecoveryInputs {
   identity: TargetIdentity;
-  target_labels: Set<TargetLabel>;
+  target_labels: Set<TargetLabelKind>;
   linear_state: string;
   archon_run: ArchonRunRecord | null;
   persisted_retry: RetryMeta | null;
@@ -369,7 +365,7 @@ export const parentTransition: ParentTransitionFn = (state, event, ctx) => {
     if (event.kind === 'analysis_started') {
       return {
         from: 'unclaimed', to: 'analyzing',
-        effects: [{ kind: 'apply_label', issue_id: parentId, label: 'gaggle:analyzing' }],
+        effects: [{ kind: 'apply_label', issue_id: parentId, label: 'analyzing' }],
       };
     }
     throw new InvalidTransitionError(state, event.kind, 'parent');
@@ -380,8 +376,8 @@ export const parentTransition: ParentTransitionFn = (state, event, ctx) => {
       return {
         from: 'analyzing', to: 'claimed',
         effects: [
-          { kind: 'remove_label', issue_id: parentId, label: 'gaggle:analyzing' },
-          { kind: 'apply_label', issue_id: parentId, label: 'gaggle:claimed' },
+          { kind: 'remove_label', issue_id: parentId, label: 'analyzing' },
+          { kind: 'apply_label', issue_id: parentId, label: 'claimed' },
         ],
       };
     }
@@ -389,7 +385,7 @@ export const parentTransition: ParentTransitionFn = (state, event, ctx) => {
       return {
         from: 'analyzing', to: 'unclaimed',
         effects: [
-          { kind: 'remove_label', issue_id: parentId, label: 'gaggle:analyzing' },
+          { kind: 'remove_label', issue_id: parentId, label: 'analyzing' },
           { kind: 'log', level: 'warn', message: 'Analysis failed', fields: { issue_id: parentId, error: event.error } },
         ],
       };
@@ -398,7 +394,7 @@ export const parentTransition: ParentTransitionFn = (state, event, ctx) => {
       return {
         from: 'analyzing', to: 'cancelled',
         effects: [
-          { kind: 'remove_label', issue_id: parentId, label: 'gaggle:analyzing' },
+          { kind: 'remove_label', issue_id: parentId, label: 'analyzing' },
           { kind: 'invalidate_analysis_cache', issue_id: parentId },
         ],
       };
@@ -420,7 +416,7 @@ export const parentTransition: ParentTransitionFn = (state, event, ctx) => {
       return {
         from: 'claimed', to,
         effects: [
-          { kind: 'remove_label', issue_id: parentId, label: 'gaggle:claimed' },
+          { kind: 'remove_label', issue_id: parentId, label: 'claimed' },
           { kind: 'set_linear_state', issue_id: parentId, state: linearState },
           { kind: 'release_parent_claim', parent_id: parentId },
           { kind: 'invalidate_analysis_cache', issue_id: parentId },
@@ -431,7 +427,7 @@ export const parentTransition: ParentTransitionFn = (state, event, ctx) => {
       return {
         from: 'claimed', to: 'cancelled',
         effects: [
-          { kind: 'remove_label', issue_id: parentId, label: 'gaggle:claimed' },
+          { kind: 'remove_label', issue_id: parentId, label: 'claimed' },
           { kind: 'cleanup_workspace', issue_identifier: ctx.parent_issue.identifier },
           { kind: 'invalidate_analysis_cache', issue_id: parentId },
         ],
@@ -474,12 +470,12 @@ export const targetTransition: TargetTransitionFn = (state, event, ctx) => {
     }
     const effects: Effect[] = [];
     // Remove whatever target-level label this state owns.
-    const labelForState: Partial<Record<TargetState, TargetLabel>> = {
-      queued: 'gaggle:queued',
-      dispatching: 'gaggle:dispatching',
-      running: 'gaggle:running',
-      gate_waiting: 'gaggle:waiting-human',
-      retrying: 'gaggle:retrying',
+    const labelForState: Partial<Record<TargetState, TargetLabelKind>> = {
+      queued: 'queued',
+      dispatching: 'dispatching',
+      running: 'running',
+      gate_waiting: 'waiting_human',
+      retrying: 'retrying',
     };
     const label = labelForState[state];
     if (label) effects.push({ kind: 'remove_label', issue_id: tid, label });
@@ -496,8 +492,8 @@ export const targetTransition: TargetTransitionFn = (state, event, ctx) => {
       return {
         from: 'queued', to: 'dispatching',
         effects: [
-          { kind: 'remove_label', issue_id: tid, label: 'gaggle:queued' },
-          { kind: 'apply_label', issue_id: tid, label: 'gaggle:dispatching' },
+          { kind: 'remove_label', issue_id: tid, label: 'queued' },
+          { kind: 'apply_label', issue_id: tid, label: 'dispatching' },
           { kind: 'spawn_worker', identity: ctx.identity, target: ctx.target, attempt: ctx.attempt },
         ],
       };
@@ -510,13 +506,13 @@ export const targetTransition: TargetTransitionFn = (state, event, ctx) => {
       return {
         from: 'dispatching', to: 'running',
         effects: [
-          { kind: 'remove_label', issue_id: tid, label: 'gaggle:dispatching' },
-          { kind: 'apply_label', issue_id: tid, label: 'gaggle:running' },
+          { kind: 'remove_label', issue_id: tid, label: 'dispatching' },
+          { kind: 'apply_label', issue_id: tid, label: 'running' },
         ],
       };
     }
     if (event.kind === 'worker_failed') {
-      return retryOrFail(state, ctx, key, tid, 'gaggle:dispatching', event.reason);
+      return retryOrFail(state, ctx, key, tid, 'dispatching', event.reason);
     }
     throw new InvalidTransitionError(state, event.kind, 'target');
   }
@@ -539,7 +535,7 @@ export const targetTransition: TargetTransitionFn = (state, event, ctx) => {
       return {
         from: 'running', to: 'succeeded',
         effects: [
-          { kind: 'remove_label', issue_id: tid, label: 'gaggle:running' },
+          { kind: 'remove_label', issue_id: tid, label: 'running' },
           { kind: 'set_linear_state', issue_id: tid, state: completedState(ctx.cfg) },
           { kind: 'delete_run', key },
           { kind: 'delete_retry', key },
@@ -547,12 +543,12 @@ export const targetTransition: TargetTransitionFn = (state, event, ctx) => {
       };
     }
     if (event.kind === 'worker_failed') {
-      return retryOrFail(state, ctx, key, tid, 'gaggle:running', event.reason);
+      return retryOrFail(state, ctx, key, tid, 'running', event.reason);
     }
     if (event.kind === 'gate_paused') {
       const effects: Effect[] = [
-        { kind: 'remove_label', issue_id: tid, label: 'gaggle:running' },
-        { kind: 'apply_label', issue_id: tid, label: 'gaggle:waiting-human' },
+        { kind: 'remove_label', issue_id: tid, label: 'running' },
+        { kind: 'apply_label', issue_id: tid, label: 'waiting_human' },
         { kind: 'register_supervised_gate', identity: ctx.identity, target: ctx.target, run_id: event.run_id, message: event.message, attempt: ctx.attempt },
       ];
       if (ctx.cfg.tracker.gate_waiting_state) {
@@ -568,19 +564,19 @@ export const targetTransition: TargetTransitionFn = (state, event, ctx) => {
       return {
         from: 'gate_waiting', to: 'running',
         effects: [
-          { kind: 'remove_label', issue_id: tid, label: 'gaggle:waiting-human' },
-          { kind: 'apply_label', issue_id: tid, label: 'gaggle:running' },
+          { kind: 'remove_label', issue_id: tid, label: 'waiting_human' },
+          { kind: 'apply_label', issue_id: tid, label: 'running' },
           { kind: 'archon_approve', identity: ctx.identity, message: event.message },
         ],
       };
     }
     if (event.kind === 'gate_rejected') {
-      return retryOrFail('gate_waiting', ctx, key, tid, 'gaggle:waiting-human', `gate_rejected: ${event.message}`, [
+      return retryOrFail('gate_waiting', ctx, key, tid, 'waiting_human', `gate_rejected: ${event.message}`, [
         { kind: 'archon_reject', identity: ctx.identity, reason: event.message },
       ]);
     }
     if (event.kind === 'gate_timed_out') {
-      return retryOrFail('gate_waiting', ctx, key, tid, 'gaggle:waiting-human', 'gate_timeout', [
+      return retryOrFail('gate_waiting', ctx, key, tid, 'waiting_human', 'gate_timeout', [
         { kind: 'archon_reject', identity: ctx.identity, reason: 'Gate timeout — no human response' },
       ]);
     }
@@ -590,8 +586,8 @@ export const targetTransition: TargetTransitionFn = (state, event, ctx) => {
       return {
         from: 'gate_waiting', to: 'queued',
         effects: [
-          { kind: 'remove_label', issue_id: tid, label: 'gaggle:waiting-human' },
-          { kind: 'apply_label', issue_id: tid, label: 'gaggle:queued' },
+          { kind: 'remove_label', issue_id: tid, label: 'waiting_human' },
+          { kind: 'apply_label', issue_id: tid, label: 'queued' },
           { kind: 'create_blocker_issue', spec: event.blocker, blocks_issue_id: tid },
           { kind: 'archon_reject', identity: ctx.identity, reason: `Blocker created: ${event.blocker.title}` },
           { kind: 'post_comment', issue_id: ctx.identity.parent_issue_id,
@@ -608,8 +604,8 @@ export const targetTransition: TargetTransitionFn = (state, event, ctx) => {
       return {
         from: 'retrying', to: 'dispatching',
         effects: [
-          { kind: 'remove_label', issue_id: tid, label: 'gaggle:retrying' },
-          { kind: 'apply_label', issue_id: tid, label: 'gaggle:dispatching' },
+          { kind: 'remove_label', issue_id: tid, label: 'retrying' },
+          { kind: 'apply_label', issue_id: tid, label: 'dispatching' },
           { kind: 'delete_retry', key },
           { kind: 'spawn_worker', identity: ctx.identity, target: ctx.target, attempt: ctx.attempt },
         ],
@@ -637,8 +633,8 @@ export const targetTransition: TargetTransitionFn = (state, event, ctx) => {
  * reconcileRunningIssues and emits `parent_externally_terminal`.
  */
 export const classifyParentState: ParentClassifierFn = (inp) => {
-  if (inp.parent_labels.has('gaggle:analyzing')) return { parent_id: inp.parent_id, state: 'analyzing' };
-  if (inp.parent_labels.has('gaggle:claimed')) return { parent_id: inp.parent_id, state: 'claimed' };
+  if (inp.parent_labels.has('analyzing')) return { parent_id: inp.parent_id, state: 'analyzing' };
+  if (inp.parent_labels.has('claimed')) return { parent_id: inp.parent_id, state: 'claimed' };
   return { parent_id: inp.parent_id, state: 'unclaimed' };
 };
 
@@ -670,11 +666,11 @@ export const classifyTargetState: TargetClassifierFn = (inp) => {
   const runId = inp.archon_run?.id ?? null;
   const recoveredAttempt = inp.persisted_retry?.attempt ?? 0;
 
-  if (inp.target_labels.has('gaggle:waiting-human')) {
+  if (inp.target_labels.has('waiting_human')) {
     return { identity: inp.identity, state: 'gate_waiting', run_id: runId, attempt: recoveredAttempt };
   }
 
-  if (inp.target_labels.has('gaggle:running')) {
+  if (inp.target_labels.has('running')) {
     const archonStatus = inp.archon_run?.status ?? null;
     if (archonStatus === 'paused') {
       return { identity: inp.identity, state: 'gate_waiting', run_id: runId, attempt: recoveredAttempt };
@@ -688,15 +684,15 @@ export const classifyTargetState: TargetClassifierFn = (inp) => {
     return { identity: inp.identity, state: 'retrying', run_id: null, attempt: recoveredAttempt };
   }
 
-  if (inp.target_labels.has('gaggle:queued')) {
+  if (inp.target_labels.has('queued')) {
     return { identity: inp.identity, state: 'queued', run_id: null, attempt: recoveredAttempt };
   }
 
-  if (inp.target_labels.has('gaggle:retrying')) {
+  if (inp.target_labels.has('retrying')) {
     return { identity: inp.identity, state: 'retrying', run_id: null, attempt: recoveredAttempt };
   }
 
-  if (inp.target_labels.has('gaggle:dispatching')) {
+  if (inp.target_labels.has('dispatching')) {
     return { identity: inp.identity, state: 'retrying', run_id: null, attempt: recoveredAttempt };
   }
 
@@ -712,7 +708,7 @@ function retryOrFail(
   ctx: TargetTransitionContext,
   key: WorkerKey,
   tid: string,
-  currentLabel: TargetLabel,
+  currentLabel: TargetLabelKind,
   reason: string,
   extraEffects: Effect[] = [],
 ): TargetTransition {
@@ -736,7 +732,7 @@ function retryOrFail(
     effects: [
       ...extraEffects,
       { kind: 'remove_label', issue_id: tid, label: currentLabel },
-      { kind: 'apply_label', issue_id: tid, label: 'gaggle:retrying' },
+      { kind: 'apply_label', issue_id: tid, label: 'retrying' },
       { kind: 'delete_run', key },
       { kind: 'persist_retry', key, meta: { attempt: nextAttempt, due_at_ms: Date.now() + delayMs, reason } },
       { kind: 'schedule_retry_timer', key, delay_ms: delayMs, attempt: nextAttempt },

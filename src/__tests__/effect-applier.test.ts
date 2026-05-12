@@ -83,13 +83,13 @@ function hasCall(calls: Call[], op: string, args?: unknown[]): boolean {
 describe('EffectApplier: Linear effects', () => {
   test('apply_label → tracker.applyLabel', async () => {
     const { applier, calls } = makeApplier();
-    await applier.apply({ kind: 'apply_label', issue_id: 'p1', label: 'gaggle:claimed' });
+    await applier.apply({ kind: 'apply_label', issue_id: 'p1', label: 'claimed' });
     expect(hasCall(calls, 'applyLabel', ['p1', 'gaggle:claimed'])).toBe(true);
   });
 
   test('remove_label → tracker.removeLabel', async () => {
     const { applier, calls } = makeApplier();
-    await applier.apply({ kind: 'remove_label', issue_id: 'p1', label: 'gaggle:running' });
+    await applier.apply({ kind: 'remove_label', issue_id: 'p1', label: 'running' });
     expect(hasCall(calls, 'removeLabel', ['p1', 'gaggle:running'])).toBe(true);
   });
 
@@ -252,8 +252,8 @@ describe('EffectApplier: persistence', () => {
     const file = join(baseFolder, 'gaggle-runs.json');
     expect(existsSync(file)).toBe(true);
     const data = JSON.parse(readFileSync(file, 'utf8')) as { retries: Record<string, { attempt: number; sub_issue_id: string | null }> };
-    expect(data.retries['p1__trialmatch-be'].attempt).toBe(2);
-    expect(data.retries['p1__trialmatch-be'].sub_issue_id).toBe('sub-be');
+    expect(data.retries['p1__trialmatch-be']?.attempt).toBe(2);
+    expect(data.retries['p1__trialmatch-be']?.sub_issue_id).toBe('sub-be');
   });
 
   test('delete_retry removes the entry', async () => {
@@ -336,8 +336,8 @@ describe('EffectApplier: applyAll', () => {
   test('processes all effects sequentially', async () => {
     const { applier, calls } = makeApplier();
     const effects: Effect[] = [
-      { kind: 'apply_label', issue_id: 'p1', label: 'gaggle:claimed' },
-      { kind: 'apply_label', issue_id: 'sub-be', label: 'gaggle:running' },
+      { kind: 'apply_label', issue_id: 'p1', label: 'claimed' },
+      { kind: 'apply_label', issue_id: 'sub-be', label: 'running' },
       { kind: 'log', level: 'info', message: 'dispatched', fields: { p: 'p1' } },
     ];
     await applier.applyAll(effects);
@@ -358,7 +358,7 @@ describe('EffectApplier: applyAll', () => {
     } as unknown as LinearClient;
 
     await applier.applyAll([
-      { kind: 'apply_label', issue_id: 'p1', label: 'gaggle:claimed' },
+      { kind: 'apply_label', issue_id: 'p1', label: 'claimed' },
       { kind: 'log', level: 'info', message: 'still ran', fields: {} },
     ]);
     expect(invoked).toBe(1);

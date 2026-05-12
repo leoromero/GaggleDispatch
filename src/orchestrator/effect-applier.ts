@@ -99,10 +99,16 @@ export class EffectApplier {
     switch (effect.kind) {
       // ─── Linear ────────────────────────────────────────────────────────
       case 'apply_label':
-        await this.deps.tracker.applyLabel(effect.issue_id, effect.label);
+        await this.deps.tracker.applyLabel(
+          effect.issue_id,
+          this.deps.cfg.tracker.gaggle_labels[effect.label],
+        );
         return;
       case 'remove_label':
-        await this.deps.tracker.removeLabel(effect.issue_id, effect.label);
+        await this.deps.tracker.removeLabel(
+          effect.issue_id,
+          this.deps.cfg.tracker.gaggle_labels[effect.label],
+        );
         return;
       case 'set_linear_state':
         await this.deps.tracker.updateIssueState(effect.issue_id, effect.state);

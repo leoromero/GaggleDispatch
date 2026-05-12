@@ -15,11 +15,11 @@ import {
   InvalidTransitionError,
   type ParentState,
   type ParentEvent,
-  type ParentLabel,
+  type ParentLabelKind,
   type ParentTransitionContext,
   type TargetState,
   type TargetEvent,
-  type TargetLabel,
+  type TargetLabelKind,
   type TargetTransitionContext,
   type TargetIdentity,
   type Effect,
@@ -68,20 +68,20 @@ describe('parentTransition: valid', () => {
   test('unclaimed + analysis_started → analyzing', () => {
     const t = parentTransition('unclaimed', { kind: 'analysis_started' }, pctx());
     expect(t.to).toBe('analyzing');
-    expect(hasEffect(t.effects, 'apply_label', (e) => e.kind === 'apply_label' && e.label === 'gaggle:analyzing')).toBe(true);
+    expect(hasEffect(t.effects, 'apply_label', (e) => e.kind === 'apply_label' && e.label === 'analyzing')).toBe(true);
   });
 
   test('analyzing + analysis_succeeded → claimed', () => {
     const t = parentTransition('analyzing', { kind: 'analysis_succeeded', targets: [makeRepoTarget()] }, pctx());
     expect(t.to).toBe('claimed');
-    expect(hasEffect(t.effects, 'remove_label', (e) => e.kind === 'remove_label' && e.label === 'gaggle:analyzing')).toBe(true);
-    expect(hasEffect(t.effects, 'apply_label', (e) => e.kind === 'apply_label' && e.label === 'gaggle:claimed')).toBe(true);
+    expect(hasEffect(t.effects, 'remove_label', (e) => e.kind === 'remove_label' && e.label === 'analyzing')).toBe(true);
+    expect(hasEffect(t.effects, 'apply_label', (e) => e.kind === 'apply_label' && e.label === 'claimed')).toBe(true);
   });
 
   test('analyzing + analysis_failed → unclaimed', () => {
     const t = parentTransition('analyzing', { kind: 'analysis_failed', error: 'boom' }, pctx());
     expect(t.to).toBe('unclaimed');
-    expect(hasEffect(t.effects, 'remove_label', (e) => e.kind === 'remove_label' && e.label === 'gaggle:analyzing')).toBe(true);
+    expect(hasEffect(t.effects, 'remove_label', (e) => e.kind === 'remove_label' && e.label === 'analyzing')).toBe(true);
     expect(hasEffect(t.effects, 'log')).toBe(true);
   });
 
@@ -103,7 +103,7 @@ describe('parentTransition: valid', () => {
     const t = parentTransition('claimed', { kind: 'target_terminal', alias: 'b', outcome: 'succeeded' },
       pctx({ a: 'succeeded', b: 'succeeded' }));
     expect(t.to).toBe('done');
-    expect(hasEffect(t.effects, 'remove_label', (e) => e.kind === 'remove_label' && e.label === 'gaggle:claimed')).toBe(true);
+    expect(hasEffect(t.effects, 'remove_label', (e) => e.kind === 'remove_label' && e.label === 'claimed')).toBe(true);
     expect(hasEffect(t.effects, 'set_linear_state', (e) => e.kind === 'set_linear_state' && e.state === 'Done')).toBe(true);
     expect(hasEffect(t.effects, 'release_parent_claim')).toBe(true);
   });
@@ -173,14 +173,14 @@ describe('targetTransition: valid', () => {
   test('dispatching + worker_started → running', () => {
     const t = targetTransition('dispatching', { kind: 'worker_started', pid: 1234 }, tctx());
     expect(t.to).toBe('running');
-    expect(hasEffect(t.effects, 'remove_label', (e) => e.kind === 'remove_label' && e.label === 'gaggle:dispatching')).toBe(true);
-    expect(hasEffect(t.effects, 'apply_label', (e) => e.kind === 'apply_label' && e.label === 'gaggle:running')).toBe(true);
+    expect(hasEffect(t.effects, 'remove_label', (e) => e.kind === 'remove_label' && e.label === 'dispatching')).toBe(true);
+    expect(hasEffect(t.effects, 'apply_label', (e) => e.kind === 'apply_label' && e.label === 'running')).toBe(true);
   });
 
   test('dispatching + worker_failed (under retry cap) → retrying', () => {
     const t = targetTransition('dispatching', { kind: 'worker_failed', reason: 'spawn_err' }, tctx({ attempt: 0 }));
     expect(t.to).toBe('retrying');
-    expect(hasEffect(t.effects, 'apply_label', (e) => e.kind === 'apply_label' && e.label === 'gaggle:retrying')).toBe(true);
+    expect(hasEffect(t.effects, 'apply_label', (e) => e.kind === 'apply_label' && e.label === 'retrying')).toBe(true);
     expect(hasEffect(t.effects, 'persist_retry')).toBe(true);
     expect(hasEffect(t.effects, 'schedule_retry_timer')).toBe(true);
   });
@@ -212,8 +212,8 @@ describe('targetTransition: valid', () => {
   test('running + gate_paused → gate_waiting', () => {
     const t = targetTransition('running', { kind: 'gate_paused', run_id: 'r1', message: 'review plan' }, tctx());
     expect(t.to).toBe('gate_waiting');
-    expect(hasEffect(t.effects, 'remove_label', (e) => e.kind === 'remove_label' && e.label === 'gaggle:running')).toBe(true);
-    expect(hasEffect(t.effects, 'apply_label', (e) => e.kind === 'apply_label' && e.label === 'gaggle:waiting-human')).toBe(true);
+    expect(hasEffect(t.effects, 'remove_label', (e) => e.kind === 'remove_label' && e.label === 'running')).toBe(true);
+    expect(hasEffect(t.effects, 'apply_label', (e) => e.kind === 'apply_label' && e.label === 'waiting_human')).toBe(true);
     expect(hasEffect(t.effects, 'register_supervised_gate')).toBe(true);
   });
 
@@ -252,7 +252,7 @@ describe('targetTransition: valid', () => {
       { kind: 'gate_create_blocker', blocker: { title: 'BE owns this', description: 'Need API first' } },
       tctx());
     expect(t.to).toBe('queued');
-    expect(hasEffect(t.effects, 'apply_label', (e) => e.kind === 'apply_label' && e.label === 'gaggle:queued')).toBe(true);
+    expect(hasEffect(t.effects, 'apply_label', (e) => e.kind === 'apply_label' && e.label === 'queued')).toBe(true);
     expect(hasEffect(t.effects, 'create_blocker_issue')).toBe(true);
     expect(hasEffect(t.effects, 'archon_reject')).toBe(true);
     expect(hasEffect(t.effects, 'post_comment')).toBe(true);
@@ -303,26 +303,26 @@ function archonRun(status: ArchonRunRecord['status'], id = 'r1'): ArchonRunRecor
 
 describe('classifyParentState', () => {
   test('gaggle:analyzing → analyzing', () => {
-    expect(classifyParentState({ parent_id: 'p1', parent_labels: new Set<ParentLabel>(['gaggle:analyzing']), linear_state: 'In Progress' }).state).toBe('analyzing');
+    expect(classifyParentState({ parent_id: 'p1', parent_labels: new Set<ParentLabelKind>(['analyzing']), linear_state: 'In Progress' }).state).toBe('analyzing');
   });
 
   test('gaggle:claimed → claimed', () => {
-    expect(classifyParentState({ parent_id: 'p1', parent_labels: new Set<ParentLabel>(['gaggle:claimed']), linear_state: 'In Progress' }).state).toBe('claimed');
+    expect(classifyParentState({ parent_id: 'p1', parent_labels: new Set<ParentLabelKind>(['claimed']), linear_state: 'In Progress' }).state).toBe('claimed');
   });
 
   test('both labels → analyzing wins (in-flight analysis takes precedence)', () => {
-    expect(classifyParentState({ parent_id: 'p1', parent_labels: new Set<ParentLabel>(['gaggle:analyzing', 'gaggle:claimed']), linear_state: 'In Progress' }).state).toBe('analyzing');
+    expect(classifyParentState({ parent_id: 'p1', parent_labels: new Set<ParentLabelKind>(['analyzing', 'claimed']), linear_state: 'In Progress' }).state).toBe('analyzing');
   });
 
   test('no labels → unclaimed', () => {
-    expect(classifyParentState({ parent_id: 'p1', parent_labels: new Set<ParentLabel>(), linear_state: 'In Progress' }).state).toBe('unclaimed');
+    expect(classifyParentState({ parent_id: 'p1', parent_labels: new Set<ParentLabelKind>(), linear_state: 'In Progress' }).state).toBe('unclaimed');
   });
 });
 
 describe('classifyTargetState', () => {
   const identity: TargetIdentity = { parent_issue_id: 'p1', repo_alias: 'a', target_issue_id: 'sub-a' };
 
-  function call(opts: { labels?: TargetLabel[]; archon?: ArchonRunRecord | null; retry?: { attempt: number; due_at_ms: number; reason: string | null } | null } = {}) {
+  function call(opts: { labels?: TargetLabelKind[]; archon?: ArchonRunRecord | null; retry?: { attempt: number; due_at_ms: number; reason: string | null } | null } = {}) {
     return classifyTargetState({
       identity,
       target_labels: new Set(opts.labels ?? []),
@@ -334,53 +334,53 @@ describe('classifyTargetState', () => {
 
   // Waiting-human dominates
   test('waiting-human alone → gate_waiting', () => {
-    const c = call({ labels: ['gaggle:waiting-human'] });
+    const c = call({ labels: ['waiting_human'] });
     expect(c?.state).toBe('gate_waiting');
   });
   test('waiting-human with paused Archon → still gate_waiting, run_id captured', () => {
-    const c = call({ labels: ['gaggle:waiting-human'], archon: archonRun('paused', 'r-gate') });
+    const c = call({ labels: ['waiting_human'], archon: archonRun('paused', 'r-gate') });
     expect(c?.state).toBe('gate_waiting');
     expect(c?.run_id).toBe('r-gate');
   });
 
   // Running label × Archon status matrix
   test('running + Archon running → running', () => {
-    const c = call({ labels: ['gaggle:running'], archon: archonRun('running', 'r-live') });
+    const c = call({ labels: ['running'], archon: archonRun('running', 'r-live') });
     expect(c?.state).toBe('running');
     expect(c?.run_id).toBe('r-live');
   });
   test('running + Archon paused → gate_waiting (label drift)', () => {
-    const c = call({ labels: ['gaggle:running'], archon: archonRun('paused') });
+    const c = call({ labels: ['running'], archon: archonRun('paused') });
     expect(c?.state).toBe('gate_waiting');
   });
   test('running + Archon completed → succeeded (label drift; work done)', () => {
-    const c = call({ labels: ['gaggle:running'], archon: archonRun('completed') });
+    const c = call({ labels: ['running'], archon: archonRun('completed') });
     expect(c?.state).toBe('succeeded');
   });
   test('running + Archon failed → retrying, run_id cleared', () => {
-    const c = call({ labels: ['gaggle:running'], archon: archonRun('failed') });
+    const c = call({ labels: ['running'], archon: archonRun('failed') });
     expect(c?.state).toBe('retrying');
     expect(c?.run_id).toBeNull();
   });
   test('running + no Archon run → retrying', () => {
-    const c = call({ labels: ['gaggle:running'], archon: null });
+    const c = call({ labels: ['running'], archon: null });
     expect(c?.state).toBe('retrying');
   });
 
   // Other labels
   test('queued → queued', () => {
-    expect(call({ labels: ['gaggle:queued'] })?.state).toBe('queued');
+    expect(call({ labels: ['queued'] })?.state).toBe('queued');
   });
   test('retrying → retrying', () => {
-    expect(call({ labels: ['gaggle:retrying'] })?.state).toBe('retrying');
+    expect(call({ labels: ['retrying'] })?.state).toBe('retrying');
   });
   test('dispatching → retrying (crashed mid-dispatch)', () => {
-    expect(call({ labels: ['gaggle:dispatching'] })?.state).toBe('retrying');
+    expect(call({ labels: ['dispatching'] })?.state).toBe('retrying');
   });
 
   // Recovered attempt count
   test('retrying with persisted retry meta → attempt comes from meta', () => {
-    const c = call({ labels: ['gaggle:retrying'], retry: { attempt: 3, due_at_ms: 1, reason: 'x' } });
+    const c = call({ labels: ['retrying'], retry: { attempt: 3, due_at_ms: 1, reason: 'x' } });
     expect(c?.attempt).toBe(3);
   });
 

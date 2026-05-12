@@ -1662,7 +1662,7 @@ export class Orchestrator {
       // Archon-status switch into a single TargetState we can dispatch on.
       const classification = classifyTargetState({
         identity,
-        target_labels: new Set(['gaggle:running']),
+        target_labels: new Set(['running']),
         linear_state: issue.state ?? '',
         archon_run: archonRun,
         persisted_retry: ctx.persistedRetries[workerKey(parentId, aliasGuess ?? '')] ?? null,
