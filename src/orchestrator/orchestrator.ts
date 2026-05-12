@@ -570,10 +570,8 @@ export class Orchestrator {
     sibMap.set(target.repo_alias, subIssue.id);
 
     // Claim parent if not already active. Drive the parent SM unclaimed →
-    // claimed (the SM emits the apply_label effect); also keep legacy state.claimed
-    // in sync until phase 5e removes it.
+    // claimed (the SM emits the apply_label effect).
     if (!this.isParentActive(parentId)) {
-      this.state.claimed.add(parentId);
       this.state.pending_issues.set(parentId, parentIssue);
       const fromState = this.state.parent_machine_states.get(parentId) ?? 'unclaimed';
       if (fromState === 'unclaimed' || fromState === 'analyzing') {
@@ -626,7 +624,6 @@ export class Orchestrator {
 
   // ─── dispatch ────────────────────────────────────────────────────────────
   private async dispatchIssue(issue: Issue, analysis: IssueAnalysis): Promise<void> {
-    this.state.claimed.add(issue.id);
     this.state.pending_issues.set(issue.id, issue);
 
     if (!this.state.pending_targets.has(issue.id)) {
@@ -1388,7 +1385,11 @@ export class Orchestrator {
       pending.length === 0 &&
       noRetryEntriesFor(this.state, issue_id)
     ) {
-      this.state.claimed.delete(issue_id);
+      // Legacy final cleanup: clear the parent from the SM map. Any preceding
+      // SM transition (target_terminal / parent_externally_terminal) will have
+      // already emitted its effects; this removes the now-stale entry so the
+      // parent is no longer tracked at all.
+      this.state.parent_machine_states.delete(issue_id);
       this.state.pending_issues.delete(issue_id);
       try {
         await this.tracker.removeLabel(issue_id, this.cfg.tracker.gaggle_labels.claimed);
@@ -1774,13 +1775,12 @@ export class Orchestrator {
 
   private recoverClaimedParents(ctx: RecoveryContext): void {
     for (const issue of ctx.claimedIssues) {
-      // Only mark as claimed if it's a parent (no parent_id). Also stash the
-      // Issue snapshot in pending_issues so later recovery passes — and the
+      // Only mark as claimed if it's a parent (no parent_id). Stash the Issue
+      // snapshot in pending_issues so later recovery passes — and the
       // EffectApplier's spawnWorker / scheduleRetry hooks — can resolve the
       // parent without a Linear round-trip. Hydrate parent_machine_states so
-      // the SM and legacy state.claimed agree on the parent's current state.
+      // the SM reflects the parent's recovered state.
       if (!issue.parent_id) {
-        this.state.claimed.add(issue.id);
         this.state.pending_issues.set(issue.id, issue);
         this.state.parent_machine_states.set(issue.id, 'claimed');
       }
@@ -2078,7 +2078,8 @@ export class Orchestrator {
         await this.maybeReleaseClaim(parentId);
       } else {
         logger.info('Orphaned claimed parent detected on startup (no work started) — un-claiming for re-dispatch', { parent_id: parentId });
-        this.state.claimed.delete(parentId);
+        // Un-claim: parent goes back to unclaimed (i.e. removed from the SM
+        // map) so the poll loop can re-pick it up next tick.
         this.state.parent_machine_states.delete(parentId);
         this.state.pending_issues.delete(parentId);
         try { await this.tracker.removeLabel(parentId, this.cfg.tracker.gaggle_labels.claimed); } catch { /* ignore */ }

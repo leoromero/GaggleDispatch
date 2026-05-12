@@ -264,7 +264,10 @@ export class EffectApplier {
         return;
       }
       case 'release_parent_claim':
-        this.deps.state.claimed.delete(effect.parent_id);
+        // Note: this effect is emitted by the parent SM AFTER it has already
+        // transitioned to done/cancelled (so parent_machine_states already
+        // reflects the new state). It still clears pending_issues, which is
+        // orchestrator-owned bookkeeping not modeled by the SM.
         this.deps.state.pending_issues.delete(effect.parent_id);
         return;
       case 'invalidate_analysis_cache':

@@ -234,8 +234,8 @@ describe('Orchestrator.recoverFromLinearLabels', () => {
     orchestrators.push(o);
     await o.start();
     const state = o.getState();
-    expect(state.claimed.has('p1')).toBe(true);
-    expect(state.claimed.has('s1')).toBe(false); // sub-issue does NOT count
+    expect(state.parent_machine_states.get('p1')).toBe('claimed');
+    expect(state.parent_machine_states.get('s1')).toBeUndefined(); // sub-issue does NOT count
   });
 
   test('extracts repo_alias from "[alias] title" pattern on running label', async () => {
@@ -355,7 +355,7 @@ describe('Orchestrator.getState', () => {
     orchestrators.push(orchestrator);
     const s = orchestrator.getState();
     expect(s.running.size).toBe(0);
-    expect(s.claimed.size).toBe(0);
+    expect(s.parent_machine_states.size).toBe(0);
     expect(s.pending_issues.size).toBe(0);
     expect(s.poll_interval_ms).toBe(cfg.polling.interval_ms);
   });
@@ -679,7 +679,11 @@ describe('emitTargetEvent populates target_machine_states', () => {
 
     await (o as unknown as { reconcileRunningIssues(): Promise<void> }).reconcileRunningIssues();
 
-    expect(o.getState().parent_machine_states.get('p1')).toBe('cancelled');
+    // Parent SM fired parent_externally_terminal → effects cleaned up Linear
+    // labels and analysis cache; maybeReleaseClaim then cleared parent_machine_states.
+    expect(o.getState().parent_machine_states.get('p1')).toBeUndefined();
+    expect(o.getState().pending_issues.has('p1')).toBe(false);
+    expect(calls.some((c) => c.op === 'removeLabel' && c.args[0] === 'p1' && c.args[1] === 'gaggle:claimed')).toBe(true);
   });
 
   test('handleWorkerExit success — parent stays in claimed when a sibling target is still queued', async () => {
@@ -856,7 +860,7 @@ describe('crash recovery — recoverFromLinearLabels', () => {
     });
     await o.start();
     // Claimed label removed so the poll loop can re-dispatch
-    expect(o.getState().claimed.has('p1')).toBe(false);
+    expect(o.getState().parent_machine_states.get('p1')).toBeUndefined();
     expect(calls.some((c) => c.op === 'removeLabel' && c.args[0] === 'p1' && c.args[1] === 'gaggle:claimed')).toBe(true);
     // Issue must NOT be moved to a terminal state — it should cycle back through dispatch
     expect(calls.some((c) => c.op === 'updateIssueState' && c.args[0] === 'p1')).toBe(false);
@@ -895,7 +899,7 @@ describe('crash recovery — recoverFromLinearLabels', () => {
 
       await o.start();
       // Claim released
-      expect(o.getState().claimed.has('p1')).toBe(false);
+      expect(o.getState().parent_machine_states.get('p1')).not.toBe('claimed');
       expect(calls.some((c) => c.op === 'removeLabel' && c.args[0] === 'p1' && c.args[1] === 'gaggle:claimed')).toBe(true);
       // Parent transitioned to Done
       expect(calls.some((c) => c.op === 'updateIssueState' && c.args[0] === 'p1' && c.args[1] === 'Done')).toBe(true);
@@ -919,7 +923,7 @@ describe('crash recovery — recoverFromLinearLabels', () => {
     });
     await o.start();
     // Parent still has active sibling → NOT released
-    expect(o.getState().claimed.has('p1')).toBe(true);
+    expect(o.getState().parent_machine_states.get('p1')).toBe('claimed');
     expect(calls.some((c) => c.op === 'updateIssueState' && c.args[0] === 'p1')).toBe(false);
   });
 
@@ -1279,7 +1283,7 @@ describe('reconcileRunningIssues — detached run transitions', () => {
       repo_target: target,
       recovered_at: Date.now(),
     });
-    state.claimed.add('p1');
+    state.parent_machine_states.set('p1', 'claimed');
     state.pending_issues.set('p1', parent);
 
     await (o as unknown as { reconcileRunningIssues(): Promise<void> }).reconcileRunningIssues();
@@ -1386,11 +1390,11 @@ describe('maybeReleaseClaim', () => {
     const issue = makeIssue({ id: 'i1', state: 'In Progress' });
     const { o, calls } = makeDispatchOrchestrator([], {});
     const state = o.getState();
-    state.claimed.add('i1');
+    state.parent_machine_states.set('i1', 'claimed');
     state.pending_issues.set('i1', issue);
     // No running workers, no pending targets, no retries → should release
     await (o as unknown as { maybeReleaseClaim(id: string): Promise<void> }).maybeReleaseClaim('i1');
-    expect(state.claimed.has('i1')).toBe(false);
+    expect(state.parent_machine_states.get('i1')).toBeUndefined();
     expect(calls.some((c) => c.op === 'removeLabel' && c.args[0] === 'i1' && (c.args[1] as string).includes('claimed'))).toBe(true);
     expect(calls.some((c) => c.op === 'updateIssueState' && c.args[0] === 'i1' && c.args[1] === 'Done')).toBe(true);
   });
@@ -1399,7 +1403,7 @@ describe('maybeReleaseClaim', () => {
     const issue = makeIssue({ id: 'i1', state: 'In Progress' });
     const { o, calls } = makeDispatchOrchestrator([], {});
     const state = o.getState();
-    state.claimed.add('i1');
+    state.parent_machine_states.set('i1', 'claimed');
     state.pending_issues.set('i1', issue);
     state.running.set('i1__repo-a', {
       session_id: 'i1__repo-a__0',
@@ -1422,7 +1426,7 @@ describe('maybeReleaseClaim', () => {
       attempt: null,
     });
     await (o as unknown as { maybeReleaseClaim(id: string): Promise<void> }).maybeReleaseClaim('i1');
-    expect(state.claimed.has('i1')).toBe(true); // still claimed
+    expect(state.parent_machine_states.get('i1')).toBe('claimed'); // still claimed
     expect(calls.some((c) => c.op === 'updateIssueState')).toBe(false);
   });
 
@@ -1430,11 +1434,11 @@ describe('maybeReleaseClaim', () => {
     const issue = makeIssue({ id: 'i1', state: 'In Progress' });
     const { o, calls } = makeDispatchOrchestrator([], {});
     const state = o.getState();
-    state.claimed.add('i1');
+    state.parent_machine_states.set('i1', 'claimed');
     state.pending_issues.set('i1', issue);
     state.pending_targets.set('i1', [makeRepoTarget()]); // one target still queued
     await (o as unknown as { maybeReleaseClaim(id: string): Promise<void> }).maybeReleaseClaim('i1');
-    expect(state.claimed.has('i1')).toBe(true);
+    expect(state.parent_machine_states.get('i1')).toBe('claimed');
     expect(calls.some((c) => c.op === 'updateIssueState')).toBe(false);
   });
 });
@@ -1446,7 +1450,7 @@ describe('reconcileRunningIssues — live session transitions', () => {
     const state = o.getState();
 
     let cancelled = false;
-    state.claimed.add('p1');
+    state.parent_machine_states.set('p1', 'claimed');
     state.pending_issues.set('p1', issue);
     state.running.set('p1__trialmatch-be', {
       session_id: 's1', issue, identifier: 'SYM-70', repo_alias: 'trialmatch-be',
@@ -1501,7 +1505,7 @@ describe('scheduleRetry — max retries and completed guard', () => {
     const target = makeRepoTarget({ repo_alias: 'trialmatch-be' });
     const { o, calls } = makeDispatchOrchestrator([], {});
     const state = o.getState();
-    state.claimed.add('p1');
+    state.parent_machine_states.set('p1', 'claimed');
     state.pending_issues.set('p1', issue);
 
     (o as unknown as { scheduleRetry(...args: unknown[]): void }).scheduleRetry(issue, target, 11, 'too many attempts');
@@ -1516,7 +1520,7 @@ describe('scheduleRetry — max retries and completed guard', () => {
     const target = makeRepoTarget({ repo_alias: 'trialmatch-be' });
     const { o, calls } = makeDispatchOrchestrator([], {});
     const state = o.getState();
-    state.claimed.add('p1');
+    state.parent_machine_states.set('p1', 'claimed');
     state.pending_issues.set('p1', issue);
     state.target_machine_states.set('p1__trialmatch-be', 'succeeded');
 
@@ -1524,7 +1528,7 @@ describe('scheduleRetry — max retries and completed guard', () => {
       .executeRetry('p1__trialmatch-be', issue, target, 1);
 
     expect(calls.some((c) => c.op === 'applyLabel')).toBe(false);
-    expect(state.claimed.has('p1')).toBe(false);
+    expect(state.parent_machine_states.get('p1')).toBeUndefined();
   });
 
   test('executeRetry re-queues when no slots available', async () => {
@@ -1535,7 +1539,7 @@ describe('scheduleRetry — max retries and completed guard', () => {
     const { orchestrator: o } = makeOrchestrator({ cfg });
     orchestrators.push(o);
     const state = o.getState();
-    state.claimed.add('p1');
+    state.parent_machine_states.set('p1', 'claimed');
     state.pending_issues.set('p1', issue);
 
     await (o as unknown as { executeRetry(k: string, i: typeof issue, t: typeof target, a: number): Promise<void> })
@@ -1550,7 +1554,7 @@ describe('scheduleRetry — max retries and completed guard', () => {
     const target = makeRepoTarget({ repo_alias: 'trialmatch-be' });
     const { o, calls } = makeDispatchOrchestrator([], {});
     const state = o.getState();
-    state.claimed.add('p1');
+    state.parent_machine_states.set('p1', 'claimed');
     state.pending_issues.set('p1', issue);
 
     (o as unknown as { tracker: unknown }).tracker = {
@@ -1562,7 +1566,7 @@ describe('scheduleRetry — max retries and completed guard', () => {
     await (o as unknown as { executeRetry(k: string, i: typeof issue, t: typeof target, a: number): Promise<void> })
       .executeRetry('p1__trialmatch-be', issue, target, 1);
 
-    expect(state.claimed.has('p1')).toBe(false);
+    expect(state.parent_machine_states.get('p1')).toBeUndefined();
   });
 });
 
@@ -1587,7 +1591,7 @@ describe('gray-zone state guards', () => {
     const target = makeRepoTarget({ repo_alias: 'trialmatch-be' });
     const { o, calls } = makeDispatchOrchestrator([], {});
     const state = o.getState();
-    state.claimed.add('p1');
+    state.parent_machine_states.set('p1', 'claimed');
     state.pending_issues.set('p1', issue);
 
     (o as unknown as { tracker: unknown }).tracker = {
@@ -1599,7 +1603,7 @@ describe('gray-zone state guards', () => {
     await (o as unknown as { executeRetry(k: string, i: typeof issue, t: typeof target, a: number): Promise<void> })
       .executeRetry('p1__trialmatch-be', issue, target, 1);
 
-    expect(state.claimed.has('p1')).toBe(false);
+    expect(state.parent_machine_states.get('p1')).toBeUndefined();
   });
 
   test('recoverFromLinearLabels: running sub in gray-zone state → label cleaned up, NOT re-queued', async () => {

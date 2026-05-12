@@ -327,12 +327,10 @@ describe('EffectApplier: timers & in-memory state', () => {
     expect(state.supervised_gates.get('p1__mono')?.sub_issue_id).toBeNull();
   });
 
-  test('release_parent_claim removes from state.claimed and pending_issues', async () => {
+  test('release_parent_claim removes pending_issues entry (parent_machine_states is set by emitParentEvent earlier)', async () => {
     const { applier, state } = makeApplier();
-    state.claimed.add('p1');
     state.pending_issues.set('p1', makeIssue({ id: 'p1' }));
     await applier.apply({ kind: 'release_parent_claim', parent_id: 'p1' });
-    expect(state.claimed.has('p1')).toBe(false);
     expect(state.pending_issues.has('p1')).toBe(false);
   });
 

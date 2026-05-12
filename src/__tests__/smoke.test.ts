@@ -471,7 +471,8 @@ describe('orchestrator state', () => {
     const cfg = { polling: { interval_ms: 1 }, agent: { max_concurrent_agents: 2 } } as unknown as ServiceConfig;
     const s = createInitialState(cfg);
     expect(s.running.size).toBe(0);
-    expect(s.claimed.size).toBe(0);
+    expect(s.parent_machine_states.size).toBe(0);
+    expect(s.target_machine_states.size).toBe(0);
     expect(s.poll_interval_ms).toBe(1);
   });
 

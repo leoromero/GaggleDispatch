@@ -344,12 +344,10 @@ export interface OrchestratorState {
   poll_interval_ms: number;
   max_concurrent_agents: number;
   running: Map<string, LiveSession>;
-  claimed: Set<string>;
   pending_targets: Map<string, RepoTarget[]>;
   pending_issues: Map<string, Issue>;
   supervised_gates: Map<string, SupervisedGateEntry>;
   retry_attempts: Map<string, RetryEntry>;
-  completed: Set<string>;
   analysis_cache: Map<string, CachedAnalysis>;
   sibling_subissues: Map<string, Map<string, string>>;
   subissue_snapshot: Map<string, { state: string; labels: string[]; refreshed_at: number }>;
