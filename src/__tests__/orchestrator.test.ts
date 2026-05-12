@@ -518,6 +518,63 @@ describe('shouldDispatch eligibility', () => {
   });
 });
 
+// ─── target_machine_states map (phase 5 hydration) ───────────────────────────
+
+describe('emitTargetEvent populates target_machine_states', () => {
+  test('worker_succeeded transition records succeeded state', async () => {
+    const issue = makeIssue({ id: 'p1', identifier: 'SYM-200' });
+    const cfg = makeServiceConfig();
+    const calls: TrackerCall[] = [];
+    const tracker = {
+      ensureGaggleLabels: async () => {},
+      resolveViewerId: async () => 'u1',
+      fetchCandidateIssues: async () => [],
+      fetchIssuesByLabel: async () => [],
+      fetchIssuesByStates: async () => [],
+      fetchIssueStatesByIds: async () => [],
+      fetchIssueComments: async () => [],
+      applyLabel: async (id: string, label: string) => { calls.push({ op: 'applyLabel', args: [id, label] }); },
+      removeLabel: async (id: string, label: string) => { calls.push({ op: 'removeLabel', args: [id, label] }); },
+      postComment: async () => ({ id: 'c1' }),
+      updateIssueState: async (id: string, s: string) => { calls.push({ op: 'updateIssueState', args: [id, s] }); },
+      createSubIssue: async () => ({ id: 'sub1', identifier: 'SYM-99' }),
+      createBlockerRelation: async () => {},
+    } as unknown as LinearClient;
+
+    const reg = makeFakeRegistry();
+    const o = new Orchestrator({
+      cfg,
+      tracker,
+      analyzer: { analyze: async () => ({ issue_id: 'x', analysis_summary: '', repo_targets: [] }) } as unknown as IssueAnalyzer,
+      workspace: {
+        ensureAuxRoot: () => {},
+        cleanAuxiliaryWorkspace: () => {},
+      } as unknown as WorkspaceManager,
+      registry: reg.handle,
+      syncer: null,
+      archonClient: makeFakeArchonClient(),
+    });
+    orchestrators.push(o);
+
+    // Drive a worker_succeeded transition directly via the private helper.
+    const target = makeRepoTarget({ repo_alias: 'fe' });
+    o.getState().pending_issues.set('p1', issue);
+    const transition = await (o as unknown as {
+      emitTargetEvent(s: string, e: { kind: string }, ctx: unknown): Promise<{ to: string }>;
+    }).emitTargetEvent('running', { kind: 'worker_succeeded' }, {
+      cfg,
+      identity: { parent_issue_id: 'p1', repo_alias: 'fe', target_issue_id: 'p1' },
+      parent_issue: issue,
+      target,
+      siblings: new Map(),
+      attempt: 0,
+    });
+
+    expect(transition.to).toBe('succeeded');
+    expect(o.getState().target_machine_states.get('p1__fe')).toBe('succeeded');
+  });
+});
+
 // ─── maybeReleaseClaim ─────────────────────────────────────────────────────────
 
 // ─── crash recovery scenarios ─────────────────────────────────────────────────

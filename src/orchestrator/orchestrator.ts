@@ -50,6 +50,8 @@ import {
   targetTransition,
   type TargetEvent,
   type TargetIdentity,
+  type TargetState,
+  type TargetTransition,
   type TargetTransitionContext,
 } from './state-machine.ts';
 import { EffectApplier } from './effect-applier.ts';
@@ -697,7 +699,7 @@ export class Orchestrator {
         continue;
       }
 
-      const transition = targetTransition('queued', { kind: 'dispatch_attempted' }, {
+      await this.emitTargetEvent('queued', { kind: 'dispatch_attempted' }, {
         cfg: this.cfg,
         identity: {
           parent_issue_id: issue.id,
@@ -709,7 +711,6 @@ export class Orchestrator {
         siblings: new Map(),
         attempt: 0,
       });
-      await this.effectApplier.applyAll(transition.effects);
       logger.info('Worker dispatched via state machine', {
         issue_id: issue.id,
         issue_identifier: issue.identifier,
@@ -922,8 +923,7 @@ export class Orchestrator {
     if (!this.state.pending_issues.has(issue.id)) {
       this.state.pending_issues.set(issue.id, issue);
     }
-    const transition = targetTransition('running', { kind: 'gate_paused', run_id, message: gate_message }, ctx);
-    await this.effectApplier.applyAll(transition.effects);
+    await this.emitTargetEvent('running', { kind: 'gate_paused', run_id, message: gate_message }, ctx);
 
     // 5. Patch up the gate entry with details the SM didn't carry:
     //    - comment_id: only known after posting (above)
@@ -1001,6 +1001,26 @@ export class Orchestrator {
     }
   }
 
+  /**
+   * Run a target state machine transition: compute it, apply effects through
+   * the EffectApplier, and record the resulting state in
+   * state.target_machine_states keyed by workerKey. This is the single
+   * canonical way the orchestrator drives the target SM — every former
+   * targetTransition + applier.applyAll pair now goes through here so the
+   * SM state map stays in sync.
+   */
+  private async emitTargetEvent(
+    fromState: TargetState,
+    event: TargetEvent,
+    ctx: TargetTransitionContext,
+  ): Promise<TargetTransition> {
+    const transition = targetTransition(fromState, event, ctx);
+    await this.effectApplier.applyAll(transition.effects);
+    const key = workerKey(ctx.identity.parent_issue_id, ctx.identity.repo_alias);
+    this.state.target_machine_states.set(key, transition.to);
+    return transition;
+  }
+
   /** Build a TargetTransitionContext from a live supervised gate entry. Used
    *  by the gate-reply state machine transitions. Ensures pending_issues is
    *  populated so downstream hooks (scheduleRetry) can resolve the Issue. */
@@ -1029,8 +1049,7 @@ export class Orchestrator {
       // Timeout → gate_timed_out (SM emits archon_reject, label swap, schedule_retry).
       if (this.cfg.archon.gate_timeout_ms > 0 && Date.now() - gate.paused_at > this.cfg.archon.gate_timeout_ms) {
         await this.resolveGateStateTransition(targetId, gate);
-        const transition = targetTransition('gate_waiting', { kind: 'gate_timed_out' }, this.buildGateTransitionCtx(gate));
-        await this.effectApplier.applyAll(transition.effects);
+        await this.emitTargetEvent('gate_waiting', { kind: 'gate_timed_out' }, this.buildGateTransitionCtx(gate));
         logger.info('Gate timed out — retry scheduled', { issue_id: gate.issue_id, repo_alias: gate.repo_alias });
         continue;
       }
@@ -1062,10 +1081,9 @@ export class Orchestrator {
           blocker_title: classification.blocker!.title,
         });
         await this.resolveGateStateTransition(targetId, gate);
-        const transition = targetTransition('gate_waiting',
+        await this.emitTargetEvent('gate_waiting',
           { kind: 'gate_create_blocker', blocker: classification.blocker! },
           this.buildGateTransitionCtx(gate));
-        await this.effectApplier.applyAll(transition.effects);
         logger.info('Blocker created — target parked in queued', { issue_id: gate.issue_id, repo_alias: gate.repo_alias });
         continue;
       }
@@ -1096,18 +1114,16 @@ export class Orchestrator {
         // effect; the applier looks up the gate's run_id, calls the
         // approveAndResume hook (which spawns the subprocess that approves+
         // resumes via the Archon CLI), and deletes the supervised_gate entry.
-        const transition = targetTransition('gate_waiting',
+        await this.emitTargetEvent('gate_waiting',
           { kind: 'gate_approved', message: classifiedMessage || null },
           this.buildGateTransitionCtx(gate));
-        await this.effectApplier.applyAll(transition.effects);
         logger.info('Gate approved — approve+resume spawned via state machine', { issue_id: gate.issue_id, repo_alias: gate.repo_alias, run_id: gate.run_id });
       } else {
         // reject → gate_rejected (SM emits archon_reject, label → retrying, schedule retry).
         // resolveGateStateTransition already ran above before the approve/reject branch.
-        const transition = targetTransition('gate_waiting',
+        await this.emitTargetEvent('gate_waiting',
           { kind: 'gate_rejected', message: classifiedMessage },
           this.buildGateTransitionCtx(gate));
-        await this.effectApplier.applyAll(transition.effects);
         logger.info('Gate rejected — retry scheduled', { issue_id: gate.issue_id, repo_alias: gate.repo_alias });
       }
     }
@@ -1202,8 +1218,7 @@ export class Orchestrator {
       siblings: new Map(), // not consulted by running → succeeded/retrying transitions
       attempt: attempt ?? 0,
     };
-    const transition = targetTransition('running', smEvent, ctx);
-    await this.effectApplier.applyAll(transition.effects);
+    const transition = await this.emitTargetEvent('running', smEvent, ctx);
 
     if (transition.to === 'succeeded') {
       this.state.completed.add(key);
@@ -1425,7 +1440,7 @@ export class Orchestrator {
     // Drive retrying → dispatching via the SM. Effects:
     //   remove gaggle:retrying, apply gaggle:dispatching, delete_retry,
     //   spawn_worker (hook calls launchWorker with the cached analysis).
-    const transition = targetTransition('retrying', { kind: 'retry_due' }, {
+    await this.emitTargetEvent('retrying', { kind: 'retry_due' }, {
       cfg: this.cfg,
       identity: {
         parent_issue_id: current.id,
@@ -1437,7 +1452,6 @@ export class Orchestrator {
       siblings: new Map(),
       attempt,
     });
-    await this.effectApplier.applyAll(transition.effects);
   }
 
   // ─── reconciliation ──────────────────────────────────────────────────────

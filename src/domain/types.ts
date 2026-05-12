@@ -358,6 +358,18 @@ export interface OrchestratorState {
    * Keyed by workerKey (parentId__repoAlias). Polled each reconcile tick.
    */
   detached_archon_runs: Map<string, DetachedArchonRun>;
+  /**
+   * Per-target state machine state, keyed by workerKey. Updated after every
+   * targetTransition call via Orchestrator.emitTargetEvent. Phase 5 will
+   * migrate `claimed` / `completed` / parts of `running` consumers to read
+   * from this map instead of the legacy sets.
+   */
+  target_machine_states: Map<string, 'queued' | 'dispatching' | 'running' | 'gate_waiting' | 'retrying' | 'succeeded' | 'failed'>;
+  /**
+   * Per-parent state machine state, keyed by parent issue id. Updated after
+   * every parentTransition call.
+   */
+  parent_machine_states: Map<string, 'unclaimed' | 'analyzing' | 'claimed' | 'done' | 'cancelled'>;
   claude_totals: { input_tokens: number; output_tokens: number; total_tokens: number; seconds_running: number };
 }
 
