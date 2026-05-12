@@ -136,8 +136,29 @@ export class Orchestrator {
         const target = this.buildRepoTargetForAlias(alias, issue);
         this.scheduleRetry(issue, target, attempt, null, delayMs);
       },
-      createBlocker: async () => {
-        throw new Error('createBlocker hook not yet wired (gate handler still uses inline logic)');
+      createBlocker: async (spec, blocksIssueId) => {
+        let assigneeId: string | null = null;
+        try { assigneeId = await this.tracker.resolveViewerId(); } catch { /* ignore */ }
+        let newIssue: { id: string; identifier: string; url: string | null };
+        try {
+          newIssue = await this.tracker.createIssue({
+            title: spec.title,
+            description: spec.description || undefined,
+            assignee_id: assigneeId,
+            state_name: this.cfg.tracker.active_states[0] ?? 'Todo',
+          });
+        } catch (err) {
+          logger.error('createBlocker hook: failed to create blocker issue', { error: (err as Error).message });
+          return;
+        }
+        try {
+          await this.tracker.createBlockerRelation(newIssue.id, blocksIssueId);
+        } catch (err) {
+          logger.warn('createBlocker hook: failed to create blocker relation', { error: (err as Error).message });
+        }
+        logger.info('createBlocker: created blocker', {
+          blocker_id: newIssue.id, blocker_identifier: newIssue.identifier, blocks_issue_id: blocksIssueId,
+        });
       },
       createSubIssue: async () => {
         throw new Error('createSubIssue hook not yet wired (dispatch path still uses inline logic)');
@@ -909,22 +930,37 @@ export class Orchestrator {
     }
   }
 
+  /** Build a TargetTransitionContext from a live supervised gate entry. Used
+   *  by the gate-reply state machine transitions. Ensures pending_issues is
+   *  populated so downstream hooks (scheduleRetry) can resolve the Issue. */
+  private buildGateTransitionCtx(gate: SupervisedGateEntry): TargetTransitionContext {
+    const targetId = gate.sub_issue_id ?? gate.issue_id;
+    if (!this.state.pending_issues.has(gate.issue_id)) {
+      this.state.pending_issues.set(gate.issue_id, gate.issue);
+    }
+    return {
+      cfg: this.cfg,
+      identity: {
+        parent_issue_id: gate.issue_id,
+        repo_alias: gate.repo_alias,
+        target_issue_id: targetId,
+      },
+      parent_issue: gate.issue,
+      target: gate.repo_target,
+      siblings: new Map(),
+      attempt: gate.attempt ?? 0,
+    };
+  }
+
   private async pollSupervisedGates(): Promise<void> {
     for (const [key, gate] of this.state.supervised_gates) {
       const targetId = gate.sub_issue_id ?? gate.issue_id;
-      // Timeout
+      // Timeout → gate_timed_out (SM emits archon_reject, label swap, schedule_retry).
       if (this.cfg.archon.gate_timeout_ms > 0 && Date.now() - gate.paused_at > this.cfg.archon.gate_timeout_ms) {
         await this.resolveGateStateTransition(targetId, gate);
-        try {
-          await this.tracker.removeLabel(targetId, this.cfg.tracker.gaggle_labels.waiting_human);
-        } catch {
-          /* ignore */
-        }
-        if (gate.run_id) {
-          await this.archon.rejectRun(gate.run_id, 'Gate timeout — no human response');
-        }
-        this.state.supervised_gates.delete(key);
-        this.scheduleRetry(gate.issue, gate.repo_target, 1, 'gate_timeout');
+        const transition = targetTransition('gate_waiting', { kind: 'gate_timed_out' }, this.buildGateTransitionCtx(gate));
+        await this.effectApplier.applyAll(transition.effects);
+        logger.info('Gate timed out — retry scheduled', { issue_id: gate.issue_id, repo_alias: gate.repo_alias });
         continue;
       }
 
@@ -950,7 +986,16 @@ export class Orchestrator {
       );
       const { intent, message: classifiedMessage } = classification;
       if (intent === 'create_blocker') {
-        await this.handleCreateBlocker(key, gate, classification.blocker!);
+        logger.info('CREATE_BLOCKER gate detected — creating blocker issue', {
+          issue_id: gate.issue_id,
+          blocker_title: classification.blocker!.title,
+        });
+        await this.resolveGateStateTransition(targetId, gate);
+        const transition = targetTransition('gate_waiting',
+          { kind: 'gate_create_blocker', blocker: classification.blocker! },
+          this.buildGateTransitionCtx(gate));
+        await this.effectApplier.applyAll(transition.effects);
+        logger.info('Blocker created — target parked in queued', { issue_id: gate.issue_id, repo_alias: gate.repo_alias });
         continue;
       }
 
@@ -1038,91 +1083,17 @@ export class Orchestrator {
         }
         logger.info('Gate approved — approve+resume worker spawned', { issue_id: gate.issue_id, repo_alias: gate.repo_alias, run_id: gate.run_id });
       } else {
-        // reject
-        if (gate.run_id) {
-          await this.archon.rejectRun(gate.run_id, classifiedMessage);
-        }
-        this.state.supervised_gates.delete(key);
-        this.scheduleRetry(gate.issue, gate.repo_target, 1, 'gate_rejected');
+        // reject → gate_rejected (SM emits archon_reject, label → retrying, schedule retry).
+        // resolveGateStateTransition already ran above before the approve/reject branch.
+        const transition = targetTransition('gate_waiting',
+          { kind: 'gate_rejected', message: classifiedMessage },
+          this.buildGateTransitionCtx(gate));
+        await this.effectApplier.applyAll(transition.effects);
         logger.info('Gate rejected — retry scheduled', { issue_id: gate.issue_id, repo_alias: gate.repo_alias });
       }
     }
   }
 
-  private async handleCreateBlocker(
-    key: string,
-    gate: SupervisedGateEntry,
-    blocker: { title: string; description: string },
-  ): Promise<void> {
-    const targetId = gate.sub_issue_id ?? gate.issue_id;
-    logger.info('CREATE_BLOCKER gate detected — creating blocker issue', {
-      issue_id: gate.issue_id,
-      blocker_title: blocker.title,
-    });
-
-    let newIssue: { id: string; identifier: string; url: string | null };
-    try {
-      const assigneeId = await this.tracker.resolveViewerId().catch(() => null);
-      newIssue = await this.tracker.createIssue({
-        title: blocker.title,
-        description: blocker.description || undefined,
-        priority: gate.issue.priority ?? undefined,
-        assignee_id: assigneeId,
-        state_name: this.cfg.tracker.active_states[0] ?? 'Todo',
-      });
-    } catch (err) {
-      logger.error('Failed to create blocker issue — leaving gate open', { error: (err as Error).message });
-      return;
-    }
-
-    // New issue BLOCKS the original (or its sub-issue if multi-repo).
-    const blockedId = gate.sub_issue_id ?? gate.issue_id;
-    try {
-      await this.tracker.createBlockerRelation(newIssue.id, blockedId);
-    } catch (err) {
-      logger.warn('Failed to create blocker relation', { error: (err as Error).message });
-    }
-
-    // Claim the blocked issue so it isn't re-dispatched while waiting.
-    try { await this.tracker.applyLabel(targetId, this.cfg.tracker.gaggle_labels.claimed); } catch { /* ignore */ }
-    try { await this.tracker.removeLabel(targetId, this.cfg.tracker.gaggle_labels.waiting_human); } catch { /* ignore */ }
-    try { await this.tracker.removeLabel(targetId, this.cfg.tracker.gaggle_labels.running); } catch { /* ignore */ }
-
-    // Restore issue state (move out of gate_waiting_state if it was applied).
-    await this.resolveGateStateTransition(targetId, gate);
-
-    // Terminate the Archon run.
-    if (gate.run_id) {
-      try {
-        await this.archon.rejectRun(
-          gate.run_id,
-          `Paused: blocker issue ${newIssue.identifier} created. Will restart when it resolves.`,
-        );
-      } catch (err) {
-        logger.warn('Failed to reject Archon run for blocker gate', { error: (err as Error).message });
-      }
-    }
-
-    // Post a comment on the original (parent) issue so humans know what happened.
-    const urlPart = newIssue.url ? ` — [${newIssue.identifier}](${newIssue.url})` : ` — ${newIssue.identifier}`;
-    try {
-      await this.tracker.postComment(
-        gate.issue_id,
-        `🔗 **Blocker created**${urlPart}: ${blocker.title}\n\n` +
-          `Implementation is paused until this issue is resolved. ` +
-          `GaggleDispatch will restart automatically once the blocker reaches a satisfied state.`,
-      );
-    } catch (err) {
-      logger.warn('Failed to post blocker comment', { error: (err as Error).message });
-    }
-
-    this.state.supervised_gates.delete(key);
-    logger.info('Blocker created — implementation paused', {
-      issue_id: gate.issue_id,
-      blocker_id: newIssue.id,
-      blocker_identifier: newIssue.identifier,
-    });
-  }
 
   private async resolveGateStateTransition(targetId: string, gate: SupervisedGateEntry): Promise<void> {
     if (!gate.gate_state_applied) return;
