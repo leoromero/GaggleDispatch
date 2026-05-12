@@ -1501,6 +1501,18 @@ export class Orchestrator {
 
     if (!this.cfg.tracker.active_states.includes(current.state)) {
       logger.info('Issue no longer active at retry time; releasing', { issue_id: issue.id, state: current.state });
+      // If the issue moved to a terminal state externally, drive the parent SM
+      // externally-terminal transition so parent_machine_states reflects it.
+      if (this.cfg.tracker.terminal_states.includes(current.state)) {
+        const parentSm = this.state.parent_machine_states.get(issue.id);
+        if (parentSm === 'analyzing' || parentSm === 'claimed') {
+          await this.emitParentEvent(parentSm, { kind: 'parent_externally_terminal' }, {
+            cfg: this.cfg,
+            parent_issue: current,
+            targets: this.buildParentTargetsMap(issue.id),
+          });
+        }
+      }
       await this.maybeReleaseClaim(issue.id);
       return;
     }
@@ -1574,8 +1586,23 @@ export class Orchestrator {
             }
             this.state.running.delete(key);
           }
-          this.workspace.cleanAuxiliaryWorkspace(issue.identifier);
-          this.state.analysis_cache.delete(issue.id);
+          // Drive the parent SM externally-terminal transition. The SM emits
+          // remove_label(claimed), cleanup_workspace, invalidate_analysis_cache
+          // — so the inline cleanup below is also covered. The legacy
+          // maybeReleaseClaim remains as a backstop for state.pending_targets /
+          // state.retry_attempts which the SM doesn't yet own.
+          const parentSm = this.state.parent_machine_states.get(issue.id);
+          if (parentSm === 'analyzing' || parentSm === 'claimed') {
+            await this.emitParentEvent(parentSm, { kind: 'parent_externally_terminal' }, {
+              cfg: this.cfg,
+              parent_issue: issue,
+              targets: this.buildParentTargetsMap(issue.id),
+            });
+          } else {
+            // SM not tracking this parent — fall back to inline cleanup.
+            this.workspace.cleanAuxiliaryWorkspace(issue.identifier);
+            this.state.analysis_cache.delete(issue.id);
+          }
           await this.maybeReleaseClaim(issue.id);
         } else if (this.cfg.tracker.active_states.includes(issue.state)) {
           for (const [, session] of this.state.running) {

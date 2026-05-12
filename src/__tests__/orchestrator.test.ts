@@ -632,6 +632,56 @@ describe('emitTargetEvent populates target_machine_states', () => {
     expect(o.getState().parent_machine_states.get('p1')).toBe('done');
   });
 
+  test('reconcileRunningIssues — issue moved to terminal externally → parent SM transitions to cancelled', async () => {
+    const issue = makeIssue({ id: 'p1', identifier: 'SYM-203', state: 'In Progress' });
+    const cfg = makeServiceConfig();
+    const calls: TrackerCall[] = [];
+    // Tracker returns the issue with a terminal state after the first fetch.
+    const tracker = {
+      ensureGaggleLabels: async () => {},
+      resolveViewerId: async () => 'u1',
+      fetchCandidateIssues: async () => [],
+      fetchIssuesByLabel: async () => [],
+      fetchIssuesByStates: async () => [],
+      fetchIssueStatesByIds: async () => [{ ...issue, state: 'Cancelled' }],
+      fetchIssueComments: async () => [],
+      applyLabel: async (id: string, label: string) => { calls.push({ op: 'applyLabel', args: [id, label] }); },
+      removeLabel: async (id: string, label: string) => { calls.push({ op: 'removeLabel', args: [id, label] }); },
+      postComment: async () => ({ id: 'c1' }),
+      updateIssueState: async (id: string, s: string) => { calls.push({ op: 'updateIssueState', args: [id, s] }); },
+      createSubIssue: async () => ({ id: 'sub1', identifier: 'SYM-99' }),
+      createBlockerRelation: async () => {},
+    } as unknown as LinearClient;
+
+    const reg = makeFakeRegistry();
+    const o = new Orchestrator({
+      cfg, tracker,
+      analyzer: { analyze: async () => ({ issue_id: 'x', analysis_summary: '', repo_targets: [] }) } as unknown as IssueAnalyzer,
+      workspace: { ensureAuxRoot: () => {}, cleanAuxiliaryWorkspace: () => {} } as unknown as WorkspaceManager,
+      registry: reg.handle,
+      syncer: null,
+      archonClient: makeFakeArchonClient(),
+    });
+    orchestrators.push(o);
+
+    // Pre-condition: parent is claimed with a running target.
+    o.getState().pending_issues.set('p1', issue);
+    o.getState().parent_machine_states.set('p1', 'claimed');
+    o.getState().target_machine_states.set('p1__fe', 'running');
+    o.getState().running.set('p1__fe', {
+      session_id: 'x', issue, identifier: 'SYM-203', repo_alias: 'fe',
+      repo_target: makeRepoTarget({ repo_alias: 'fe' }), sub_issue_id: null,
+      archon_pid: 1, archon_db_run_id: 'r1',
+      archon_workflow: '', last_archon_event: null, last_archon_timestamp: null, last_archon_message: null,
+      claude_input_tokens: 0, claude_output_tokens: 0, claude_total_tokens: 0, turn_count: 0,
+      started_at: new Date().toISOString(), attempt: null,
+    });
+
+    await (o as unknown as { reconcileRunningIssues(): Promise<void> }).reconcileRunningIssues();
+
+    expect(o.getState().parent_machine_states.get('p1')).toBe('cancelled');
+  });
+
   test('handleWorkerExit success — parent stays in claimed when a sibling target is still queued', async () => {
     const issue = makeIssue({ id: 'p1', identifier: 'SYM-202' });
     const cfg = makeServiceConfig();
