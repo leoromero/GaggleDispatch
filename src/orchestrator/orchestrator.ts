@@ -401,7 +401,7 @@ export class Orchestrator {
     // SM transitions may apply gaggle:dispatching just before this hook fires;
     // remove it before we apply gaggle:running so the target carries one
     // target-level label at a time. Idempotent if absent.
-    try { await this.tracker.removeLabel(targetId, 'gaggle:dispatching'); } catch { /* ignore */ }
+    try { await this.tracker.removeLabel(targetId, this.cfg.tracker.gaggle_labels.dispatching); } catch { /* ignore */ }
     try {
       await this.tracker.applyLabel(targetId, this.cfg.tracker.gaggle_labels.running);
     } catch (err) {
