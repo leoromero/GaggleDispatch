@@ -116,8 +116,24 @@ export class Orchestrator {
       workspace: this.workspace,
       state: this.state,
       registryBaseFolder: this.cfg.registry.base_folder,
-      spawnWorker: async () => {
-        throw new Error('spawnWorker hook not yet wired (dispatch path still uses inline logic)');
+      spawnWorker: async (args) => {
+        const parentIssue = this.state.pending_issues.get(args.identity.parent_issue_id);
+        if (!parentIssue) {
+          throw new Error(`spawnWorker hook: parent issue ${args.identity.parent_issue_id} not in pending_issues`);
+        }
+        const subIssueId =
+          args.identity.target_issue_id === args.identity.parent_issue_id
+            ? null
+            : args.identity.target_issue_id;
+        const cachedAnalysis = this.state.analysis_cache.get(parentIssue.id)?.analysis;
+        await this.launchWorker(
+          parentIssue,
+          args.target,
+          subIssueId,
+          args.attempt,
+          args.messageOverride,
+          cachedAnalysis,
+        );
       },
       cancelWorker: (key) => {
         const sess = this.state.running.get(key);
@@ -360,13 +376,16 @@ export class Orchestrator {
     };
   }
 
-  /** Launch Archon for a (parentIssue, repoTarget, subIssueId) triple. Shared by drainPendingTargets, dispatchSubIssueFromPoll, and promoteQueuedSiblings. */
+  /** Launch Archon for a (parentIssue, repoTarget, subIssueId) triple. Shared by drainPendingTargets, dispatchSubIssueFromPoll, and promoteQueuedSiblings.
+   *  If `analysisOverride` is provided it is passed to the worker — used by
+   *  the SM-driven retry path so the cached parent analysis is preserved. */
   private async launchWorker(
     parentIssue: Issue,
     target: import('../domain/types.ts').RepoTarget,
     subIssueId: string | null,
     attempt: number | null,
     messageOverride?: string,
+    analysisOverride?: IssueAnalysis,
   ): Promise<void> {
     const targetId = subIssueId ?? parentIssue.id;
     const key = workerKey(parentIssue.id, target.repo_alias);
@@ -377,6 +396,10 @@ export class Orchestrator {
       session_id: buildSessionId(parentIssue.identifier, target.repo_alias, attempt),
     });
 
+    // SM transitions may apply gaggle:dispatching just before this hook fires;
+    // remove it before we apply gaggle:running so the target carries one
+    // target-level label at a time. Idempotent if absent.
+    try { await this.tracker.removeLabel(targetId, 'gaggle:dispatching'); } catch { /* ignore */ }
     try {
       await this.tracker.applyLabel(targetId, this.cfg.tracker.gaggle_labels.running);
     } catch (err) {
@@ -395,7 +418,7 @@ export class Orchestrator {
       workspace: this.workspace,
       issue: parentIssue,
       repo_target: target,
-      analysis: { issue_id: parentIssue.id, analysis_summary: '', repo_targets: [target] },
+      analysis: analysisOverride ?? { issue_id: parentIssue.id, analysis_summary: '', repo_targets: [target] },
       attempt,
       source_branch: branch,
       message_override: messageOverride,
@@ -1399,79 +1422,26 @@ export class Orchestrator {
     const subIssueId = this.state.sibling_subissues.get(issue.id)?.get(target.repo_alias) ?? null;
     const targetId = subIssueId ?? issue.id;
 
-    // worker_failed → retrying applies gaggle:retrying via the SM; remove it
-    // now that we're moving back to dispatching/running. Cheap no-op if absent.
-    try {
-      await this.tracker.removeLabel(targetId, 'gaggle:retrying');
-    } catch {
-      /* ignore */
-    }
-    try {
-      await this.tracker.applyLabel(targetId, this.cfg.tracker.gaggle_labels.running);
-    } catch {
-      /* ignore */
-    }
+    // Ensure pending_issues is populated so the spawnWorker hook can resolve
+    // the refreshed Issue. The hook also uses analysis_cache.
+    this.state.pending_issues.set(current.id, current);
 
-    let placeholder = buildLiveSession({
-      issue: current,
-      repo_target: target,
+    // Drive retrying → dispatching via the SM. Effects:
+    //   remove gaggle:retrying, apply gaggle:dispatching, delete_retry,
+    //   spawn_worker (hook calls launchWorker with the cached analysis).
+    const transition = targetTransition('retrying', { kind: 'retry_due' }, {
+      cfg: this.cfg,
+      identity: {
+        parent_issue_id: current.id,
+        repo_alias: target.repo_alias,
+        target_issue_id: targetId,
+      },
+      parent_issue: current,
+      target,
+      siblings: new Map(),
       attempt,
-      sub_issue_id: subIssueId,
-      cancel: () => {},
     });
-    this.state.running.set(key, placeholder);
-
-    try {
-      const branch = this.cfg.repositories.find((r) => r.url === target.repo_url)?.default_branch ?? 'main';
-      const handle = await spawnWorker(
-        {
-          cfg: this.cfg,
-          workspace: this.workspace,
-          issue: current,
-          repo_target: target,
-          analysis,
-          attempt,
-          source_branch: branch,
-        },
-        {
-          onStarted: (pid) => {
-            const s = this.state.running.get(key);
-            if (s) s.archon_pid = pid;
-          },
-          onOutput: (line) => {
-            const s = this.state.running.get(key);
-            if (s) {
-              s.last_archon_message = line;
-              s.last_archon_timestamp = new Date().toISOString();
-            }
-          },
-          onRunId: (db_run_id) => {
-            const s = this.state.running.get(key);
-            if (s) {
-              s.archon_db_run_id = db_run_id;
-              this.attachPoller(key, db_run_id, current, target, subIssueId, attempt);
-            }
-            writeRunEntry(this.cfg.registry.base_folder, key, {
-              archon_run_id: db_run_id,
-              parent_issue_id: current.id,
-              sub_issue_id: subIssueId,
-              repo_alias: target.repo_alias,
-            });
-          },
-          onGatePaused: (run_id, gate_message) => {
-            void this.handleGatePaused(current, target, subIssueId, run_id, gate_message, attempt);
-          },
-          onExit: (event) => {
-            void this.handleWorkerExit(current, target, event, attempt);
-          },
-        },
-      );
-      const sess = this.state.running.get(key);
-      if (sess) sess.cancel = handle.cancel;
-    } catch (err) {
-      this.state.running.delete(key);
-      this.scheduleRetry(current, target, attempt + 1, (err as Error).message);
-    }
+    await this.effectApplier.applyAll(transition.effects);
   }
 
   // ─── reconciliation ──────────────────────────────────────────────────────
