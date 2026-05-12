@@ -212,9 +212,12 @@ export type Effect =
   | { kind: 'cancel_worker'; key: WorkerKey }
   | { kind: 'cleanup_workspace'; issue_identifier: string }
 
-  // Archon control plane
-  | { kind: 'archon_approve'; run_id: string; message: string | null }
-  | { kind: 'archon_reject'; run_id: string; reason: string }
+  // Archon control plane. The applier resolves the run_id from the live
+  // supervised_gates entry keyed by identity, and removes that gate entry as
+  // an atomic part of the operation. This couples the Archon call with the
+  // in-memory gate cleanup, matching the current orchestrator's semantics.
+  | { kind: 'archon_approve'; identity: TargetIdentity; message: string | null }
+  | { kind: 'archon_reject'; identity: TargetIdentity; reason: string }
 
   // Persistence (run-registry, extended to hold retry meta as well)
   | { kind: 'persist_run'; key: WorkerKey; run_id: string; meta: RunMeta }
@@ -559,20 +562,18 @@ export const targetTransition: TargetTransitionFn = (state, event, ctx) => {
         effects: [
           { kind: 'remove_label', issue_id: tid, label: 'gaggle:waiting-human' },
           { kind: 'apply_label', issue_id: tid, label: 'gaggle:running' },
-          // run_id lives on the gate entry in memory; the applier reads it from there.
-          // Effect carries the message; applier looks up run_id from the supervised gate map.
-          { kind: 'archon_approve', run_id: '__from_gate__', message: event.message },
+          { kind: 'archon_approve', identity: ctx.identity, message: event.message },
         ],
       };
     }
     if (event.kind === 'gate_rejected') {
       return retryOrFail('gate_waiting', ctx, key, tid, 'gaggle:waiting-human', `gate_rejected: ${event.message}`, [
-        { kind: 'archon_reject', run_id: '__from_gate__', reason: event.message },
+        { kind: 'archon_reject', identity: ctx.identity, reason: event.message },
       ]);
     }
     if (event.kind === 'gate_timed_out') {
       return retryOrFail('gate_waiting', ctx, key, tid, 'gaggle:waiting-human', 'gate_timeout', [
-        { kind: 'archon_reject', run_id: '__from_gate__', reason: 'Gate timeout — no human response' },
+        { kind: 'archon_reject', identity: ctx.identity, reason: 'Gate timeout — no human response' },
       ]);
     }
     if (event.kind === 'gate_create_blocker') {
@@ -584,7 +585,7 @@ export const targetTransition: TargetTransitionFn = (state, event, ctx) => {
           { kind: 'remove_label', issue_id: tid, label: 'gaggle:waiting-human' },
           { kind: 'apply_label', issue_id: tid, label: 'gaggle:queued' },
           { kind: 'create_blocker_issue', spec: event.blocker, blocks_issue_id: tid },
-          { kind: 'archon_reject', run_id: '__from_gate__', reason: `Blocker created: ${event.blocker.title}` },
+          { kind: 'archon_reject', identity: ctx.identity, reason: `Blocker created: ${event.blocker.title}` },
           { kind: 'post_comment', issue_id: ctx.identity.parent_issue_id,
             body: `🔗 **Blocker created**: ${event.blocker.title}\n\nImplementation is paused until this issue is resolved. GaggleDispatch will restart automatically once the blocker reaches a satisfied state.` },
           { kind: 'delete_run', key },
