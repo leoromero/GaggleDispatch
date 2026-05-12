@@ -10,16 +10,21 @@ import { describe, expect, test } from 'bun:test';
 import {
   parentTransition,
   targetTransition,
+  classifyParentState,
+  classifyTargetState,
   InvalidTransitionError,
   type ParentState,
   type ParentEvent,
+  type ParentLabel,
   type ParentTransitionContext,
   type TargetState,
   type TargetEvent,
+  type TargetLabel,
   type TargetTransitionContext,
   type TargetIdentity,
   type Effect,
 } from '../orchestrator/state-machine.ts';
+import type { ArchonRunRecord } from '../executor/archon-client.ts';
 import { makeIssue, makeRepoTarget, makeServiceConfig } from './helpers/fixtures.ts';
 
 // ─── fixtures ──────────────────────────────────────────────────────────────
@@ -283,6 +288,107 @@ describe('targetTransition: parent_terminal universal handling', () => {
 });
 
 // ─── Target SM: invalid transitions ────────────────────────────────────────
+
+// ─── Recovery classifiers ──────────────────────────────────────────────────
+
+function archonRun(status: ArchonRunRecord['status'], id = 'r1'): ArchonRunRecord {
+  return {
+    id, status,
+    workflow_name: 'gaggle/gaggle-fix-issue',
+    working_path: '/x',
+    started_at: new Date().toISOString(),
+    user_message: '', completed_at: null, last_activity_at: null, metadata: {},
+  };
+}
+
+describe('classifyParentState', () => {
+  test('gaggle:analyzing → analyzing', () => {
+    expect(classifyParentState({ parent_id: 'p1', parent_labels: new Set<ParentLabel>(['gaggle:analyzing']), linear_state: 'In Progress' }).state).toBe('analyzing');
+  });
+
+  test('gaggle:claimed → claimed', () => {
+    expect(classifyParentState({ parent_id: 'p1', parent_labels: new Set<ParentLabel>(['gaggle:claimed']), linear_state: 'In Progress' }).state).toBe('claimed');
+  });
+
+  test('both labels → analyzing wins (in-flight analysis takes precedence)', () => {
+    expect(classifyParentState({ parent_id: 'p1', parent_labels: new Set<ParentLabel>(['gaggle:analyzing', 'gaggle:claimed']), linear_state: 'In Progress' }).state).toBe('analyzing');
+  });
+
+  test('no labels → unclaimed', () => {
+    expect(classifyParentState({ parent_id: 'p1', parent_labels: new Set<ParentLabel>(), linear_state: 'In Progress' }).state).toBe('unclaimed');
+  });
+});
+
+describe('classifyTargetState', () => {
+  const identity: TargetIdentity = { parent_issue_id: 'p1', repo_alias: 'a', target_issue_id: 'sub-a' };
+
+  function call(opts: { labels?: TargetLabel[]; archon?: ArchonRunRecord | null; retry?: { attempt: number; due_at_ms: number; reason: string | null } | null } = {}) {
+    return classifyTargetState({
+      identity,
+      target_labels: new Set(opts.labels ?? []),
+      linear_state: 'In Progress',
+      archon_run: opts.archon ?? null,
+      persisted_retry: opts.retry ?? null,
+    });
+  }
+
+  // Waiting-human dominates
+  test('waiting-human alone → gate_waiting', () => {
+    const c = call({ labels: ['gaggle:waiting-human'] });
+    expect(c?.state).toBe('gate_waiting');
+  });
+  test('waiting-human with paused Archon → still gate_waiting, run_id captured', () => {
+    const c = call({ labels: ['gaggle:waiting-human'], archon: archonRun('paused', 'r-gate') });
+    expect(c?.state).toBe('gate_waiting');
+    expect(c?.run_id).toBe('r-gate');
+  });
+
+  // Running label × Archon status matrix
+  test('running + Archon running → running', () => {
+    const c = call({ labels: ['gaggle:running'], archon: archonRun('running', 'r-live') });
+    expect(c?.state).toBe('running');
+    expect(c?.run_id).toBe('r-live');
+  });
+  test('running + Archon paused → gate_waiting (label drift)', () => {
+    const c = call({ labels: ['gaggle:running'], archon: archonRun('paused') });
+    expect(c?.state).toBe('gate_waiting');
+  });
+  test('running + Archon completed → succeeded (label drift; work done)', () => {
+    const c = call({ labels: ['gaggle:running'], archon: archonRun('completed') });
+    expect(c?.state).toBe('succeeded');
+  });
+  test('running + Archon failed → retrying, run_id cleared', () => {
+    const c = call({ labels: ['gaggle:running'], archon: archonRun('failed') });
+    expect(c?.state).toBe('retrying');
+    expect(c?.run_id).toBeNull();
+  });
+  test('running + no Archon run → retrying', () => {
+    const c = call({ labels: ['gaggle:running'], archon: null });
+    expect(c?.state).toBe('retrying');
+  });
+
+  // Other labels
+  test('queued → queued', () => {
+    expect(call({ labels: ['gaggle:queued'] })?.state).toBe('queued');
+  });
+  test('retrying → retrying', () => {
+    expect(call({ labels: ['gaggle:retrying'] })?.state).toBe('retrying');
+  });
+  test('dispatching → retrying (crashed mid-dispatch)', () => {
+    expect(call({ labels: ['gaggle:dispatching'] })?.state).toBe('retrying');
+  });
+
+  // Recovered attempt count
+  test('retrying with persisted retry meta → attempt comes from meta', () => {
+    const c = call({ labels: ['gaggle:retrying'], retry: { attempt: 3, due_at_ms: 1, reason: 'x' } });
+    expect(c?.attempt).toBe(3);
+  });
+
+  // No labels
+  test('no target-level labels → null', () => {
+    expect(call({ labels: [] })).toBeNull();
+  });
+});
 
 describe('targetTransition: invalid pairs throw', () => {
   const allStates: TargetState[] = ['queued', 'dispatching', 'running', 'gate_waiting', 'retrying', 'succeeded', 'failed'];

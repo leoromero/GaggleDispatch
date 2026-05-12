@@ -333,7 +333,14 @@ export interface TargetClassification {
 }
 
 export type ParentClassifierFn = (inp: ParentRecoveryInputs) => ParentClassification;
-export type TargetClassifierFn = (inp: TargetRecoveryInputs) => TargetClassification;
+
+/**
+ * Target classifier returns null when no target-level labels are present on
+ * the issue. That signals "this issue is not currently a target of any state
+ * machine" — the coordinator should not create a target SM for it. Every
+ * non-null path is keyed by exactly one observed target label.
+ */
+export type TargetClassifierFn = (inp: TargetRecoveryInputs) => TargetClassification | null;
 
 // ─── Errors ────────────────────────────────────────────────────────────────
 
@@ -612,6 +619,87 @@ export const targetTransition: TargetTransitionFn = (state, event, ctx) => {
 
   // succeeded | failed — terminal.
   throw new InvalidTransitionError(state, event.kind, 'target');
+};
+
+// ─── Recovery classifiers ──────────────────────────────────────────────────
+
+/**
+ * Pure classifier: parent label set → ParentState.
+ *
+ *   gaggle:analyzing  → analyzing (highest priority — analysis is in flight)
+ *   gaggle:claimed    → claimed
+ *   (no labels)       → unclaimed
+ *
+ * The classifier does NOT inspect Linear state. A parent issue in a terminal
+ * Linear state but still carrying gaggle:claimed is in `claimed`; the
+ * coordinator detects the externally-terminal condition via
+ * reconcileRunningIssues and emits `parent_externally_terminal`.
+ */
+export const classifyParentState: ParentClassifierFn = (inp) => {
+  if (inp.parent_labels.has('gaggle:analyzing')) return { parent_id: inp.parent_id, state: 'analyzing' };
+  if (inp.parent_labels.has('gaggle:claimed')) return { parent_id: inp.parent_id, state: 'claimed' };
+  return { parent_id: inp.parent_id, state: 'unclaimed' };
+};
+
+/**
+ * Pure classifier: target label set + Archon status → TargetState.
+ *
+ * Resolution order (each branch returns; later branches don't run):
+ *
+ *   1. gaggle:waiting-human            → gate_waiting
+ *      Gate is authoritative for this label; Archon status is informational.
+ *
+ *   2. gaggle:running, reconciled with Archon status:
+ *        Archon paused                 → gate_waiting   (label drift; gate is truth)
+ *        Archon completed              → succeeded      (label drift; run finished)
+ *        Archon running                → running        (live, possibly detached)
+ *        Archon failed / not-found     → retrying       (the orchestrator will re-queue)
+ *
+ *   3. gaggle:queued                   → queued
+ *
+ *   4. gaggle:retrying                 → retrying
+ *
+ *   5. gaggle:dispatching              → retrying
+ *      A crash during dispatching means no worker ever started; treat as a
+ *      retry candidate so the next tick re-enters the dispatch flow.
+ *
+ *   6. (no target-level labels)        → null
+ */
+export const classifyTargetState: TargetClassifierFn = (inp) => {
+  const runId = inp.archon_run?.id ?? null;
+  const recoveredAttempt = inp.persisted_retry?.attempt ?? 0;
+
+  if (inp.target_labels.has('gaggle:waiting-human')) {
+    return { identity: inp.identity, state: 'gate_waiting', run_id: runId, attempt: recoveredAttempt };
+  }
+
+  if (inp.target_labels.has('gaggle:running')) {
+    const archonStatus = inp.archon_run?.status ?? null;
+    if (archonStatus === 'paused') {
+      return { identity: inp.identity, state: 'gate_waiting', run_id: runId, attempt: recoveredAttempt };
+    }
+    if (archonStatus === 'completed') {
+      return { identity: inp.identity, state: 'succeeded', run_id: runId, attempt: recoveredAttempt };
+    }
+    if (archonStatus === 'running') {
+      return { identity: inp.identity, state: 'running', run_id: runId, attempt: recoveredAttempt };
+    }
+    return { identity: inp.identity, state: 'retrying', run_id: null, attempt: recoveredAttempt };
+  }
+
+  if (inp.target_labels.has('gaggle:queued')) {
+    return { identity: inp.identity, state: 'queued', run_id: null, attempt: recoveredAttempt };
+  }
+
+  if (inp.target_labels.has('gaggle:retrying')) {
+    return { identity: inp.identity, state: 'retrying', run_id: null, attempt: recoveredAttempt };
+  }
+
+  if (inp.target_labels.has('gaggle:dispatching')) {
+    return { identity: inp.identity, state: 'retrying', run_id: null, attempt: recoveredAttempt };
+  }
+
+  return null;
 };
 
 /** Shared helper for `worker_failed` and `gate_rejected`/`gate_timed_out`:
