@@ -79,8 +79,8 @@ describe('run-registry', () => {
     writeRunEntry(tmpDir, 'SYM-2__repo-b', { archon_run_id: 'bbb', parent_issue_id: 'p2', sub_issue_id: 's2', repo_alias: 'repo-b' });
     const all = allRunEntries(tmpDir);
     expect(Object.keys(all)).toHaveLength(2);
-    expect(all['SYM-1__repo-a'].archon_run_id).toBe('aaa');
-    expect(all['SYM-2__repo-b'].archon_run_id).toBe('bbb');
+    expect(all['SYM-1__repo-a']?.archon_run_id).toBe('aaa');
+    expect(all['SYM-2__repo-b']?.archon_run_id).toBe('bbb');
   });
 
   test('deleteRunEntry removes the entry', () => {
@@ -100,7 +100,7 @@ describe('run-registry', () => {
     deleteRunEntry(tmpDir, 'SYM-1__a');
     const all = allRunEntries(tmpDir);
     expect(Object.keys(all)).toHaveLength(1);
-    expect(all['SYM-2__b'].archon_run_id).toBe('b');
+    expect(all['SYM-2__b']?.archon_run_id).toBe('b');
   });
 
   test('writeRunEntry overwrites an existing entry for the same key', () => {

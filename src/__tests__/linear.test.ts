@@ -60,7 +60,7 @@ describe('LinearClient.query', () => {
   test('throws LinearError on non-OK HTTP status', async () => {
     const c = new LinearClient(makeServiceConfig());
     // Override stubFetch to return a 401
-    globalThis.fetch = async () => new Response('Unauthorized', { status: 401 });
+    globalThis.fetch = (async () => new Response('Unauthorized', { status: 401 })) as unknown as typeof fetch;
     await expect(c.resolveViewerId()).rejects.toThrow('Linear HTTP 401');
   });
 
@@ -389,16 +389,17 @@ describe('LinearClient.fetchIssuesByLabel', () => {
 });
 
 describe('LinearClient.ensureGaggleLabels', () => {
-  test('creates all four labels when none exist', async () => {
+  test('creates all seven labels when none exist', async () => {
     const c = new LinearClient(makeServiceConfig());
     enqueue(...teamResolution()); // team
-    // 4 labels × (fetch + create) = 8 calls
-    for (let i = 0; i < 4; i++) {
+    // 7 labels (claimed/queued/running/waiting-human + analyzing/dispatching/retrying)
+    // × (fetch + create) = 14 calls
+    for (let i = 0; i < 7; i++) {
       enqueue({ data: { issueLabels: { nodes: [] } } });
       enqueue({ data: { issueLabelCreate: { success: true, issueLabel: { id: `lbl${i}` } } } });
     }
     await c.ensureGaggleLabels();
-    expect(fetchCalls.length).toBe(9); // 1 team + 8 label
+    expect(fetchCalls.length).toBe(15); // 1 team + 14 label
   });
 });
 

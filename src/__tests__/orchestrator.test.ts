@@ -741,6 +741,295 @@ describe('emitTargetEvent populates target_machine_states', () => {
   });
 });
 
+// ─── hot path integration tests ───────────────────────────────────────────────
+//
+// Each test exercises one orchestrator hot-path method end-to-end: the test
+// sets up minimum required state, invokes the method, and verifies both the
+// SM state map and the downstream side effects (tracker calls, applier
+// effects). These complement the unit-level state-machine and applier
+// matrices by proving the integration wiring is correct.
+
+describe('hot path: handleGatePaused', () => {
+  test('running target + gate_paused → gate_waiting; supervised_gates populated, label swap', async () => {
+    const issue = makeIssue({ id: 'p1', identifier: 'SYM-300' });
+    const cfg = makeServiceConfig();
+    const calls: TrackerCall[] = [];
+    const tracker = {
+      ensureGaggleLabels: async () => {},
+      resolveViewerId: async () => 'u1',
+      fetchCandidateIssues: async () => [],
+      fetchIssuesByLabel: async () => [],
+      fetchIssuesByStates: async () => [],
+      fetchIssueStatesByIds: async () => [],
+      fetchIssueComments: async () => [],
+      applyLabel: async (id: string, label: string) => { calls.push({ op: 'applyLabel', args: [id, label] }); },
+      removeLabel: async (id: string, label: string) => { calls.push({ op: 'removeLabel', args: [id, label] }); },
+      postComment: async () => ({ id: 'c1' }),
+      updateIssueState: async (id: string, s: string) => { calls.push({ op: 'updateIssueState', args: [id, s] }); },
+      createSubIssue: async () => ({ id: 'sub1', identifier: 'SYM-99' }),
+      createBlockerRelation: async () => {},
+    } as unknown as LinearClient;
+
+    const reg = makeFakeRegistry();
+    const o = new Orchestrator({
+      cfg, tracker,
+      analyzer: { analyze: async () => ({ issue_id: 'x', analysis_summary: '', repo_targets: [] }) } as unknown as IssueAnalyzer,
+      workspace: { ensureAuxRoot: () => {}, cleanAuxiliaryWorkspace: () => {} } as unknown as WorkspaceManager,
+      registry: reg.handle,
+      syncer: null,
+      archonClient: makeFakeArchonClient(),
+    });
+    orchestrators.push(o);
+
+    // Pre-condition: target is running.
+    o.getState().pending_issues.set('p1', issue);
+    o.getState().target_machine_states.set('p1__fe', 'running');
+    o.getState().running.set('p1__fe', {
+      session_id: 'x', issue, identifier: 'SYM-300', repo_alias: 'fe',
+      repo_target: makeRepoTarget({ repo_alias: 'fe' }), sub_issue_id: null,
+      archon_pid: 1, archon_db_run_id: 'r1',
+      archon_workflow: '', last_archon_event: null, last_archon_timestamp: null, last_archon_message: null,
+      claude_input_tokens: 0, claude_output_tokens: 0, claude_total_tokens: 0, turn_count: 0,
+      started_at: new Date().toISOString(), attempt: null,
+    });
+
+    await (o as unknown as {
+      handleGatePaused(i: typeof issue, t: ReturnType<typeof makeRepoTarget>, subId: string | null, runId: string, msg: string, attempt: number | null): Promise<void>;
+    }).handleGatePaused(issue, makeRepoTarget({ repo_alias: 'fe' }), null, 'run-xyz', 'Please review.', null);
+
+    // SM transitioned to gate_waiting
+    expect(o.getState().target_machine_states.get('p1__fe')).toBe('gate_waiting');
+    // Label swap: remove running, apply waiting-human
+    expect(calls.some((c) => c.op === 'removeLabel' && c.args[1] === 'gaggle:running')).toBe(true);
+    expect(calls.some((c) => c.op === 'applyLabel' && c.args[1] === 'gaggle:waiting-human')).toBe(true);
+    // supervised_gates entry registered with correct run_id
+    const gate = o.getState().supervised_gates.get('p1__fe');
+    expect(gate?.run_id).toBe('run-xyz');
+    expect(gate?.gate_message).toBe('Please review.');
+    // state.running cleaned up (slot freed)
+    expect(o.getState().running.has('p1__fe')).toBe(false);
+  });
+});
+
+describe('hot path: handleWorkerExit failure → retrying', () => {
+  test('worker_failed (under max retries) transitions target to retrying and schedules a retry timer', async () => {
+    const issue = makeIssue({ id: 'p1', identifier: 'SYM-310' });
+    const cfg = makeServiceConfig();
+    const calls: TrackerCall[] = [];
+    const tracker = {
+      ensureGaggleLabels: async () => {},
+      resolveViewerId: async () => 'u1',
+      fetchCandidateIssues: async () => [],
+      fetchIssuesByLabel: async () => [],
+      fetchIssuesByStates: async () => [],
+      fetchIssueStatesByIds: async () => [],
+      fetchIssueComments: async () => [],
+      applyLabel: async (id: string, label: string) => { calls.push({ op: 'applyLabel', args: [id, label] }); },
+      removeLabel: async (id: string, label: string) => { calls.push({ op: 'removeLabel', args: [id, label] }); },
+      postComment: async () => ({ id: 'c1' }),
+      updateIssueState: async (id: string, s: string) => { calls.push({ op: 'updateIssueState', args: [id, s] }); },
+      createSubIssue: async () => ({ id: 'sub1', identifier: 'SYM-99' }),
+      createBlockerRelation: async () => {},
+    } as unknown as LinearClient;
+
+    const reg = makeFakeRegistry();
+    const o = new Orchestrator({
+      cfg, tracker,
+      analyzer: { analyze: async () => ({ issue_id: 'x', analysis_summary: '', repo_targets: [] }) } as unknown as IssueAnalyzer,
+      workspace: { ensureAuxRoot: () => {}, cleanAuxiliaryWorkspace: () => {} } as unknown as WorkspaceManager,
+      registry: reg.handle,
+      syncer: null,
+      archonClient: makeFakeArchonClient(),
+    });
+    orchestrators.push(o);
+
+    o.getState().pending_issues.set('p1', issue);
+    o.getState().parent_machine_states.set('p1', 'claimed');
+    o.getState().target_machine_states.set('p1__fe', 'running');
+    o.getState().running.set('p1__fe', {
+      session_id: 'x', issue, identifier: 'SYM-310', repo_alias: 'fe',
+      repo_target: makeRepoTarget({ repo_alias: 'fe' }), sub_issue_id: null,
+      archon_pid: 1, archon_db_run_id: 'r1',
+      archon_workflow: '', last_archon_event: null, last_archon_timestamp: null, last_archon_message: null,
+      claude_input_tokens: 0, claude_output_tokens: 0, claude_total_tokens: 0, turn_count: 0,
+      started_at: new Date().toISOString(), attempt: null,
+    });
+
+    await (o as unknown as {
+      handleWorkerExit(i: typeof issue, t: ReturnType<typeof makeRepoTarget>, e: { type: string }, a: number | null): Promise<void>;
+    }).handleWorkerExit(issue, makeRepoTarget({ repo_alias: 'fe' }), { type: 'archon_failed' }, 0);
+
+    expect(o.getState().target_machine_states.get('p1__fe')).toBe('retrying');
+    expect(calls.some((c) => c.op === 'applyLabel' && c.args[1] === 'gaggle:retrying')).toBe(true);
+    // Retry timer should be scheduled via the hook → retry_attempts populated
+    expect(o.getState().retry_attempts.has('p1__fe')).toBe(true);
+    // Parent should NOT transition to done (target isn't terminal)
+    expect(o.getState().parent_machine_states.get('p1')).toBe('claimed');
+  });
+});
+
+describe('hot path: pollSupervisedGates timeout', () => {
+  test('gate that exceeds gate_timeout_ms → gate_timed_out fires; archon.rejectRun + retry scheduled', async () => {
+    const issue = makeIssue({ id: 'p1', identifier: 'SYM-320' });
+    const cfg = makeServiceConfig();
+    cfg.archon.gate_timeout_ms = 1000; // tiny timeout
+    const calls: TrackerCall[] = [];
+    const archonCalls: string[] = [];
+    const tracker = {
+      ensureGaggleLabels: async () => {},
+      resolveViewerId: async () => 'u1',
+      fetchCandidateIssues: async () => [],
+      fetchIssuesByLabel: async () => [],
+      fetchIssuesByStates: async () => [],
+      fetchIssueStatesByIds: async () => [],
+      fetchIssueComments: async () => [],
+      applyLabel: async (id: string, label: string) => { calls.push({ op: 'applyLabel', args: [id, label] }); },
+      removeLabel: async (id: string, label: string) => { calls.push({ op: 'removeLabel', args: [id, label] }); },
+      postComment: async () => ({ id: 'c1' }),
+      updateIssueState: async (id: string, s: string) => { calls.push({ op: 'updateIssueState', args: [id, s] }); },
+      createSubIssue: async () => ({ id: 'sub1', identifier: 'SYM-99' }),
+      createBlockerRelation: async () => {},
+    } as unknown as LinearClient;
+
+    const reg = makeFakeRegistry();
+    const archon = makeFakeArchonClient();
+    (archon as unknown as { rejectRun: (id: string, reason: string) => Promise<void> }).rejectRun =
+      async (runId: string, reason: string) => { archonCalls.push(`rejectRun(${runId},${reason})`); };
+
+    const o = new Orchestrator({
+      cfg, tracker,
+      analyzer: { analyze: async () => ({ issue_id: 'x', analysis_summary: '', repo_targets: [] }) } as unknown as IssueAnalyzer,
+      workspace: { ensureAuxRoot: () => {}, cleanAuxiliaryWorkspace: () => {} } as unknown as WorkspaceManager,
+      registry: reg.handle,
+      syncer: null,
+      archonClient: archon,
+    });
+    orchestrators.push(o);
+
+    // Pre-condition: a supervised gate paused well past the timeout.
+    o.getState().pending_issues.set('p1', issue);
+    o.getState().target_machine_states.set('p1__fe', 'gate_waiting');
+    o.getState().supervised_gates.set('p1__fe', {
+      run_id: 'run-xyz', issue_id: 'p1', issue,
+      repo_alias: 'fe', repo_target: makeRepoTarget({ repo_alias: 'fe' }),
+      sub_issue_id: null, paused_at: Date.now() - 10_000,
+      gate_message: 'review', comment_id: null, gate_state_applied: false, attempt: 0,
+    });
+
+    await (o as unknown as { pollSupervisedGates(): Promise<void> }).pollSupervisedGates();
+
+    // Archon reject was called via the SM's archon_reject effect
+    expect(archonCalls.some((c) => c.startsWith('rejectRun(run-xyz,'))).toBe(true);
+    // Target moves to retrying; gate entry deleted
+    expect(o.getState().target_machine_states.get('p1__fe')).toBe('retrying');
+    expect(o.getState().supervised_gates.has('p1__fe')).toBe(false);
+    // Retry timer scheduled
+    expect(o.getState().retry_attempts.has('p1__fe')).toBe(true);
+  });
+});
+
+describe('hot path: drainPendingTargets phase 3', () => {
+  test('ready target → dispatch_attempted via SM (target_machine_states transitions to dispatching/running)', async () => {
+    const issue = makeIssue({ id: 'p1', identifier: 'SYM-330' });
+    const target = makeRepoTarget({ repo_alias: 'fe' });
+    const analysis: IssueAnalysis = { issue_id: 'p1', analysis_summary: '', repo_targets: [target] };
+    const cfg = makeServiceConfig();
+    const calls: TrackerCall[] = [];
+    const tracker = {
+      ensureGaggleLabels: async () => {},
+      resolveViewerId: async () => 'u1',
+      fetchCandidateIssues: async () => [],
+      fetchIssuesByLabel: async () => [],
+      fetchIssuesByStates: async () => [],
+      fetchIssueStatesByIds: async () => [],
+      fetchIssueComments: async () => [],
+      applyLabel: async (id: string, label: string) => { calls.push({ op: 'applyLabel', args: [id, label] }); },
+      removeLabel: async (id: string, label: string) => { calls.push({ op: 'removeLabel', args: [id, label] }); },
+      postComment: async () => ({ id: 'c1' }),
+      updateIssueState: async (id: string, s: string) => { calls.push({ op: 'updateIssueState', args: [id, s] }); },
+      createSubIssue: async () => ({ id: 'sub1', identifier: 'SYM-99' }),
+      createBlockerRelation: async () => {},
+    } as unknown as LinearClient;
+
+    const reg = makeFakeRegistry();
+    const o = new Orchestrator({
+      cfg, tracker,
+      analyzer: { analyze: async () => analysis } as unknown as IssueAnalyzer,
+      workspace: { ensureAuxRoot: () => {}, cleanAuxiliaryWorkspace: () => {} } as unknown as WorkspaceManager,
+      registry: reg.handle,
+      syncer: null,
+      archonClient: makeFakeArchonClient(),
+    });
+    orchestrators.push(o);
+
+    o.getState().pending_issues.set('p1', issue);
+    o.getState().pending_targets.set('p1', [target]);
+    o.getState().parent_machine_states.set('p1', 'claimed');
+
+    // drainPendingTargets is private; access via cast.
+    await (o as unknown as {
+      drainPendingTargets(i: typeof issue, a: IssueAnalysis): Promise<void>;
+    }).drainPendingTargets(issue, analysis);
+
+    // emitTargetEvent transitioned 'queued' → 'dispatching'. launchWorker then
+    // tried to apply the running label (idempotent gaggle:dispatching remove
+    // is harmless; running apply may or may not succeed since spawnWorker is
+    // not a real subprocess). Either way, target_machine_states should now
+    // be 'dispatching' (or possibly 'retrying' if launchWorker failed cleanly).
+    const finalState = o.getState().target_machine_states.get('p1__fe');
+    expect(['dispatching', 'running', 'retrying']).toContain(finalState);
+    // The SM-driven dispatch should have emitted the dispatching label.
+    expect(calls.some((c) => c.op === 'applyLabel' && c.args[1] === 'gaggle:dispatching')).toBe(true);
+  });
+
+  test('target with unsatisfied depends_on → stays queued (no SM dispatch)', async () => {
+    const issue = makeIssue({ id: 'p1', identifier: 'SYM-331' });
+    const target = makeRepoTarget({ repo_alias: 'fe', depends_on: ['be'] });
+    const analysis: IssueAnalysis = { issue_id: 'p1', analysis_summary: '', repo_targets: [target] };
+    const cfg = makeServiceConfig();
+    const calls: TrackerCall[] = [];
+    const tracker = {
+      ensureGaggleLabels: async () => {},
+      resolveViewerId: async () => 'u1',
+      fetchCandidateIssues: async () => [],
+      fetchIssuesByLabel: async () => [],
+      fetchIssuesByStates: async () => [],
+      fetchIssueStatesByIds: async () => [],
+      fetchIssueComments: async () => [],
+      applyLabel: async (id: string, label: string) => { calls.push({ op: 'applyLabel', args: [id, label] }); },
+      removeLabel: async () => {},
+      postComment: async () => ({ id: 'c1' }),
+      updateIssueState: async () => {},
+      createSubIssue: async () => ({ id: 'sub1', identifier: 'SYM-99' }),
+      createBlockerRelation: async () => {},
+    } as unknown as LinearClient;
+
+    const reg = makeFakeRegistry();
+    const o = new Orchestrator({
+      cfg, tracker,
+      analyzer: { analyze: async () => analysis } as unknown as IssueAnalyzer,
+      workspace: { ensureAuxRoot: () => {}, cleanAuxiliaryWorkspace: () => {} } as unknown as WorkspaceManager,
+      registry: reg.handle,
+      syncer: null,
+      archonClient: makeFakeArchonClient(),
+    });
+    orchestrators.push(o);
+
+    o.getState().pending_issues.set('p1', issue);
+    o.getState().pending_targets.set('p1', [target]);
+    o.getState().parent_machine_states.set('p1', 'claimed');
+    // No sibling 'be' is registered → blocker unsatisfied.
+
+    await (o as unknown as {
+      drainPendingTargets(i: typeof issue, a: IssueAnalysis): Promise<void>;
+    }).drainPendingTargets(issue, analysis);
+
+    expect(o.getState().target_machine_states.get('p1__fe')).toBe('queued');
+    expect(calls.some((c) => c.op === 'applyLabel' && c.args[1] === 'gaggle:queued')).toBe(true);
+    expect(calls.some((c) => c.op === 'applyLabel' && c.args[1] === 'gaggle:dispatching')).toBe(false);
+  });
+});
+
 // ─── maybeReleaseClaim ─────────────────────────────────────────────────────────
 
 // ─── crash recovery scenarios ─────────────────────────────────────────────────

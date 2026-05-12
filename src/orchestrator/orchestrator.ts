@@ -1161,7 +1161,7 @@ export class Orchestrator {
         await this.emitTargetEvent('gate_waiting',
           { kind: 'gate_approved', message: classifiedMessage || null },
           this.buildGateTransitionCtx(gate));
-        logger.info('Gate approved — approve+resume spawned via state machine', { issue_id: gate.issue_id, repo_alias: gate.repo_alias, run_id: gate.run_id });
+        logger.info('Gate approved — approve+resume spawned via state machine', { issue_id: gate.issue_id, repo_alias: gate.repo_alias, run_id: gate.run_id ?? undefined });
       } else {
         // reject → gate_rejected (SM emits archon_reject, label → retrying, schedule retry).
         // resolveGateStateTransition already ran above before the approve/reject branch.

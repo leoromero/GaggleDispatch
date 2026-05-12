@@ -15,7 +15,7 @@ import {
   noRunningWorkersFor,
   workerKey,
 } from '../orchestrator/state.ts';
-import { buildSymphonyEnv } from '../workspace/message.ts';
+import { buildGaggleEnv } from '../workspace/message.ts';
 import { sanitizeId, deriveRepoSlug, parseGithubOwnerRepo, isInside, expandPath, expandEnvString } from '../util/paths.ts';
 import { buildIssueMessage } from '../workspace/message.ts';
 import type { Issue, IssueAnalysis, RepoTarget, ServiceConfig, SyncedRegistryRepoEntry } from '../domain/types.ts';
@@ -407,7 +407,7 @@ describe('readiness predicate', () => {
   });
 });
 
-describe('buildSymphonyEnv', () => {
+describe('buildGaggleEnv', () => {
   test('maps all expected keys', () => {
     const issue: Issue = {
       id: 'i1', identifier: 'SYM-1', title: 'A bug', description: null,
@@ -419,16 +419,14 @@ describe('buildSymphonyEnv', () => {
       archon_workflow: 'gaggle/fix', rationale: 'why', components: [],
     };
     const analysis: IssueAnalysis = { issue_id: 'i1', analysis_summary: 'summary', repo_targets: [] };
-    const env = buildSymphonyEnv({ issue, repo_target: target, analysis, attempt: null });
-    expect(env.SYMPHONY_ISSUE_ID).toBe('i1');
-    expect(env.SYMPHONY_ISSUE_IDENTIFIER).toBe('SYM-1');
-    expect(env.SYMPHONY_ISSUE_TITLE).toBe('A bug');
-    expect(env.SYMPHONY_REPO_ALIAS).toBe('repo-r');
-    expect(env.GAGGLE_ARCHON_WORKFLOW).toBe('gaggle/fix');
-    expect(env.SYMPHONY_ATTEMPT).toBe('first');
-    expect(env.SYMPHONY_ANALYSIS_SUMMARY).toBe('summary');
-    expect(env.GAGGLE_REPO_ALIAS).toBe('repo-r');
+    const env = buildGaggleEnv({ issue, repo_target: target, analysis, attempt: null });
+    expect(env.GAGGLE_ISSUE_ID).toBe('i1');
     expect(env.GAGGLE_ISSUE_IDENTIFIER).toBe('SYM-1');
+    expect(env.GAGGLE_ISSUE_TITLE).toBe('A bug');
+    expect(env.GAGGLE_REPO_ALIAS).toBe('repo-r');
+    expect(env.GAGGLE_ARCHON_WORKFLOW).toBe('gaggle/fix');
+    expect(env.GAGGLE_ATTEMPT).toBe('first');
+    expect(env.GAGGLE_ANALYSIS_SUMMARY).toBe('summary');
   });
 
   test('encodes numeric attempt as string', () => {
@@ -439,7 +437,7 @@ describe('buildSymphonyEnv', () => {
     };
     const target: RepoTarget = { repo_url: '', repo_alias: 'r', local_path: '', archon_workflow: '', rationale: '', components: [] };
     const analysis: IssueAnalysis = { issue_id: 'i1', analysis_summary: '', repo_targets: [] };
-    expect(buildSymphonyEnv({ issue, repo_target: target, analysis, attempt: 2 }).SYMPHONY_ATTEMPT).toBe('2');
+    expect(buildGaggleEnv({ issue, repo_target: target, analysis, attempt: 2 }).GAGGLE_ATTEMPT).toBe('2');
   });
 });
 
