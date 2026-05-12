@@ -717,6 +717,9 @@ export class Orchestrator {
         try {
           await this.tracker.applyLabel(targetId, this.cfg.tracker.gaggle_labels.queued);
         } catch { /* non-fatal */ }
+        // Hydrate target_machine_states so the parent SM's target_terminal
+        // check sees this queued target and won't conclude "all terminal" prematurely.
+        this.state.target_machine_states.set(workerKey(issue.id, target.repo_alias), 'queued');
         remaining.push(target);
         continue;
       }
@@ -725,6 +728,7 @@ export class Orchestrator {
         try {
           await this.tracker.applyLabel(targetId, this.cfg.tracker.gaggle_labels.queued);
         } catch { /* non-fatal */ }
+        this.state.target_machine_states.set(workerKey(issue.id, target.repo_alias), 'queued');
         remaining.push(target);
         continue;
       }
@@ -1897,6 +1901,7 @@ export class Orchestrator {
       let map = this.state.sibling_subissues.get(parentId);
       if (!map) { map = new Map(); this.state.sibling_subissues.set(parentId, map); }
       map.set(aliasGuess, issue.id);
+      this.state.target_machine_states.set(workerKey(parentId, aliasGuess), 'queued');
       parentIdsToPromote.add(parentId);
       logger.info('Recovered queued sub-issue', {
         issue_identifier: issue.identifier, parent_id: parentId, repo_alias: aliasGuess,
@@ -1992,6 +1997,7 @@ export class Orchestrator {
       const delay = retry ? Math.max(0, retry.due_at_ms - Date.now()) : 0;
 
       this.scheduleRetry(parentIssue, target, attempt, reason, delay);
+      this.state.target_machine_states.set(key, 'retrying');
       logger.info('Recovered retrying target — retry timer rescheduled', {
         issue_identifier: issue.identifier,
         parent_id: parentId,
@@ -2094,6 +2100,7 @@ export class Orchestrator {
         gate_state_applied: false,
         attempt: null,
       });
+      this.state.target_machine_states.set(key, 'gate_waiting');
       logger.info('Recovered supervised gate (Archon process gone)', {
         issue_identifier: issue.identifier,
       });
