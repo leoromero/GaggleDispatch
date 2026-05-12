@@ -214,6 +214,13 @@ export type Effect =
   // in-memory gate cleanup, matching the current orchestrator's semantics.
   | { kind: 'archon_approve'; identity: TargetIdentity; message: string | null }
   | { kind: 'archon_reject'; identity: TargetIdentity; reason: string }
+  // archon_approve_and_resume is distinct from archon_approve: rather than
+  // just storing the approval via the HTTP API, it spawns the
+  // `archon workflow approve <run_id> <comment>` subprocess which records
+  // the comment as the gate's output AND resumes the workflow. The applier
+  // delegates to the approveAndResume hook (orchestrator-owned), which sets
+  // up callbacks that thread back into handleWorkerExit / handleGatePaused.
+  | { kind: 'archon_approve_and_resume'; identity: TargetIdentity; message: string | null; attempt: number | null }
 
   // Persistence (run-registry, extended to hold retry meta as well)
   | { kind: 'persist_run'; key: WorkerKey; run_id: string; meta: RunMeta }
@@ -566,7 +573,10 @@ export const targetTransition: TargetTransitionFn = (state, event, ctx) => {
         effects: [
           { kind: 'remove_label', issue_id: tid, label: 'waiting_human' },
           { kind: 'apply_label', issue_id: tid, label: 'running' },
-          { kind: 'archon_approve', identity: ctx.identity, message: event.message },
+          // approve_and_resume spawns the subprocess that approves + resumes
+          // the workflow; the HTTP-only `archon_approve` would store the
+          // approval but not restart the workflow.
+          { kind: 'archon_approve_and_resume', identity: ctx.identity, message: event.message, attempt: ctx.attempt },
         ],
       };
     }

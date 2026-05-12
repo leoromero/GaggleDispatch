@@ -68,6 +68,7 @@ function makeApplier(overrides: { archonShouldThrow?: boolean } = {}) {
     scheduleRetry: (key, delayMs, attempt) => { calls.push({ op: 'scheduleRetry', args: [key, delayMs, attempt] }); },
     createBlocker: async (spec, blocksId) => { calls.push({ op: 'createBlocker', args: [spec, blocksId] }); },
     createSubIssue: async (parentId, target) => { calls.push({ op: 'createSubIssue', args: [parentId, target.repo_alias] }); },
+    approveAndResume: async (args) => { calls.push({ op: 'approveAndResume', args: [args.identity.repo_alias, args.runId, args.message] }); },
   };
 
   const applier = new EffectApplier(deps);
@@ -197,6 +198,19 @@ describe('EffectApplier: Archon control plane', () => {
     const { applier, calls } = makeApplier();
     await applier.apply({ kind: 'archon_approve', identity: IDENTITY, message: null });
     expect(calls.some((c) => c.op === 'approveRun')).toBe(false);
+  });
+
+  test('archon_approve_and_resume calls the approveAndResume hook and deletes the gate', async () => {
+    const { applier, calls, state } = makeApplier();
+    state.supervised_gates.set('p1__trialmatch-be', {
+      run_id: 'run-xyz', issue_id: 'p1', issue: makeIssue({ id: 'p1' }),
+      repo_alias: 'trialmatch-be', repo_target: makeRepoTarget(),
+      sub_issue_id: 'sub-be', paused_at: Date.now(), gate_message: 'r',
+      comment_id: null, gate_state_applied: false, attempt: null,
+    });
+    await applier.apply({ kind: 'archon_approve_and_resume', identity: IDENTITY, message: 'lgtm', attempt: null });
+    expect(hasCall(calls, 'approveAndResume', ['trialmatch-be', 'run-xyz', 'lgtm'])).toBe(true);
+    expect(state.supervised_gates.has('p1__trialmatch-be')).toBe(false);
   });
 
   test('archon error is swallowed and logged', async () => {

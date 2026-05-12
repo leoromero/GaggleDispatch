@@ -224,10 +224,10 @@ describe('targetTransition: valid', () => {
     expect(hasEffect(t.effects, 'set_linear_state', (e) => e.kind === 'set_linear_state' && e.state === 'Awaiting Review')).toBe(true);
   });
 
-  test('gate_waiting + gate_approved → running', () => {
+  test('gate_waiting + gate_approved → running (emits archon_approve_and_resume)', () => {
     const t = targetTransition('gate_waiting', { kind: 'gate_approved', message: 'lgtm' }, tctx());
     expect(t.to).toBe('running');
-    expect(hasEffect(t.effects, 'archon_approve')).toBe(true);
+    expect(hasEffect(t.effects, 'archon_approve_and_resume')).toBe(true);
   });
 
   test('gate_waiting + gate_rejected → retrying', () => {

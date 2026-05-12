@@ -57,6 +57,15 @@ export interface CreateSubIssueHook {
   (parentId: string, target: RepoTarget): Promise<void>;
 }
 
+export interface ApproveAndResumeHook {
+  (args: {
+    identity: TargetIdentity;
+    runId: string;
+    message: string | null;
+    attempt: number | null;
+  }): Promise<void>;
+}
+
 // ─── applier deps ──────────────────────────────────────────────────────────
 
 export interface EffectApplierDeps {
@@ -73,6 +82,7 @@ export interface EffectApplierDeps {
   scheduleRetry: ScheduleRetryHook;
   createBlocker: CreateBlockerHook;
   createSubIssue: CreateSubIssueHook;
+  approveAndResume: ApproveAndResumeHook;
 }
 
 export class EffectApplier {
@@ -157,6 +167,20 @@ export class EffectApplier {
         const gate = this.deps.state.supervised_gates.get(key);
         if (gate?.run_id) {
           await this.deps.archon.rejectRun(gate.run_id, effect.reason);
+        }
+        this.deps.state.supervised_gates.delete(key);
+        return;
+      }
+      case 'archon_approve_and_resume': {
+        const key = makeWorkerKey(effect.identity.parent_issue_id, effect.identity.repo_alias);
+        const gate = this.deps.state.supervised_gates.get(key);
+        if (gate?.run_id) {
+          await this.deps.approveAndResume({
+            identity: effect.identity,
+            runId: gate.run_id,
+            message: effect.message,
+            attempt: effect.attempt,
+          });
         }
         this.deps.state.supervised_gates.delete(key);
         return;

@@ -181,6 +181,18 @@ export class Orchestrator {
       createSubIssue: async () => {
         throw new Error('createSubIssue hook not yet wired (dispatch path still uses inline logic)');
       },
+      approveAndResume: async (args) => {
+        const parentIssue = this.state.pending_issues.get(args.identity.parent_issue_id);
+        if (!parentIssue) {
+          throw new Error(`approveAndResume hook: parent issue ${args.identity.parent_issue_id} not in pending_issues`);
+        }
+        const subIssueId =
+          args.identity.target_issue_id === args.identity.parent_issue_id
+            ? null
+            : args.identity.target_issue_id;
+        const target = this.buildRepoTargetForAlias(args.identity.repo_alias, parentIssue);
+        this.launchApproveAndResume(parentIssue, target, subIssueId, args.runId, args.message, args.attempt);
+      },
     });
   }
 
@@ -458,6 +470,71 @@ export class Orchestrator {
       try { await this.tracker.removeLabel(targetId, this.cfg.tracker.gaggle_labels.running); } catch { /* ignore */ }
       this.scheduleRetry(parentIssue, target, (attempt ?? 0) + 1, (err as Error).message);
     }
+  }
+
+  /** Spawn the `archon workflow approve <run_id> <comment>` subprocess that
+   *  stores the comment as the gate's output AND resumes the workflow. The
+   *  callbacks thread back into handleWorkerExit / handleGatePaused so the
+   *  resumed workflow flows through the same SM transitions as a fresh worker. */
+  private launchApproveAndResume(
+    parentIssue: Issue,
+    target: RepoTarget,
+    subIssueId: string | null,
+    runId: string,
+    message: string | null,
+    attempt: number | null,
+  ): void {
+    const key = workerKey(parentIssue.id, target.repo_alias);
+    const session = buildLiveSession({
+      issue: parentIssue,
+      repo_target: target,
+      attempt,
+      sub_issue_id: subIssueId,
+      cancel: () => {},
+    });
+    this.state.running.set(key, session);
+
+    const resumeHandle = approveAndResumeArchon(
+      this.cfg.archon.command,
+      runId,
+      message ?? undefined,
+      this.cfg.archon.turn_timeout_ms,
+      (e) => {
+        const s = this.state.running.get(key);
+        switch (e.type) {
+          case 'archon_started':
+            if (s) { s.archon_pid = e.pid; s.last_archon_timestamp = new Date().toISOString(); }
+            break;
+          case 'archon_output':
+            if (s) { s.last_archon_message = e.line; s.last_archon_timestamp = new Date().toISOString(); s.turn_count += 1; }
+            break;
+          case 'archon_run_id':
+            if (s) {
+              s.archon_db_run_id = e.db_run_id;
+              this.attachPoller(key, e.db_run_id, parentIssue, target, subIssueId, attempt);
+            }
+            writeRunEntry(this.cfg.registry.base_folder, key, {
+              archon_run_id: e.db_run_id,
+              parent_issue_id: parentIssue.id,
+              sub_issue_id: subIssueId,
+              repo_alias: target.repo_alias,
+            });
+            break;
+          case 'archon_gate_paused':
+            void this.handleGatePaused(parentIssue, target, subIssueId, e.run_id, e.gate_message, attempt);
+            break;
+          case 'archon_succeeded':
+          case 'archon_failed':
+          case 'archon_timed_out':
+          case 'archon_stalled':
+          case 'archon_cancelled':
+            deleteRunEntry(this.cfg.registry.base_folder, key);
+            void this.handleWorkerExit(parentIssue, target, { type: e.type, exit_code: 'exit_code' in e ? e.exit_code : undefined }, attempt);
+            break;
+        }
+      },
+    );
+    session.cancel = resumeHandle.cancel;
   }
 
   /** Poll-loop recovery path: dispatch a sub-issue that has no gaggle labels (e.g. crash before label was applied). */
@@ -1015,67 +1092,15 @@ export class Orchestrator {
       await this.resolveGateStateTransition(targetId, gate);
 
       if (intent === 'approve') {
-        // Use `archon workflow approve <run_id> <comment>` which (1) stores the
-        // approval with the comment as $<gate-id>.output and (2) auto-resumes the
-        // workflow. The raw HTTP approveRun API only stores the approval without
-        // resuming, losing the human comment for downstream nodes.
-        this.state.supervised_gates.delete(key);
-        const session = buildLiveSession({
-          issue: gate.issue,
-          repo_target: gate.repo_target,
-          attempt: gate.attempt,
-          sub_issue_id: gate.sub_issue_id,
-          cancel: () => {},
-        });
-        this.state.running.set(key, session);
-        try {
-          await this.tracker.applyLabel(targetId, this.cfg.tracker.gaggle_labels.running);
-        } catch { /* ignore */ }
-
-        if (gate.run_id) {
-          const resumeHandle = approveAndResumeArchon(
-            this.cfg.archon.command,
-            gate.run_id,
-            classifiedMessage || undefined,
-            this.cfg.archon.turn_timeout_ms,
-            (e) => {
-              const s = this.state.running.get(key);
-              switch (e.type) {
-                case 'archon_started':
-                  if (s) { s.archon_pid = e.pid; s.last_archon_timestamp = new Date().toISOString(); }
-                  break;
-                case 'archon_output':
-                  if (s) { s.last_archon_message = e.line; s.last_archon_timestamp = new Date().toISOString(); s.turn_count += 1; }
-                  break;
-                case 'archon_run_id':
-                  if (s) {
-                    s.archon_db_run_id = e.db_run_id;
-                    this.attachPoller(key, e.db_run_id, gate.issue, gate.repo_target, gate.sub_issue_id, gate.attempt);
-                  }
-                  writeRunEntry(this.cfg.registry.base_folder, key, {
-                    archon_run_id: e.db_run_id,
-                    parent_issue_id: gate.issue_id,
-                    sub_issue_id: gate.sub_issue_id,
-                    repo_alias: gate.repo_alias,
-                  });
-                  break;
-                case 'archon_gate_paused':
-                  void this.handleGatePaused(gate.issue, gate.repo_target, gate.sub_issue_id, e.run_id, e.gate_message, gate.attempt);
-                  break;
-                case 'archon_succeeded':
-                case 'archon_failed':
-                case 'archon_timed_out':
-                case 'archon_stalled':
-                case 'archon_cancelled':
-                  deleteRunEntry(this.cfg.registry.base_folder, key);
-                  void this.handleWorkerExit(gate.issue, gate.repo_target, { type: e.type, exit_code: 'exit_code' in e ? e.exit_code : undefined }, gate.attempt);
-                  break;
-              }
-            },
-          );
-          session.cancel = resumeHandle.cancel;
-        }
-        logger.info('Gate approved — approve+resume worker spawned', { issue_id: gate.issue_id, repo_alias: gate.repo_alias, run_id: gate.run_id });
+        // gate_approved → running. SM emits label swap + archon_approve_and_resume
+        // effect; the applier looks up the gate's run_id, calls the
+        // approveAndResume hook (which spawns the subprocess that approves+
+        // resumes via the Archon CLI), and deletes the supervised_gate entry.
+        const transition = targetTransition('gate_waiting',
+          { kind: 'gate_approved', message: classifiedMessage || null },
+          this.buildGateTransitionCtx(gate));
+        await this.effectApplier.applyAll(transition.effects);
+        logger.info('Gate approved — approve+resume spawned via state machine', { issue_id: gate.issue_id, repo_alias: gate.repo_alias, run_id: gate.run_id });
       } else {
         // reject → gate_rejected (SM emits archon_reject, label → retrying, schedule retry).
         // resolveGateStateTransition already ran above before the approve/reject branch.
