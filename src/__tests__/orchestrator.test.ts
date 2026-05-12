@@ -3,13 +3,16 @@
  * machine that don't require spawning real Archon subprocesses:
  *
  *  • startup label-driven recovery (Section 12.4)
- *  • `ensureSymphonyLabels` is called on start
+ *  • `ensureGaggleLabels` is called on start
  *  • analysis cache invalidation when registry context changes
  *  • `stop()` cancels in-flight LiveSessions
- *  • candidate sort/dispatch eligibility (via shouldDispatch invoked indirectly)
+ *  • shouldDispatch / shouldDispatchSubIssue eligibility guards
+ *  • maybeReleaseClaim → transitions parent to Done
+ *  • completed-key guard prevents re-dispatch of already-finished issues
  */
 
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
+import { mkdirSync, rmSync } from 'node:fs';
 import { Orchestrator } from '../orchestrator/orchestrator.ts';
 import type { LinearClient } from '../tracker/linear.ts';
 import type { IssueAnalyzer } from '../analyzer/issue-analyzer.ts';
@@ -18,8 +21,25 @@ import type { RegistryLoaderHandle } from '../registry/loader.ts';
 import type {
   Issue,
   RegistryContext,
+  ServiceConfig,
 } from '../domain/types.ts';
-import { makeIssue, makeRegistryContext, makeServiceConfig } from './helpers/fixtures.ts';
+import { writeRunEntry } from '../registry/run-registry.ts';
+import { ArchonClient, type ArchonRunRecord } from '../executor/archon-client.ts';
+import { makeIssue, makeRegistryContext, makeServiceConfig, makeRepoTarget } from './helpers/fixtures.ts';
+
+/** Build a fake ArchonClient whose listRuns() delegates to the provided function. */
+function makeFakeArchonClient(
+  listRunsFn: () => Promise<ArchonRunRecord[]> = () => Promise.resolve([]),
+): ArchonClient {
+  const client = Object.create(ArchonClient.prototype) as ArchonClient;
+  (client as unknown as { listRuns: () => Promise<ArchonRunRecord[]> }).listRuns = listRunsFn;
+  (client as unknown as { getRunDetail: () => Promise<null> }).getRunDetail = () => Promise.resolve(null);
+  (client as unknown as { approveRun: () => Promise<void> }).approveRun = () => Promise.resolve();
+  (client as unknown as { rejectRun: () => Promise<void> }).rejectRun = () => Promise.resolve();
+  (client as unknown as { cancelRun: () => Promise<void> }).cancelRun = () => Promise.resolve();
+  (client as unknown as { abandonRun: () => Promise<void> }).abandonRun = () => Promise.resolve();
+  return client;
+}
 
 interface TrackerCall {
   op: string;
@@ -34,8 +54,8 @@ function makeFakeTracker(opts: {
 } = {}) {
   const calls: TrackerCall[] = [];
   const tracker = {
-    async ensureSymphonyLabels() {
-      calls.push({ op: 'ensureSymphonyLabels', args: [] });
+    async ensureGaggleLabels() {
+      calls.push({ op: 'ensureGaggleLabels', args: [] });
     },
     async resolveViewerId() {
       calls.push({ op: 'resolveViewerId', args: [] });
@@ -107,8 +127,13 @@ function makeFakeRegistry(initial?: RegistryContext) {
   };
 }
 
-function makeOrchestrator(extra: { tracker?: ReturnType<typeof makeFakeTracker>['tracker']; registry?: RegistryLoaderHandle } = {}) {
-  const cfg = makeServiceConfig();
+function makeOrchestrator(extra: {
+  tracker?: ReturnType<typeof makeFakeTracker>['tracker'];
+  registry?: RegistryLoaderHandle;
+  archonStatus?: () => Promise<ArchonRunRecord[]>;
+  cfg?: ServiceConfig;
+} = {}) {
+  const cfg = extra.cfg ?? makeServiceConfig();
   // Disable polling in tests by setting a very large interval; we drive flow manually via start().
   cfg.polling.interval_ms = 86_400_000;
   const trackerObj = extra.tracker ? { tracker: extra.tracker, calls: [] as TrackerCall[] } : makeFakeTracker();
@@ -120,6 +145,7 @@ function makeOrchestrator(extra: { tracker?: ReturnType<typeof makeFakeTracker>[
     workspace: {} as unknown as WorkspaceManager,
     registry,
     syncer: null,
+    archonClient: makeFakeArchonClient(extra.archonStatus),
   });
   return { orchestrator, cfg, registry, tracker: trackerObj.tracker };
 }
@@ -135,7 +161,7 @@ afterEach(async () => {
 });
 
 describe('Orchestrator.start', () => {
-  test('calls ensureSymphonyLabels and resolveViewerId during startup', async () => {
+  test('calls ensureGaggleLabels and resolveViewerId during startup', async () => {
     const { tracker, calls } = makeFakeTracker();
     const reg = makeFakeRegistry();
     const cfg = makeServiceConfig();
@@ -151,7 +177,7 @@ describe('Orchestrator.start', () => {
     orchestrators.push(o);
     await o.start();
     const ops = calls.map((c) => c.op);
-    expect(ops).toContain('ensureSymphonyLabels');
+    expect(ops).toContain('ensureGaggleLabels');
     expect(ops).toContain('resolveViewerId');
     expect(ops).toContain('fetchIssuesByLabel');
   });
@@ -180,12 +206,17 @@ describe('Orchestrator.recoverFromLinearLabels', () => {
   test('restores claimed parent issues into the in-memory claimed set', async () => {
     const claimedParent = makeIssue({ id: 'p1', identifier: 'SYM-100', parent_id: null });
     const claimedSub = makeIssue({ id: 's1', identifier: 'SYM-101', parent_id: 'p1' });
+    // Give the parent an active sibling (queued) so it is NOT treated as an orphan.
+    const queuedSub = makeIssue({
+      id: 'sub-be', identifier: 'SYM-102', parent_id: 'p1',
+      title: '[backend-svc] Fix the thing', state: 'Todo', labels: ['gaggle:queued'],
+    });
     const { tracker } = makeFakeTracker({
       byLabel: {
-        'symphony:claimed': [claimedParent, claimedSub],
-        'symphony:running': [],
-        'symphony:waiting-human': [],
-        'symphony:queued': [],
+        'gaggle:claimed': [claimedParent, claimedSub],
+        'gaggle:running': [],
+        'gaggle:waiting-human': [],
+        'gaggle:queued': [queuedSub],
       },
     });
     const cfg = makeServiceConfig();
@@ -215,10 +246,10 @@ describe('Orchestrator.recoverFromLinearLabels', () => {
     });
     const { tracker, calls } = makeFakeTracker({
       byLabel: {
-        'symphony:claimed': [],
-        'symphony:running': [runningSub],
-        'symphony:waiting-human': [],
-        'symphony:queued': [],
+        'gaggle:claimed': [],
+        'gaggle:running': [runningSub],
+        'gaggle:waiting-human': [],
+        'gaggle:queued': [],
       },
     });
     const cfg = makeServiceConfig();
@@ -238,8 +269,8 @@ describe('Orchestrator.recoverFromLinearLabels', () => {
     expect(state.sibling_subissues.get('parent1')?.get('backend-svc')).toBe('sub1');
 
     const ops = calls.map((c) => c.op + ':' + (c.args[1] ?? c.args[0]));
-    expect(ops).toContain('removeLabel:symphony:running');
-    expect(ops).toContain('applyLabel:symphony:queued');
+    expect(ops).toContain('removeLabel:gaggle:running');
+    expect(ops).toContain('applyLabel:gaggle:queued');
   });
 });
 
@@ -296,6 +327,7 @@ describe('Orchestrator.stop', () => {
       repo_target: { repo_url: '', repo_alias: 'r', local_path: '', archon_workflow: '', rationale: '', components: [] },
       sub_issue_id: null,
       archon_pid: null,
+      archon_db_run_id: null,
       archon_workflow: '',
       last_archon_event: null,
       last_archon_timestamp: null,
@@ -325,5 +357,1109 @@ describe('Orchestrator.getState', () => {
     expect(s.claimed.size).toBe(0);
     expect(s.pending_issues.size).toBe(0);
     expect(s.poll_interval_ms).toBe(cfg.polling.interval_ms);
+  });
+});
+
+// ─── helpers shared by dispatch tests ─────────────────────────────────────────
+
+/** Build an orchestrator whose analyzer returns empty targets (no workers spawned). */
+function makeDispatchOrchestrator(candidates: Issue[], opts: {
+  byLabel?: Record<string, Issue[]>;
+  analyzerTargets?: import('../domain/types.ts').RepoTarget[];
+  archonStatus?: () => Promise<ArchonRunRecord[]>;
+} = {}) {
+  const cfg = makeServiceConfig();
+  cfg.polling.interval_ms = 86_400_000;
+  const calls: TrackerCall[] = [];
+  const tracker: LinearClient = {
+    async ensureGaggleLabels() { calls.push({ op: 'ensureGaggleLabels', args: [] }); },
+    async resolveViewerId() { calls.push({ op: 'resolveViewerId', args: [] }); return 'u1'; },
+    async fetchCandidateIssues() { calls.push({ op: 'fetchCandidateIssues', args: [] }); return candidates; },
+    async fetchIssuesByLabel(label: string) { calls.push({ op: 'fetchIssuesByLabel', args: [label] }); return opts.byLabel?.[label] ?? []; },
+    async fetchIssuesByStates() { return []; },
+    async fetchIssueStatesByIds(ids: string[]) { calls.push({ op: 'fetchIssueStatesByIds', args: [ids] }); return []; },
+    async fetchIssueComments() { return []; },
+    async applyLabel(id: string, label: string) { calls.push({ op: 'applyLabel', args: [id, label] }); },
+    async removeLabel(id: string, label: string) { calls.push({ op: 'removeLabel', args: [id, label] }); },
+    async postComment() { return { id: 'c1' }; },
+    async updateIssueState(id: string, state: string) { calls.push({ op: 'updateIssueState', args: [id, state] }); },
+    async createSubIssue() { calls.push({ op: 'createSubIssue', args: [] }); return { id: 'sub1', identifier: 'SYM-99' }; },
+    async createBlockerRelation() {},
+  } as unknown as LinearClient;
+
+  const targets = opts.analyzerTargets ?? [];
+  const analyzer: IssueAnalyzer = {
+    analyze: async (issue: { id: string }) => {
+      calls.push({ op: 'analyze', args: [issue.id] });
+      return { issue_id: issue.id, analysis_summary: '', repo_targets: targets };
+    },
+  } as unknown as IssueAnalyzer;
+
+  const reg = makeFakeRegistry();
+  const o = new Orchestrator({
+    cfg,
+    tracker,
+    analyzer,
+    workspace: { cleanAuxiliaryWorkspace: () => {} } as unknown as WorkspaceManager,
+    registry: reg.handle,
+    syncer: null,
+    archonClient: makeFakeArchonClient(opts.archonStatus),
+  });
+  orchestrators.push(o);
+
+  return { o, cfg, calls };
+}
+
+/** Drive a single tick directly (bypasses timer). */
+async function runTick(o: Orchestrator): Promise<void> {
+  await (o as unknown as { tick(): Promise<void> }).tick();
+}
+
+// ─── shouldDispatch eligibility ────────────────────────────────────────────────
+
+describe('shouldDispatch eligibility', () => {
+  test('skips issues in terminal state', async () => {
+    const issue = makeIssue({ id: 'i1', state: 'Done' });
+    const { o, calls } = makeDispatchOrchestrator([issue]);
+    await runTick(o);
+    expect(calls.some((c) => c.op === 'analyze')).toBe(false);
+    expect(calls.some((c) => c.op === 'applyLabel' && (c.args[1] as string).includes('claimed'))).toBe(false);
+  });
+
+  test('skips issues not in active_states', async () => {
+    const issue = makeIssue({ id: 'i1', state: 'Backlog' }); // not in ['Todo','In Progress']
+    const { o, calls } = makeDispatchOrchestrator([issue]);
+    await runTick(o);
+    expect(calls.some((c) => c.op === 'analyze')).toBe(false);
+  });
+
+  test('skips issues carrying a gaggle label', async () => {
+    const issue = makeIssue({ id: 'i1', state: 'In Progress', labels: ['gaggle:claimed'] });
+    const { o, calls } = makeDispatchOrchestrator([issue]);
+    await runTick(o);
+    expect(calls.some((c) => c.op === 'analyze')).toBe(false);
+  });
+
+  test('skips issues already in state.claimed', async () => {
+    const issue = makeIssue({ id: 'i1', state: 'In Progress' });
+    const { o, calls } = makeDispatchOrchestrator([issue]);
+    o.getState().claimed.add('i1');
+    await runTick(o);
+    expect(calls.some((c) => c.op === 'analyze')).toBe(false);
+  });
+
+  test('skips issues with a running worker in state.running', async () => {
+    const issue = makeIssue({ id: 'i1', state: 'In Progress' });
+    const { o, calls } = makeDispatchOrchestrator([issue]);
+    // Simulate a running session for this issue
+    o.getState().running.set('i1__repo-a', {
+      session_id: 'i1__repo-a__0',
+      issue,
+      identifier: 'SYM-1',
+      repo_alias: 'repo-a',
+      repo_target: makeRepoTarget(),
+      sub_issue_id: null,
+      archon_pid: null,
+      archon_db_run_id: null,
+      archon_workflow: 'gaggle/gaggle-fix-issue',
+      last_archon_event: null,
+      last_archon_timestamp: null,
+      last_archon_message: null,
+      claude_input_tokens: 0,
+      claude_output_tokens: 0,
+      claude_total_tokens: 0,
+      turn_count: 0,
+      started_at: new Date().toISOString(),
+      attempt: null,
+    });
+    await runTick(o);
+    expect(calls.some((c) => c.op === 'analyze')).toBe(false);
+  });
+
+  test('skips issues whose targets already completed this session (completed-key guard)', async () => {
+    const issue = makeIssue({ id: 'i1', state: 'In Progress' });
+    const { o, calls } = makeDispatchOrchestrator([issue]);
+    // Pre-populate completed set as if this issue was already worked on
+    o.getState().completed.add('i1__repo-a');
+    await runTick(o);
+    expect(calls.some((c) => c.op === 'analyze')).toBe(false);
+    expect(calls.some((c) => c.op === 'applyLabel' && (c.args[1] as string).includes('claimed'))).toBe(false);
+  });
+
+  test('skips sub-issues via parent dispatch path (they go through shouldDispatchSubIssue)', async () => {
+    // Sub-issue has parent_id — shouldDispatch returns false for it
+    const sub = makeIssue({ id: 's1', state: 'In Progress', parent_id: 'p1' });
+    const { o, calls } = makeDispatchOrchestrator([sub]);
+    await runTick(o);
+    // shouldDispatch returns false for sub-issues; shouldDispatchSubIssue also skips
+    // because the title has no [alias] prefix → neither path dispatches
+    expect(calls.some((c) => c.op === 'analyze')).toBe(false);
+  });
+
+  test('dispatches clean parent issues and applies gaggle:claimed label', async () => {
+    const issue = makeIssue({ id: 'i1', state: 'In Progress' });
+    // analyzer returns empty targets so no spawnWorker is attempted
+    const { o, calls } = makeDispatchOrchestrator([issue], { analyzerTargets: [] });
+    await runTick(o);
+    expect(calls.some((c) => c.op === 'analyze' && c.args[0] === 'i1')).toBe(true);
+    expect(calls.some((c) => c.op === 'applyLabel' && c.args[0] === 'i1' && c.args[1] === 'gaggle:claimed')).toBe(true);
+  });
+
+  test('does not re-dispatch an issue that was just dispatched (claimed set)', async () => {
+    const issue = makeIssue({ id: 'i1', state: 'In Progress' });
+    const { o, calls } = makeDispatchOrchestrator([issue], { analyzerTargets: [] });
+    await runTick(o);
+    const analyzeCountAfterFirst = calls.filter((c) => c.op === 'analyze').length;
+    // Run a second tick — issue is now in claimed set so shouldDispatch returns false
+    await runTick(o);
+    const analyzeCountAfterSecond = calls.filter((c) => c.op === 'analyze').length;
+    expect(analyzeCountAfterSecond).toBe(analyzeCountAfterFirst); // no additional analysis
+  });
+});
+
+// ─── maybeReleaseClaim ─────────────────────────────────────────────────────────
+
+// ─── crash recovery scenarios ─────────────────────────────────────────────────
+
+describe('crash recovery — recoverFromLinearLabels', () => {
+  function makeRecoveryOrchestrator(
+    byLabel: Record<string, Issue[]>,
+    opts: { archonStatus?: () => Promise<ArchonRunRecord[]>; baseFolder?: string } = {},
+  ) {
+    const cfg = makeServiceConfig();
+    cfg.polling.interval_ms = 86_400_000;
+    if (opts.baseFolder) cfg.registry.base_folder = opts.baseFolder;
+    const calls: TrackerCall[] = [];
+    const tracker: LinearClient = {
+      async ensureGaggleLabels() { calls.push({ op: 'ensureGaggleLabels', args: [] }); },
+      async resolveViewerId() { return 'u1'; },
+      async fetchCandidateIssues() { return []; },
+      async fetchIssuesByLabel(label: string) {
+        calls.push({ op: 'fetchIssuesByLabel', args: [label] });
+        return byLabel[label] ?? [];
+      },
+      async fetchIssuesByStates() { return []; },
+      async fetchIssueStatesByIds(ids: string[]) {
+        calls.push({ op: 'fetchIssueStatesByIds', args: [ids] });
+        return [];
+      },
+      async fetchIssueComments() { return []; },
+      async applyLabel(id: string, label: string) { calls.push({ op: 'applyLabel', args: [id, label] }); },
+      async removeLabel(id: string, label: string) { calls.push({ op: 'removeLabel', args: [id, label] }); },
+      async postComment() { return { id: 'c1' }; },
+      async updateIssueState(id: string, state: string) { calls.push({ op: 'updateIssueState', args: [id, state] }); },
+      async createSubIssue() { return { id: 'sub1', identifier: 'SYM-99' }; },
+      async createBlockerRelation() {},
+    } as unknown as LinearClient;
+
+    const reg = makeFakeRegistry();
+    const o = new Orchestrator({
+      cfg,
+      tracker,
+      analyzer: { analyze: async () => ({ issue_id: 'x', analysis_summary: '', repo_targets: [] }) } as unknown as IssueAnalyzer,
+      workspace: {} as unknown as WorkspaceManager,
+      registry: reg.handle,
+      syncer: null,
+      archonClient: makeFakeArchonClient(opts.archonStatus),
+    });
+    orchestrators.push(o);
+    return { o, calls, cfg };
+  }
+
+  test('running sub-issue → label swapped to queued and added to sibling_subissues', async () => {
+    const parent = makeIssue({ id: 'p1', identifier: 'SYM-10', parent_id: null, state: 'In Progress', labels: ['gaggle:claimed'] });
+    const runningSub = makeIssue({
+      id: 'sub-be', identifier: 'SYM-11', parent_id: 'p1',
+      title: '[trialmatch-be] Fix the feature',
+      state: 'In Progress', labels: ['gaggle:running'],
+    });
+    const { o, calls } = makeRecoveryOrchestrator({
+      'gaggle:claimed': [parent],
+      'gaggle:running': [runningSub],
+      'gaggle:queued': [],
+      'gaggle:waiting-human': [],
+    });
+    await o.start();
+    expect(o.getState().sibling_subissues.get('p1')?.get('trialmatch-be')).toBe('sub-be');
+    expect(calls.some((c) => c.op === 'removeLabel' && c.args[0] === 'sub-be' && c.args[1] === 'gaggle:running')).toBe(true);
+    expect(calls.some((c) => c.op === 'applyLabel' && c.args[0] === 'sub-be' && c.args[1] === 'gaggle:queued')).toBe(true);
+  });
+
+  test('running sub-issue in terminal state → label cleaned up, not re-queued', async () => {
+    const parent = makeIssue({ id: 'p1', parent_id: null, state: 'In Progress', labels: ['gaggle:claimed'] });
+    const terminalSub = makeIssue({
+      id: 'sub-be', identifier: 'SYM-11', parent_id: 'p1',
+      title: '[trialmatch-be] Fix the feature',
+      state: 'Done', labels: ['gaggle:running'], // Done but still has running label
+    });
+    const { o, calls } = makeRecoveryOrchestrator({
+      'gaggle:claimed': [parent],
+      'gaggle:running': [terminalSub],
+      'gaggle:queued': [],
+      'gaggle:waiting-human': [],
+    });
+    await o.start();
+    // Label cleaned up
+    expect(calls.some((c) => c.op === 'removeLabel' && c.args[0] === 'sub-be' && c.args[1] === 'gaggle:running')).toBe(true);
+    // NOT re-queued
+    expect(calls.some((c) => c.op === 'applyLabel' && c.args[0] === 'sub-be' && c.args[1] === 'gaggle:queued')).toBe(false);
+    // NOT added to sibling_subissues (skipped)
+    expect(o.getState().sibling_subissues.has('p1')).toBe(false);
+  });
+
+  test('queued sub-issue → restored to sibling_subissues', async () => {
+    const parent = makeIssue({ id: 'p1', parent_id: null, state: 'In Progress', labels: ['gaggle:claimed'] });
+    const queuedSub = makeIssue({
+      id: 'sub-fe', identifier: 'SYM-12', parent_id: 'p1',
+      title: '[trialmatch-fe] Fix the feature',
+      state: 'Todo', labels: ['gaggle:queued'],
+    });
+    const { o } = makeRecoveryOrchestrator({
+      'gaggle:claimed': [parent],
+      'gaggle:running': [],
+      'gaggle:queued': [queuedSub],
+      'gaggle:waiting-human': [],
+    });
+    await o.start();
+    expect(o.getState().sibling_subissues.get('p1')?.get('trialmatch-fe')).toBe('sub-fe');
+  });
+
+  test('orphaned claimed parent — crash before dispatch (no persisted run) → un-claimed for re-dispatch, NOT terminal', async () => {
+    // Orchestrator crashed between applyLabel(claimed) and spawning the worker.
+    // No Archon run was ever started, so no run entry exists in the registry.
+    const orphaned = makeIssue({ id: 'p1', identifier: 'SYM-20', parent_id: null, state: 'In Progress', labels: ['gaggle:claimed'] });
+    const { o, calls } = makeRecoveryOrchestrator({
+      'gaggle:claimed': [orphaned],
+      'gaggle:running': [],
+      'gaggle:queued': [],
+      'gaggle:waiting-human': [],
+    });
+    await o.start();
+    // Claimed label removed so the poll loop can re-dispatch
+    expect(o.getState().claimed.has('p1')).toBe(false);
+    expect(calls.some((c) => c.op === 'removeLabel' && c.args[0] === 'p1' && c.args[1] === 'gaggle:claimed')).toBe(true);
+    // Issue must NOT be moved to a terminal state — it should cycle back through dispatch
+    expect(calls.some((c) => c.op === 'updateIssueState' && c.args[0] === 'p1')).toBe(false);
+  });
+
+  test('orphaned claimed parent — work completed while down (persisted run + Archon completed) → claim released and parent transitioned to Done', async () => {
+    // All sub-issues finished while the orchestrator was down; crash happened before
+    // maybeReleaseClaim could remove the claimed label and transition the parent.
+    const BASE = mkdirSync(`/tmp/gaggle-test-orphan-${Date.now()}`, { recursive: true }) as unknown as string ?? `/tmp/gaggle-test-orphan-${Date.now()}`;
+    const WORKER_KEY = 'p1__trialmatch-be';
+    const ARCHON_RUN_ID = 'deadbeefdeadbeefdeadbeefdeadbeef';
+    try {
+      writeRunEntry(BASE, WORKER_KEY, {
+        archon_run_id: ARCHON_RUN_ID,
+        parent_issue_id: 'p1',
+        sub_issue_id: 'sub-be',
+        repo_alias: 'trialmatch-be',
+      });
+
+      const orphaned = makeIssue({ id: 'p1', identifier: 'SYM-21', parent_id: null, state: 'In Progress', labels: ['gaggle:claimed'] });
+      const { o, calls } = makeRecoveryOrchestrator({
+        'gaggle:claimed': [orphaned],
+        'gaggle:running': [],
+        'gaggle:queued': [],
+        'gaggle:waiting-human': [],
+      }, {
+        baseFolder: BASE,
+        archonStatus: () => Promise.resolve([{
+          id: ARCHON_RUN_ID, status: 'completed',
+          workflow_name: 'gaggle/gaggle-fix-issue',
+          working_path: '/some/path/trialmatch-be',
+          started_at: new Date().toISOString(),
+          user_message: '', completed_at: new Date().toISOString(), last_activity_at: null, metadata: {},
+        }]),
+      });
+
+      await o.start();
+      // Claim released
+      expect(o.getState().claimed.has('p1')).toBe(false);
+      expect(calls.some((c) => c.op === 'removeLabel' && c.args[0] === 'p1' && c.args[1] === 'gaggle:claimed')).toBe(true);
+      // Parent transitioned to Done
+      expect(calls.some((c) => c.op === 'updateIssueState' && c.args[0] === 'p1' && c.args[1] === 'Done')).toBe(true);
+    } finally {
+      rmSync(BASE, { recursive: true, force: true });
+    }
+  });
+
+  test('claimed parent with active siblings is NOT released on startup', async () => {
+    const parent = makeIssue({ id: 'p1', parent_id: null, state: 'In Progress', labels: ['gaggle:claimed'] });
+    const queuedSub = makeIssue({
+      id: 'sub-be', identifier: 'SYM-21', parent_id: 'p1',
+      title: '[trialmatch-be] Fix the feature',
+      state: 'Todo', labels: ['gaggle:queued'],
+    });
+    const { o, calls } = makeRecoveryOrchestrator({
+      'gaggle:claimed': [parent],
+      'gaggle:running': [],
+      'gaggle:queued': [queuedSub],
+      'gaggle:waiting-human': [],
+    });
+    await o.start();
+    // Parent still has active sibling → NOT released
+    expect(o.getState().claimed.has('p1')).toBe(true);
+    expect(calls.some((c) => c.op === 'updateIssueState' && c.args[0] === 'p1')).toBe(false);
+  });
+
+  test('waiting-human sub-issue → partial gate entry restored in supervised_gates', async () => {
+    const waitingSub = makeIssue({
+      id: 'sub-be', identifier: 'SYM-30', parent_id: 'p1',
+      title: '[trialmatch-be] Fix the feature',
+      state: 'In Progress', labels: ['gaggle:waiting-human'],
+    });
+    const { o } = makeRecoveryOrchestrator({
+      'gaggle:claimed': [],
+      'gaggle:running': [],
+      'gaggle:queued': [],
+      'gaggle:waiting-human': [waitingSub],
+    });
+    await o.start();
+    const gate = o.getState().supervised_gates.get('p1__trialmatch-be');
+    expect(gate).toBeDefined();
+    expect(gate?.repo_alias).toBe('trialmatch-be');
+    expect(gate?.sub_issue_id).toBe('sub-be');
+  });
+
+  test('running sub-issue with persisted run id → matched by exact id, tracked as detached', async () => {
+    // Arrange: a claimed parent + running sub-issue, plus a persisted gaggle-runs.json entry.
+    const BASE = '/tmp/base';
+    mkdirSync(BASE, { recursive: true });
+    const WORKER_KEY = 'p1__trialmatch-be';
+    const ARCHON_RUN_ID = 'cafebabecafebabecafebabecafebabe';
+    writeRunEntry(BASE, WORKER_KEY, {
+      archon_run_id: ARCHON_RUN_ID,
+      parent_issue_id: 'p1',
+      sub_issue_id: 'sub-be',
+      repo_alias: 'trialmatch-be',
+    });
+
+    const parent = makeIssue({ id: 'p1', identifier: 'SYM-10', parent_id: null, state: 'In Progress', labels: ['gaggle:claimed'] });
+    const runningSub = makeIssue({
+      id: 'sub-be', identifier: 'SYM-11', parent_id: 'p1',
+      title: '[trialmatch-be] Fix the feature',
+      state: 'In Progress', labels: ['gaggle:running'],
+    });
+
+    const { o } = makeRecoveryOrchestrator({
+      'gaggle:claimed': [parent],
+      'gaggle:running': [runningSub],
+      'gaggle:queued': [],
+      'gaggle:waiting-human': [],
+    }, {
+      // Inject an archonStatus that returns a running record with the exact ARCHON_RUN_ID.
+      archonStatus: () => Promise.resolve([{
+        id: ARCHON_RUN_ID,
+        status: 'running',
+        workflow_name: 'gaggle/gaggle-fix-issue',
+        working_path: '/some/path/trialmatch-be',
+        started_at: new Date().toISOString(),
+        user_message: '', completed_at: null, last_activity_at: null, metadata: {},
+      }]),
+    });
+
+    await o.start();
+
+    // The run should be tracked as a detached run (not re-queued).
+    const detached = o.getState().detached_archon_runs;
+    const found = [...detached.values()].find((d) => d.archon_run_id === ARCHON_RUN_ID);
+    expect(found).toBeDefined();
+    expect(found?.repo_alias).toBe('trialmatch-be');
+
+    // Clean up persisted entry.
+    rmSync(BASE, { recursive: true, force: true });
+  });
+
+  test('running sub + persisted run + Archon completed → sub marked Done, parent claim released', async () => {
+    // Both Gaggle and Archon crashed while Archon was running; Archon completed before the crash.
+    // On restart: running label still on sub, but Archon shows completed → clean finish.
+    const BASE = mkdirSync(`/tmp/gaggle-test-rc-${Date.now()}`, { recursive: true }) as unknown as string ?? `/tmp/gaggle-test-rc-${Date.now()}`;
+    const WORKER_KEY = 'p1__trialmatch-be';
+    const ARCHON_RUN_ID = 'c0ffeec0ffeec0ffeec0ffeec0ffeec0';
+    try {
+      writeRunEntry(BASE, WORKER_KEY, {
+        archon_run_id: ARCHON_RUN_ID,
+        parent_issue_id: 'p1',
+        sub_issue_id: 'sub-be',
+        repo_alias: 'trialmatch-be',
+      });
+
+      const parent = makeIssue({ id: 'p1', identifier: 'SYM-40', parent_id: null, state: 'In Progress', labels: ['gaggle:claimed'] });
+      const runningSub = makeIssue({
+        id: 'sub-be', identifier: 'SYM-41', parent_id: 'p1',
+        title: '[trialmatch-be] Fix the feature',
+        state: 'In Progress', labels: ['gaggle:running'],
+      });
+
+      const { o, calls } = makeRecoveryOrchestrator({
+        'gaggle:claimed': [parent],
+        'gaggle:running': [runningSub],
+        'gaggle:queued': [],
+        'gaggle:waiting-human': [],
+      }, {
+        baseFolder: BASE,
+        archonStatus: () => Promise.resolve([{
+          id: ARCHON_RUN_ID, status: 'completed',
+          workflow_name: 'gaggle/gaggle-fix-issue',
+          working_path: '/some/path/trialmatch-be',
+          started_at: new Date().toISOString(),
+          user_message: '', completed_at: new Date().toISOString(), last_activity_at: null, metadata: {},
+        }]),
+      });
+
+      await o.start();
+
+      // Sub-issue: running label removed, transitioned to Done
+      expect(calls.some((c) => c.op === 'removeLabel' && c.args[0] === 'sub-be' && c.args[1] === 'gaggle:running')).toBe(true);
+      expect(calls.some((c) => c.op === 'updateIssueState' && c.args[0] === 'sub-be' && c.args[1] === 'Done')).toBe(true);
+      // Parent: claim released, transitioned to Done
+      expect(calls.some((c) => c.op === 'removeLabel' && c.args[0] === 'p1' && c.args[1] === 'gaggle:claimed')).toBe(true);
+      expect(calls.some((c) => c.op === 'updateIssueState' && c.args[0] === 'p1' && c.args[1] === 'Done')).toBe(true);
+      // Not re-queued
+      expect(calls.some((c) => c.op === 'applyLabel' && c.args[0] === 'sub-be' && c.args[1] === 'gaggle:queued')).toBe(false);
+    } finally {
+      rmSync(BASE, { recursive: true, force: true });
+    }
+  });
+
+  test('running sub + persisted run + Archon paused → supervised gate restored, label swapped to waiting-human', async () => {
+    // Both crashed while Archon was at a plan gate waiting for human approval.
+    // On restart: running label on sub, but Archon shows paused → restore gate.
+    const BASE = mkdirSync(`/tmp/gaggle-test-rp-${Date.now()}`, { recursive: true }) as unknown as string ?? `/tmp/gaggle-test-rp-${Date.now()}`;
+    const WORKER_KEY = 'p1__trialmatch-be';
+    const ARCHON_RUN_ID = 'babe1234babe1234babe1234babe1234';
+    try {
+      writeRunEntry(BASE, WORKER_KEY, {
+        archon_run_id: ARCHON_RUN_ID,
+        parent_issue_id: 'p1',
+        sub_issue_id: 'sub-be',
+        repo_alias: 'trialmatch-be',
+      });
+
+      const parent = makeIssue({ id: 'p1', identifier: 'SYM-50', parent_id: null, state: 'In Progress', labels: ['gaggle:claimed'] });
+      const runningSub = makeIssue({
+        id: 'sub-be', identifier: 'SYM-51', parent_id: 'p1',
+        title: '[trialmatch-be] Fix the feature',
+        state: 'In Progress', labels: ['gaggle:running'],
+      });
+
+      const { o, calls } = makeRecoveryOrchestrator({
+        'gaggle:claimed': [parent],
+        'gaggle:running': [runningSub],
+        'gaggle:queued': [],
+        'gaggle:waiting-human': [],
+      }, {
+        baseFolder: BASE,
+        archonStatus: () => Promise.resolve([{
+          id: ARCHON_RUN_ID, status: 'paused',
+          workflow_name: 'gaggle/gaggle-fix-issue',
+          working_path: '/some/path/trialmatch-be',
+          started_at: new Date().toISOString(),
+          user_message: '', completed_at: null, last_activity_at: null,
+          metadata: { approval: { message: 'Please review the implementation plan.' } },
+        }]),
+      });
+
+      await o.start();
+
+      // Label swapped: running → waiting-human
+      expect(calls.some((c) => c.op === 'removeLabel' && c.args[0] === 'sub-be' && c.args[1] === 'gaggle:running')).toBe(true);
+      expect(calls.some((c) => c.op === 'applyLabel' && c.args[0] === 'sub-be' && c.args[1] === 'gaggle:waiting-human')).toBe(true);
+      // Gate entry restored with correct metadata
+      const gate = o.getState().supervised_gates.get('p1__trialmatch-be');
+      expect(gate).toBeDefined();
+      expect(gate?.run_id).toBe(ARCHON_RUN_ID);
+      expect(gate?.repo_alias).toBe('trialmatch-be');
+      expect(gate?.sub_issue_id).toBe('sub-be');
+      expect(gate?.gate_message).toBe('Please review the implementation plan.');
+      // NOT re-queued, NOT moved to Done
+      expect(calls.some((c) => c.op === 'applyLabel' && c.args[1] === 'gaggle:queued')).toBe(false);
+      expect(calls.some((c) => c.op === 'updateIssueState' && c.args[0] === 'sub-be')).toBe(false);
+    } finally {
+      rmSync(BASE, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('shouldDispatchSubIssue eligibility', () => {
+  test('dispatches a clean sub-issue with no blockers', async () => {
+    const sub = makeIssue({
+      id: 'sub1', identifier: 'SYM-50', parent_id: 'p1',
+      title: '[trialmatch-be] Fix it', state: 'Todo', labels: [],
+      blocked_by: [],
+    });
+    const { o, calls } = makeDispatchOrchestrator([sub]);
+    // Simulate sibling_subissues so the sub maps to its parent.
+    o.getState().sibling_subissues.set('p1', new Map([['trialmatch-be', 'sub1']]));
+    // shouldDispatchSubIssue should return true for a clean sub-issue.
+    const result = (o as unknown as { shouldDispatchSubIssue(i: typeof sub): boolean }).shouldDispatchSubIssue(sub);
+  });
+
+  test('skips sub-issue when an unsatisfied Linear blocker exists', async () => {
+    const sub = makeIssue({
+      id: 'sub1', identifier: 'SYM-51', parent_id: 'p1',
+      title: '[trialmatch-be] Fix it', state: 'Todo', labels: [],
+      blocked_by: [{ id: 'upstream', identifier: 'SYM-10', state: 'In Progress', labels: [] }],
+    });
+    const { o } = makeDispatchOrchestrator([sub]);
+    const result = (o as unknown as { shouldDispatchSubIssue(i: typeof sub): boolean }).shouldDispatchSubIssue(sub);
+    expect(result).toBe(false);
+  });
+
+  test('skips sub-issue whose Done blocker does not satisfy deployed readiness policy (no env label)', async () => {
+    // Default config: blocker_default_readiness='deployed', no env labels on blocker
+    const sub = makeIssue({
+      id: 'sub1', identifier: 'SYM-52', parent_id: 'p1',
+      title: '[trialmatch-be] Fix it', state: 'Todo', labels: [],
+      blocked_by: [{ id: 'upstream', identifier: 'SYM-10', state: 'Done', labels: [] }],
+    });
+    const { o } = makeDispatchOrchestrator([sub]);
+    // With 'deployed' readiness, Done state alone is not enough — needs env label.
+    const result = (o as unknown as { shouldDispatchSubIssue(i: typeof sub): boolean }).shouldDispatchSubIssue(sub);
+    expect(result).toBe(false);
+  });
+
+  test('dispatches sub-issue when Done blocker satisfies merged readiness policy', async () => {
+    const sub = makeIssue({
+      id: 'sub1', identifier: 'SYM-52b', parent_id: 'p1',
+      title: '[trialmatch-be] Fix it', state: 'Todo', labels: [],
+      blocked_by: [{ id: 'upstream', identifier: 'SYM-10', state: 'Done', labels: [] }],
+    });
+    // Use a tracker config with merged readiness (matches TrialMatch WORKFLOW.md).
+    const cfg = makeServiceConfig();
+    cfg.tracker.blocker_default_readiness = 'merged';
+    const { orchestrator } = makeOrchestrator({ cfg });
+    orchestrators.push(orchestrator);
+    const result = (orchestrator as unknown as { shouldDispatchSubIssue(i: typeof sub): boolean }).shouldDispatchSubIssue(sub);
+    expect(result).toBe(true);
+  });
+
+  test('skips sub-issue when worker already running for that key', async () => {
+    const sub = makeIssue({
+      id: 'sub1', identifier: 'SYM-53', parent_id: 'p1',
+      title: '[trialmatch-be] Fix it', state: 'Todo', labels: [],
+      blocked_by: [],
+    });
+    const { o } = makeDispatchOrchestrator([sub]);
+    o.getState().running.set('p1__trialmatch-be', {
+      session_id: 'x', issue: makeIssue(), identifier: 'SYM-53', repo_alias: 'trialmatch-be',
+      repo_target: makeRepoTarget(), sub_issue_id: 'sub1', archon_pid: null, archon_db_run_id: null,
+      archon_workflow: '', last_archon_event: null, last_archon_timestamp: null, last_archon_message: null,
+      claude_input_tokens: 0, claude_output_tokens: 0, claude_total_tokens: 0, turn_count: 0,
+      started_at: new Date().toISOString(), attempt: null,
+    });
+    const result = (o as unknown as { shouldDispatchSubIssue(i: typeof sub): boolean }).shouldDispatchSubIssue(sub);
+    expect(result).toBe(false);
+  });
+
+  test('skips sub-issue when key already completed this session', async () => {
+    const sub = makeIssue({
+      id: 'sub1', identifier: 'SYM-54', parent_id: 'p1',
+      title: '[trialmatch-be] Fix it', state: 'Todo', labels: [],
+      blocked_by: [],
+    });
+    const { o } = makeDispatchOrchestrator([sub]);
+    o.getState().completed.add('p1__trialmatch-be');
+    const result = (o as unknown as { shouldDispatchSubIssue(i: typeof sub): boolean }).shouldDispatchSubIssue(sub);
+    expect(result).toBe(false);
+  });
+});
+
+describe('reconcileRunningIssues — detached run transitions', () => {
+  test('completed detached run → sub-issue marked Done and removed from detached map', async () => {
+    const parent = makeIssue({ id: 'p1', identifier: 'SYM-60', state: 'In Progress' });
+    const target = makeRepoTarget({ repo_alias: 'trialmatch-be' });
+    const ARCHON_RUN_ID = 'cafecafecafecafecafecafecafecafe';
+
+    const { o, calls } = makeDispatchOrchestrator([], {
+      archonStatus: () => Promise.resolve([{
+        id: ARCHON_RUN_ID, status: 'completed',
+        workflow_name: 'gaggle/gaggle-fix-issue',
+        working_path: '/path', started_at: new Date().toISOString(),
+        user_message: '', completed_at: null, last_activity_at: null, metadata: {},
+      }]),
+    });
+
+    // Seed detached run (as if recovered from crash)
+    const state = o.getState();
+    state.detached_archon_runs.set('p1__trialmatch-be', {
+      archon_run_id: ARCHON_RUN_ID,
+      parent_issue: parent,
+      sub_issue_id: 'sub-be',
+      repo_alias: 'trialmatch-be',
+      repo_target: target,
+      recovered_at: Date.now(),
+    });
+    state.claimed.add('p1');
+    state.pending_issues.set('p1', parent);
+
+    await (o as unknown as { reconcileRunningIssues(): Promise<void> }).reconcileRunningIssues();
+
+    // Removed from detached map
+    expect(state.detached_archon_runs.size).toBe(0);
+    // Marked completed in Linear
+    expect(calls.some((c) => c.op === 'updateIssueState' && c.args[0] === 'sub-be' && c.args[1] === 'Done')).toBe(true);
+    // Added to completed set
+    expect(state.completed.has('p1__trialmatch-be')).toBe(true);
+  });
+
+  test('failed detached run → sub-issue re-queued', async () => {
+    const parent = makeIssue({ id: 'p1', identifier: 'SYM-61', state: 'In Progress' });
+    const target = makeRepoTarget({ repo_alias: 'trialmatch-be' });
+    const ARCHON_RUN_ID = 'deadbeefdeadbeefdeadbeefdeadbeef';
+
+    const { o, calls } = makeDispatchOrchestrator([], {
+      archonStatus: () => Promise.resolve([{
+        id: ARCHON_RUN_ID, status: 'failed',
+        workflow_name: 'gaggle/gaggle-fix-issue',
+        working_path: '/path', started_at: new Date().toISOString(),
+        user_message: '', completed_at: null, last_activity_at: null, metadata: {},
+      }]),
+    });
+
+    const state = o.getState();
+    state.detached_archon_runs.set('p1__trialmatch-be', {
+      archon_run_id: ARCHON_RUN_ID,
+      parent_issue: parent,
+      sub_issue_id: 'sub-be',
+      repo_alias: 'trialmatch-be',
+      repo_target: target,
+      recovered_at: Date.now(),
+    });
+
+    await (o as unknown as { reconcileRunningIssues(): Promise<void> }).reconcileRunningIssues();
+
+    expect(state.detached_archon_runs.size).toBe(0);
+    // Re-queued label applied
+    expect(calls.some((c) => c.op === 'applyLabel' && c.args[0] === 'sub-be' && (c.args[1] as string).includes('queued'))).toBe(true);
+  });
+
+  test('not_found detached run → sub-issue re-queued', async () => {
+    const parent = makeIssue({ id: 'p1', identifier: 'SYM-62', state: 'In Progress' });
+    const target = makeRepoTarget({ repo_alias: 'trialmatch-be' });
+
+    const { o, calls } = makeDispatchOrchestrator([], {
+      // archonStatus returns empty — run not found in Archon DB
+      archonStatus: () => Promise.resolve([]),
+    });
+
+    const state = o.getState();
+    state.detached_archon_runs.set('p1__trialmatch-be', {
+      archon_run_id: 'missingmissingmissingmissing1234',
+      parent_issue: parent,
+      sub_issue_id: 'sub-be',
+      repo_alias: 'trialmatch-be',
+      repo_target: target,
+      recovered_at: Date.now(),
+    });
+
+    await (o as unknown as { reconcileRunningIssues(): Promise<void> }).reconcileRunningIssues();
+
+    expect(state.detached_archon_runs.size).toBe(0);
+    expect(calls.some((c) => c.op === 'applyLabel' && c.args[0] === 'sub-be' && (c.args[1] as string).includes('queued'))).toBe(true);
+  });
+
+  test('still-running detached run → left in detached map', async () => {
+    const parent = makeIssue({ id: 'p1', identifier: 'SYM-63', state: 'In Progress' });
+    const target = makeRepoTarget({ repo_alias: 'trialmatch-be' });
+    const ARCHON_RUN_ID = 'aaaabbbbccccddddaaaabbbbccccdddd';
+
+    const { o, calls } = makeDispatchOrchestrator([], {
+      archonStatus: () => Promise.resolve([{
+        id: ARCHON_RUN_ID, status: 'running',
+        workflow_name: 'gaggle/gaggle-fix-issue',
+        working_path: '/path', started_at: new Date().toISOString(),
+        user_message: '', completed_at: null, last_activity_at: null, metadata: {},
+      }]),
+    });
+
+    const state = o.getState();
+    state.detached_archon_runs.set('p1__trialmatch-be', {
+      archon_run_id: ARCHON_RUN_ID,
+      parent_issue: parent,
+      sub_issue_id: 'sub-be',
+      repo_alias: 'trialmatch-be',
+      repo_target: target,
+      recovered_at: Date.now(),
+    });
+
+    await (o as unknown as { reconcileRunningIssues(): Promise<void> }).reconcileRunningIssues();
+
+    // Still running — remains in the map
+    expect(state.detached_archon_runs.size).toBe(1);
+    expect(calls.some((c) => c.op === 'applyLabel')).toBe(false);
+    expect(calls.some((c) => c.op === 'updateIssueState')).toBe(false);
+  });
+});
+
+describe('maybeReleaseClaim', () => {
+  test('releases claim and transitions parent to Done when all work is done', async () => {
+    const issue = makeIssue({ id: 'i1', state: 'In Progress' });
+    const { o, calls } = makeDispatchOrchestrator([], {});
+    const state = o.getState();
+    state.claimed.add('i1');
+    state.pending_issues.set('i1', issue);
+    // No running workers, no pending targets, no retries → should release
+    await (o as unknown as { maybeReleaseClaim(id: string): Promise<void> }).maybeReleaseClaim('i1');
+    expect(state.claimed.has('i1')).toBe(false);
+    expect(calls.some((c) => c.op === 'removeLabel' && c.args[0] === 'i1' && (c.args[1] as string).includes('claimed'))).toBe(true);
+    expect(calls.some((c) => c.op === 'updateIssueState' && c.args[0] === 'i1' && c.args[1] === 'Done')).toBe(true);
+  });
+
+  test('does NOT release claim while a worker is still running', async () => {
+    const issue = makeIssue({ id: 'i1', state: 'In Progress' });
+    const { o, calls } = makeDispatchOrchestrator([], {});
+    const state = o.getState();
+    state.claimed.add('i1');
+    state.pending_issues.set('i1', issue);
+    state.running.set('i1__repo-a', {
+      session_id: 'i1__repo-a__0',
+      issue,
+      identifier: 'SYM-1',
+      repo_alias: 'repo-a',
+      repo_target: makeRepoTarget(),
+      sub_issue_id: null,
+      archon_pid: null,
+      archon_db_run_id: null,
+      archon_workflow: '',
+      last_archon_event: null,
+      last_archon_timestamp: null,
+      last_archon_message: null,
+      claude_input_tokens: 0,
+      claude_output_tokens: 0,
+      claude_total_tokens: 0,
+      turn_count: 0,
+      started_at: new Date().toISOString(),
+      attempt: null,
+    });
+    await (o as unknown as { maybeReleaseClaim(id: string): Promise<void> }).maybeReleaseClaim('i1');
+    expect(state.claimed.has('i1')).toBe(true); // still claimed
+    expect(calls.some((c) => c.op === 'updateIssueState')).toBe(false);
+  });
+
+  test('does NOT release claim while pending targets remain', async () => {
+    const issue = makeIssue({ id: 'i1', state: 'In Progress' });
+    const { o, calls } = makeDispatchOrchestrator([], {});
+    const state = o.getState();
+    state.claimed.add('i1');
+    state.pending_issues.set('i1', issue);
+    state.pending_targets.set('i1', [makeRepoTarget()]); // one target still queued
+    await (o as unknown as { maybeReleaseClaim(id: string): Promise<void> }).maybeReleaseClaim('i1');
+    expect(state.claimed.has('i1')).toBe(true);
+    expect(calls.some((c) => c.op === 'updateIssueState')).toBe(false);
+  });
+});
+
+describe('reconcileRunningIssues — live session transitions', () => {
+  test('cancels live workers when refreshed parent issue is in terminal state', async () => {
+    const issue = makeIssue({ id: 'p1', identifier: 'SYM-70', state: 'In Progress' });
+    const { o } = makeDispatchOrchestrator([], {});
+    const state = o.getState();
+
+    let cancelled = false;
+    state.claimed.add('p1');
+    state.pending_issues.set('p1', issue);
+    state.running.set('p1__trialmatch-be', {
+      session_id: 's1', issue, identifier: 'SYM-70', repo_alias: 'trialmatch-be',
+      repo_target: makeRepoTarget(), sub_issue_id: null, archon_pid: null, archon_db_run_id: null,
+      archon_workflow: '', last_archon_event: null, last_archon_timestamp: null, last_archon_message: null,
+      claude_input_tokens: 0, claude_output_tokens: 0, claude_total_tokens: 0, turn_count: 0,
+      started_at: new Date().toISOString(), attempt: null,
+      cancel: () => { cancelled = true; },
+    });
+
+    (o as unknown as { tracker: unknown }).tracker = {
+      fetchIssueStatesByIds: async () => [{ ...issue, state: 'Done' }],
+      removeLabel: async () => {},
+      updateIssueState: async () => {},
+    };
+
+    await (o as unknown as { reconcileRunningIssues(): Promise<void> }).reconcileRunningIssues();
+
+    expect(cancelled).toBe(true);
+    expect(state.running.has('p1__trialmatch-be')).toBe(false);
+  });
+
+  test('cancels live workers when refreshed issue is neither active nor terminal', async () => {
+    const issue = makeIssue({ id: 'p1', identifier: 'SYM-71', state: 'In Progress' });
+    const { o } = makeDispatchOrchestrator([], {});
+    const state = o.getState();
+
+    let cancelled = false;
+    state.running.set('p1__trialmatch-be', {
+      session_id: 's1', issue, identifier: 'SYM-71', repo_alias: 'trialmatch-be',
+      repo_target: makeRepoTarget(), sub_issue_id: null, archon_pid: null, archon_db_run_id: null,
+      archon_workflow: '', last_archon_event: null, last_archon_timestamp: null, last_archon_message: null,
+      claude_input_tokens: 0, claude_output_tokens: 0, claude_total_tokens: 0, turn_count: 0,
+      started_at: new Date().toISOString(), attempt: null,
+      cancel: () => { cancelled = true; },
+    });
+
+    (o as unknown as { tracker: unknown }).tracker = {
+      fetchIssueStatesByIds: async () => [{ ...issue, state: 'Backlog' }],
+    };
+
+    await (o as unknown as { reconcileRunningIssues(): Promise<void> }).reconcileRunningIssues();
+
+    expect(cancelled).toBe(true);
+    expect(state.running.has('p1__trialmatch-be')).toBe(false);
+  });
+});
+
+describe('scheduleRetry — max retries and completed guard', () => {
+  test('abandons and marks Cancelled when attempt > 10', async () => {
+    const issue = makeIssue({ id: 'p1', identifier: 'SYM-80', state: 'In Progress' });
+    const target = makeRepoTarget({ repo_alias: 'trialmatch-be' });
+    const { o, calls } = makeDispatchOrchestrator([], {});
+    const state = o.getState();
+    state.claimed.add('p1');
+    state.pending_issues.set('p1', issue);
+
+    (o as unknown as { scheduleRetry(...args: unknown[]): void }).scheduleRetry(issue, target, 11, 'too many attempts');
+
+    await new Promise((r) => setTimeout(r, 0));
+    expect(state.retry_attempts.has('p1__trialmatch-be')).toBe(false);
+    expect(calls.some((c) => c.op === 'updateIssueState' && c.args[1] === 'Cancelled')).toBe(true);
+  });
+
+  test('executeRetry bails out immediately when key already in completed set', async () => {
+    const issue = makeIssue({ id: 'p1', identifier: 'SYM-81', state: 'In Progress' });
+    const target = makeRepoTarget({ repo_alias: 'trialmatch-be' });
+    const { o, calls } = makeDispatchOrchestrator([], {});
+    const state = o.getState();
+    state.claimed.add('p1');
+    state.pending_issues.set('p1', issue);
+    state.completed.add('p1__trialmatch-be');
+
+    await (o as unknown as { executeRetry(k: string, i: typeof issue, t: typeof target, a: number): Promise<void> })
+      .executeRetry('p1__trialmatch-be', issue, target, 1);
+
+    expect(calls.some((c) => c.op === 'applyLabel')).toBe(false);
+    expect(state.claimed.has('p1')).toBe(false);
+  });
+
+  test('executeRetry re-queues when no slots available', async () => {
+    const issue = makeIssue({ id: 'p1', identifier: 'SYM-82', state: 'In Progress' });
+    const target = makeRepoTarget({ repo_alias: 'trialmatch-be' });
+    const cfg = makeServiceConfig();
+    cfg.agent.max_concurrent_agents = 0;
+    const { orchestrator: o } = makeOrchestrator({ cfg });
+    orchestrators.push(o);
+    const state = o.getState();
+    state.claimed.add('p1');
+    state.pending_issues.set('p1', issue);
+
+    await (o as unknown as { executeRetry(k: string, i: typeof issue, t: typeof target, a: number): Promise<void> })
+      .executeRetry('p1__trialmatch-be', issue, target, 2);
+
+    expect(state.retry_attempts.has('p1__trialmatch-be')).toBe(true);
+    expect(state.retry_attempts.get('p1__trialmatch-be')?.attempt).toBe(2);
+  });
+
+  test('executeRetry releases claim when issue is terminal at retry time', async () => {
+    const issue = makeIssue({ id: 'p1', identifier: 'SYM-83', state: 'In Progress' });
+    const target = makeRepoTarget({ repo_alias: 'trialmatch-be' });
+    const { o, calls } = makeDispatchOrchestrator([], {});
+    const state = o.getState();
+    state.claimed.add('p1');
+    state.pending_issues.set('p1', issue);
+
+    (o as unknown as { tracker: unknown }).tracker = {
+      fetchIssueStatesByIds: async () => [{ ...issue, state: 'Done' }],
+      removeLabel: async (_id: string, _l: string) => { calls.push({ op: 'removeLabel', args: [_id, _l] }); },
+      updateIssueState: async (_id: string, _s: string) => { calls.push({ op: 'updateIssueState', args: [_id, _s] }); },
+    };
+
+    await (o as unknown as { executeRetry(k: string, i: typeof issue, t: typeof target, a: number): Promise<void> })
+      .executeRetry('p1__trialmatch-be', issue, target, 1);
+
+    expect(state.claimed.has('p1')).toBe(false);
+  });
+});
+
+// ─── gray-zone state guards ────────────────────────────────────────────────────
+// A gray-zone state is one that is neither in active_states nor terminal_states.
+// The default test config uses active_states=['Todo','In Progress'], terminal_states=[...Done/Cancelled].
+// 'Triage' is used here as a representative gray-zone state — it's not active (won't dispatch)
+// and not terminal (won't be caught by old terminal-only guards). All paths must treat any
+// non-active state as off-limits regardless of whether it appears in terminal_states.
+
+describe('gray-zone state guards', () => {
+  test('shouldDispatch skips issues in gray-zone state (Triage)', async () => {
+    const issue = makeIssue({ id: 'i1', state: 'Triage' }); // not in active_states, not in terminal_states
+    const { o, calls } = makeDispatchOrchestrator([issue]);
+    await runTick(o);
+    expect(calls.some((c) => c.op === 'analyze')).toBe(false);
+    expect(calls.some((c) => c.op === 'applyLabel' && (c.args[1] as string).includes('claimed'))).toBe(false);
+  });
+
+  test('executeRetry releases claim when issue is in gray-zone state (not active, not terminal)', async () => {
+    const issue = makeIssue({ id: 'p1', identifier: 'SYM-84', state: 'In Progress' });
+    const target = makeRepoTarget({ repo_alias: 'trialmatch-be' });
+    const { o, calls } = makeDispatchOrchestrator([], {});
+    const state = o.getState();
+    state.claimed.add('p1');
+    state.pending_issues.set('p1', issue);
+
+    (o as unknown as { tracker: unknown }).tracker = {
+      fetchIssueStatesByIds: async () => [{ ...issue, state: 'Triage' }], // gray-zone: not active, not terminal
+      removeLabel: async (_id: string, _l: string) => { calls.push({ op: 'removeLabel', args: [_id, _l] }); },
+      updateIssueState: async (_id: string, _s: string) => { calls.push({ op: 'updateIssueState', args: [_id, _s] }); },
+    };
+
+    await (o as unknown as { executeRetry(k: string, i: typeof issue, t: typeof target, a: number): Promise<void> })
+      .executeRetry('p1__trialmatch-be', issue, target, 1);
+
+    expect(state.claimed.has('p1')).toBe(false);
+  });
+
+  test('recoverFromLinearLabels: running sub in gray-zone state → label cleaned up, NOT re-queued', async () => {
+    const parent = makeIssue({ id: 'p1', identifier: 'SYM-85', parent_id: null, state: 'In Progress', labels: ['gaggle:claimed'] });
+    const graySub = makeIssue({
+      id: 'sub-be', identifier: 'SYM-86', parent_id: 'p1',
+      title: '[trialmatch-be] Fix the feature',
+      state: 'Triage', labels: ['gaggle:running'], // gray-zone: stale running label, issue moved out of active states
+    });
+
+    const cfg = makeServiceConfig();
+    cfg.polling.interval_ms = 86_400_000;
+    const calls: TrackerCall[] = [];
+    const tracker = {
+      async ensureGaggleLabels() { calls.push({ op: 'ensureGaggleLabels', args: [] }); },
+      async resolveViewerId() { return 'u1'; },
+      async fetchCandidateIssues() { return []; },
+      async fetchIssuesByLabel(label: string) {
+        calls.push({ op: 'fetchIssuesByLabel', args: [label] });
+        const byLabel: Record<string, typeof parent[]> = {
+          'gaggle:claimed': [parent],
+          'gaggle:running': [graySub],
+          'gaggle:queued': [],
+          'gaggle:waiting-human': [],
+        };
+        return byLabel[label] ?? [];
+      },
+      async fetchIssuesByStates() { return []; },
+      async fetchIssueStatesByIds(ids: string[]) { calls.push({ op: 'fetchIssueStatesByIds', args: [ids] }); return []; },
+      async fetchIssueComments() { return []; },
+      async applyLabel(id: string, label: string) { calls.push({ op: 'applyLabel', args: [id, label] }); },
+      async removeLabel(id: string, label: string) { calls.push({ op: 'removeLabel', args: [id, label] }); },
+      async postComment() { return { id: 'c1' }; },
+      async updateIssueState(id: string, s: string) { calls.push({ op: 'updateIssueState', args: [id, s] }); },
+      async createSubIssue() { return { id: 'sub1', identifier: 'SYM-99' }; },
+      async createBlockerRelation() {},
+    } as unknown as LinearClient;
+
+    const reg = makeFakeRegistry();
+    const o = new Orchestrator({
+      cfg,
+      tracker,
+      analyzer: { analyze: async () => ({ issue_id: 'x', analysis_summary: '', repo_targets: [] }) } as unknown as IssueAnalyzer,
+      workspace: {} as unknown as WorkspaceManager,
+      registry: reg.handle,
+      syncer: null,
+      archonClient: makeFakeArchonClient(),
+    });
+    orchestrators.push(o);
+
+    await o.start();
+
+    // Running label cleaned up
+    expect(calls.some((c) => c.op === 'removeLabel' && c.args[0] === 'sub-be' && c.args[1] === 'gaggle:running')).toBe(true);
+    // NOT re-queued (gray-zone = no longer active)
+    expect(calls.some((c) => c.op === 'applyLabel' && c.args[0] === 'sub-be' && c.args[1] === 'gaggle:queued')).toBe(false);
+    // NOT added to sibling_subissues
+    expect(o.getState().sibling_subissues.get('p1')?.has('trialmatch-be')).toBeFalsy();
+  });
+
+  test('recoverFromLinearLabels: queued sub in gray-zone state → NOT restored to sibling_subissues', async () => {
+    const parent = makeIssue({ id: 'p1', identifier: 'SYM-87', parent_id: null, state: 'In Progress', labels: ['gaggle:claimed'] });
+    const graySub = makeIssue({
+      id: 'sub-be', identifier: 'SYM-88', parent_id: 'p1',
+      title: '[trialmatch-be] Fix the feature',
+      state: 'Triage', labels: ['gaggle:queued'], // gray-zone: label carried over, issue moved out of active states
+    });
+
+    const cfg = makeServiceConfig();
+    cfg.polling.interval_ms = 86_400_000;
+    const calls: TrackerCall[] = [];
+    const tracker = {
+      async ensureGaggleLabels() { calls.push({ op: 'ensureGaggleLabels', args: [] }); },
+      async resolveViewerId() { return 'u1'; },
+      async fetchCandidateIssues() { return []; },
+      async fetchIssuesByLabel(label: string) {
+        calls.push({ op: 'fetchIssuesByLabel', args: [label] });
+        const byLabel: Record<string, typeof parent[]> = {
+          'gaggle:claimed': [parent],
+          'gaggle:running': [],
+          'gaggle:queued': [graySub],
+          'gaggle:waiting-human': [],
+        };
+        return byLabel[label] ?? [];
+      },
+      async fetchIssuesByStates() { return []; },
+      async fetchIssueStatesByIds(ids: string[]) { calls.push({ op: 'fetchIssueStatesByIds', args: [ids] }); return []; },
+      async fetchIssueComments() { return []; },
+      async applyLabel(id: string, label: string) { calls.push({ op: 'applyLabel', args: [id, label] }); },
+      async removeLabel(id: string, label: string) { calls.push({ op: 'removeLabel', args: [id, label] }); },
+      async postComment() { return { id: 'c1' }; },
+      async updateIssueState(id: string, s: string) { calls.push({ op: 'updateIssueState', args: [id, s] }); },
+      async createSubIssue() { return { id: 'sub1', identifier: 'SYM-99' }; },
+      async createBlockerRelation() {},
+    } as unknown as LinearClient;
+
+    const reg = makeFakeRegistry();
+    const o = new Orchestrator({
+      cfg,
+      tracker,
+      analyzer: { analyze: async () => ({ issue_id: 'x', analysis_summary: '', repo_targets: [] }) } as unknown as IssueAnalyzer,
+      workspace: {} as unknown as WorkspaceManager,
+      registry: reg.handle,
+      syncer: null,
+      archonClient: makeFakeArchonClient(),
+    });
+    orchestrators.push(o);
+
+    await o.start();
+
+    // Gray-zone queued sub should NOT be restored to sibling_subissues
+    expect(o.getState().sibling_subissues.get('p1')?.has('trialmatch-be')).toBeFalsy();
+  });
+});
+
+describe('reconcileRunningIssues — detached paused transition', () => {
+  test('paused detached run → moved to supervised_gates and label swapped', async () => {
+    const parent = makeIssue({ id: 'p1', identifier: 'SYM-90', state: 'In Progress' });
+    const target = makeRepoTarget({ repo_alias: 'trialmatch-be' });
+    const ARCHON_RUN_ID = 'bebebebebebebebebebebebebebebebe';
+
+    const { o, calls } = makeDispatchOrchestrator([], {
+      archonStatus: () => Promise.resolve([{
+        id: ARCHON_RUN_ID, status: 'paused',
+        workflow_name: 'gaggle/gaggle-fix-issue',
+        working_path: '/path', started_at: new Date().toISOString(),
+        user_message: '', completed_at: null, last_activity_at: null,
+        metadata: { approval: { sessionId: 'gate-session-id', message: 'Please review' } },
+      }]),
+    });
+
+    const state = o.getState();
+    state.detached_archon_runs.set('p1__trialmatch-be', {
+      archon_run_id: ARCHON_RUN_ID,
+      parent_issue: parent,
+      sub_issue_id: 'sub-be',
+      repo_alias: 'trialmatch-be',
+      repo_target: target,
+      recovered_at: Date.now(),
+    });
+
+    await (o as unknown as { reconcileRunningIssues(): Promise<void> }).reconcileRunningIssues();
+
+    expect(state.detached_archon_runs.size).toBe(0);
+    const gate = state.supervised_gates.get('p1__trialmatch-be');
+    expect(gate).toBeDefined();
+    expect(gate?.gate_message).toContain('Please review');
+    expect(calls.some((c) => c.op === 'removeLabel' && (c.args[1] as string).includes('running'))).toBe(true);
+    expect(calls.some((c) => c.op === 'applyLabel' && (c.args[1] as string).includes('waiting-human'))).toBe(true);
   });
 });

@@ -7,7 +7,7 @@
  */
 
 import { existsSync, readdirSync, rmSync } from 'node:fs';
-import { join } from 'node:path';
+import { join, sep } from 'node:path';
 import type {
   Issue,
   IssueAnalysis,
@@ -23,10 +23,14 @@ import { LinearClient } from '../tracker/linear.ts';
 import { IssueAnalyzer } from '../analyzer/issue-analyzer.ts';
 import { WorkspaceManager } from '../workspace/workspace-manager.ts';
 import {
-  archonApprove,
-  archonReject,
-} from '../executor/archon.ts';
-import { spawnWorker, buildLiveSession } from './worker.ts';
+  ArchonClient,
+  findArchonRunForRepo,
+  type ArchonRunRecord,
+} from '../executor/archon-client.ts';
+import { ArchonRunPoller } from '../executor/archon-poller.ts';
+import { spawnWorker, buildLiveSession, type WorkerStartArgs } from './worker.ts';
+import { approveAndResumeArchon } from '../executor/archon.ts';
+import { buildIssueMessage } from '../workspace/message.ts';
 import {
   availableSlots,
   buildSessionId,
@@ -36,12 +40,14 @@ import {
   workerKey,
 } from './state.ts';
 import { blockersSatisfied, repoTargetReady } from './readiness.ts';
-import { defaultGateResumeState } from '../config/service-config.ts';
+import { defaultGateResumeState, completedState } from '../config/service-config.ts';
 import type { RegistryLoaderHandle } from '../registry/loader.ts';
 import type { SyncerHandle } from '../registry/repo-syncer.ts';
+import { writeRunEntry, deleteRunEntry, allRunEntries } from '../registry/run-registry.ts';
+import { classifyGateReply, type GateClassification } from './gate-classifier.ts';
 
-const APPROVE_KEYWORDS = /^(approve|approved|yes|y|lgtm|ship it|go|continue)\b/i;
-const REJECT_KEYWORDS = /^(reject|rejected|no|n|cancel|abort|stop)\b/i;
+const APPROVE_KEYWORDS = /^(approve[d]?|yes|y|lgtm|ship\s+it|go|continue|implement|do\s+it|looks?\s+good|lg|ok(ay)?|sure|proceed|start|build|make\s+it|let'?s\s+go|confirm(ed)?|✅|👍)\b/i;
+const REJECT_KEYWORDS = /^(reject(ed)?|no|n|cancel(led)?|abort|stop|don'?t|nope|👎)\b/i;
 
 export interface OrchestratorDeps {
   cfg: ServiceConfig;
@@ -50,6 +56,8 @@ export interface OrchestratorDeps {
   workspace: WorkspaceManager;
   registry: RegistryLoaderHandle;
   syncer: SyncerHandle | null;
+  /** Injected for testing; defaults to a real ArchonClient built from cfg. */
+  archonClient?: ArchonClient;
 }
 
 export class Orchestrator {
@@ -60,6 +68,7 @@ export class Orchestrator {
   private workspace: WorkspaceManager;
   private registry: RegistryLoaderHandle;
   private syncer: SyncerHandle | null;
+  private archon: ArchonClient;
   private tickTimer: ReturnType<typeof setTimeout> | null = null;
   private stopped = false;
   private analyzing = new Set<string>();
@@ -71,6 +80,7 @@ export class Orchestrator {
     this.workspace = deps.workspace;
     this.registry = deps.registry;
     this.syncer = deps.syncer;
+    this.archon = deps.archonClient ?? new ArchonClient(deps.cfg.archon.api_url);
     this.state = createInitialState(this.cfg);
 
     deps.registry.on(() => {
@@ -97,7 +107,7 @@ export class Orchestrator {
       max_concurrent_agents: this.cfg.agent.max_concurrent_agents,
     });
 
-    await this.tracker.ensureSymphonyLabels();
+    await this.tracker.ensureGaggleLabels();
     if (this.cfg.tracker.assigned_to_me) {
       await this.tracker.resolveViewerId();
     }
@@ -113,6 +123,7 @@ export class Orchestrator {
     if (this.tickTimer) clearTimeout(this.tickTimer);
     for (const [, session] of this.state.running) {
       try {
+        session.stopPoller?.();
         session.cancel?.();
       } catch {
         /* ignore */
@@ -133,6 +144,7 @@ export class Orchestrator {
     try {
       await this.reconcileRunningIssues();
       await this.pollSupervisedGates();
+      await this.pollMergedPRs();
       await this.processPendingTargets();
 
       const issues = await this.fetchCandidates();
@@ -143,21 +155,28 @@ export class Orchestrator {
       for (const issue of sorted) {
         if (this.stopped) break;
         if (availableSlots(this.state) === 0) break;
-        if (!this.shouldDispatch(issue)) continue;
 
-        let analysis: IssueAnalysis | null;
-        try {
-          analysis = await this.getOrAnalyze(issue);
-        } catch (err) {
-          logger.error('Issue analysis failed', {
-            issue_id: issue.id,
-            issue_identifier: issue.identifier,
-            error: (err as Error).message,
-          });
-          continue;
+        if (issue.parent_id) {
+          // Sub-issue path: dispatched without analysis (description IS the task).
+          if (!this.shouldDispatchSubIssue(issue)) continue;
+          await this.dispatchSubIssueFromPoll(issue);
+        } else {
+          // Parent issue path: analyze then fan out.
+          if (!this.shouldDispatch(issue)) continue;
+          let analysis: IssueAnalysis | null;
+          try {
+            analysis = await this.getOrAnalyze(issue);
+          } catch (err) {
+            logger.error('Issue analysis failed', {
+              issue_id: issue.id,
+              issue_identifier: issue.identifier,
+              error: (err as Error).message,
+            });
+            continue;
+          }
+          if (!analysis) continue;
+          await this.dispatchIssue(issue, analysis);
         }
-        if (!analysis) continue;
-        await this.dispatchIssue(issue, analysis);
       }
     } catch (err) {
       logger.error('Tick error', { error: (err as Error).message });
@@ -193,11 +212,16 @@ export class Orchestrator {
     if (!issue.id || !issue.identifier || !issue.title || !issue.state) return false;
     if (this.cfg.tracker.terminal_states.includes(issue.state)) return false;
     if (!this.cfg.tracker.active_states.includes(issue.state)) return false;
+    // Parent issues only — sub-issues are handled by shouldDispatchSubIssue.
+    if (issue.parent_id) return false;
+    const gaggleLabels =Object.values(this.cfg.tracker.gaggle_labels).map((l) => l.toLowerCase());
+    if (issue.labels.some((l) => gaggleLabels.includes(l))) return false;
     if (this.state.claimed.has(issue.id)) return false;
-    if (issue.labels.includes(this.cfg.tracker.symphony_labels.claimed.toLowerCase())) {
-      return false;
-    }
     for (const key of this.state.running.keys()) {
+      if (key.startsWith(issue.id + '__')) return false;
+    }
+    // If any target for this issue was already completed this session, skip re-dispatch.
+    for (const key of this.state.completed) {
       if (key.startsWith(issue.id + '__')) return false;
     }
     if (!blockersSatisfied(issue.blocked_by, this.cfg)) return false;
@@ -211,6 +235,162 @@ export class Orchestrator {
       if (inState >= stateLimit) return false;
     }
     return true;
+  }
+
+  /** Eligibility check for sub-issues picked up directly from the poll loop (recovery path). */
+  private shouldDispatchSubIssue(issue: Issue): boolean {
+    if (!issue.id || !issue.identifier || !issue.title || !issue.state) return false;
+    if (this.cfg.tracker.terminal_states.includes(issue.state)) return false;
+    if (!this.cfg.tracker.active_states.includes(issue.state)) return false;
+    // Any gaggle label means the orchestrator is already managing it.
+    const gaggleLabels =Object.values(this.cfg.tracker.gaggle_labels).map((l) => l.toLowerCase());
+    if (issue.labels.some((l) => gaggleLabels.includes(l))) return false;
+    const alias = this.parseAliasFromTitle(issue.title);
+    if (!alias) return false;
+    const parentId = issue.parent_id!;
+    const key = workerKey(parentId, alias);
+    if (this.state.running.has(key)) return false;
+    if (this.state.completed.has(key)) return false;
+    // Native Linear blockers must be satisfied (set via createBlockerRelation).
+    if (!blockersSatisfied(issue.blocked_by, this.cfg)) return false;
+    return true;
+  }
+
+  private parseAliasFromTitle(title: string): string | null {
+    const m = title.match(/^\[([^\]]+)\]/);
+    return m ? m[1]! : null;
+  }
+
+  private buildRepoTargetFromSubIssue(subIssue: Issue): import('../domain/types.ts').RepoTarget | null {
+    const alias = this.parseAliasFromTitle(subIssue.title);
+    if (!alias) return null;
+    const repo = this.registry.getContext().repositories.find((r) => r.name === alias);
+    if (!repo) {
+      logger.warn('Sub-issue has unknown repo alias; cannot dispatch', {
+        alias,
+        sub_issue_id: subIssue.id,
+      });
+      return null;
+    }
+    return {
+      repo_url: repo.url,
+      repo_alias: repo.name,
+      local_path: repo.local_path,
+      archon_workflow: repo.default_workflow ?? this.cfg.archon.default_workflow,
+      rationale: subIssue.description ?? subIssue.title,
+      components: [],
+    };
+  }
+
+  /** Launch Archon for a (parentIssue, repoTarget, subIssueId) triple. Shared by drainPendingTargets, dispatchSubIssueFromPoll, and promoteQueuedSiblings. */
+  private async launchWorker(
+    parentIssue: Issue,
+    target: import('../domain/types.ts').RepoTarget,
+    subIssueId: string | null,
+    attempt: number | null,
+    messageOverride?: string,
+  ): Promise<void> {
+    const targetId = subIssueId ?? parentIssue.id;
+    const key = workerKey(parentIssue.id, target.repo_alias);
+    const log = logger.child({
+      issue_id: parentIssue.id,
+      issue_identifier: parentIssue.identifier,
+      repo_alias: target.repo_alias,
+      session_id: buildSessionId(parentIssue.identifier, target.repo_alias, attempt),
+    });
+
+    try {
+      await this.tracker.applyLabel(targetId, this.cfg.tracker.gaggle_labels.running);
+    } catch (err) {
+      logger.error('Failed to apply running label; aborting dispatch', {
+        issue_id: parentIssue.id, repo_alias: target.repo_alias, error: (err as Error).message,
+      });
+      return;
+    }
+
+    const placeholder = buildLiveSession({ issue: parentIssue, repo_target: target, attempt, sub_issue_id: subIssueId, cancel: () => {} });
+    this.state.running.set(key, placeholder);
+
+    const branch = this.cfg.repositories.find((r) => r.url === target.repo_url)?.default_branch ?? 'main';
+    const workerArgs: WorkerStartArgs = {
+      cfg: this.cfg,
+      workspace: this.workspace,
+      issue: parentIssue,
+      repo_target: target,
+      analysis: { issue_id: parentIssue.id, analysis_summary: '', repo_targets: [target] },
+      attempt,
+      source_branch: branch,
+      message_override: messageOverride,
+    };
+
+    try {
+      const handle = await spawnWorker(workerArgs, {
+        onStarted: (pid) => { const s = this.state.running.get(key); if (s) { s.archon_pid = pid; s.last_archon_timestamp = new Date().toISOString(); } },
+        onOutput: (line) => { const s = this.state.running.get(key); if (s) { s.last_archon_message = line; s.last_archon_timestamp = new Date().toISOString(); s.turn_count += 1; } },
+        onRunId: (db_run_id) => {
+          const s = this.state.running.get(key);
+          if (s) {
+            s.archon_db_run_id = db_run_id;
+            this.attachPoller(key, db_run_id, parentIssue, target, subIssueId, attempt);
+          }
+          writeRunEntry(this.cfg.registry.base_folder, key, {
+            archon_run_id: db_run_id,
+            parent_issue_id: parentIssue.id,
+            sub_issue_id: subIssueId,
+            repo_alias: target.repo_alias,
+          });
+          log.info('Captured Archon run id', { archon_run_id: db_run_id });
+        },
+        onGatePaused: (run_id, gate_message) => { void this.handleGatePaused(parentIssue, target, subIssueId, run_id, gate_message, attempt); },
+        onExit: (event) => {
+          deleteRunEntry(this.cfg.registry.base_folder, key);
+          void this.handleWorkerExit(parentIssue, target, event, attempt);
+        },
+      });
+      const sess = this.state.running.get(key);
+      if (sess) sess.cancel = handle.cancel;
+      log.info('Worker spawned', { workflow: target.archon_workflow });
+    } catch (err) {
+      this.state.running.delete(key);
+      try { await this.tracker.removeLabel(targetId, this.cfg.tracker.gaggle_labels.running); } catch { /* ignore */ }
+      this.scheduleRetry(parentIssue, target, (attempt ?? 0) + 1, (err as Error).message);
+    }
+  }
+
+  /** Poll-loop recovery path: dispatch a sub-issue that has no gaggle labels (e.g. crash before label was applied). */
+  private async dispatchSubIssueFromPoll(subIssue: Issue): Promise<void> {
+    const parentId = subIssue.parent_id!;
+    const target = this.buildRepoTargetFromSubIssue(subIssue);
+    if (!target) return;
+
+    // Resolve parent issue (prefer in-memory cache, fall back to Linear fetch).
+    let parentIssue = this.state.pending_issues.get(parentId);
+    if (!parentIssue) {
+      try {
+        const fetched = await this.tracker.fetchIssueStatesByIds([parentId]);
+        parentIssue = fetched[0];
+      } catch { /* ignore */ }
+    }
+    if (!parentIssue) {
+      logger.warn('Cannot resolve parent issue for sub-issue; skipping dispatch', {
+        sub_issue_id: subIssue.id, parent_id: parentId,
+      });
+      return;
+    }
+
+    // Register in sibling map.
+    let sibMap = this.state.sibling_subissues.get(parentId);
+    if (!sibMap) { sibMap = new Map(); this.state.sibling_subissues.set(parentId, sibMap); }
+    sibMap.set(target.repo_alias, subIssue.id);
+
+    // Claim parent if not already done.
+    if (!this.state.claimed.has(parentId)) {
+      this.state.claimed.add(parentId);
+      this.state.pending_issues.set(parentId, parentIssue);
+      try { await this.tracker.applyLabel(parentId, this.cfg.tracker.gaggle_labels.claimed); } catch { /* ignore */ }
+    }
+
+    await this.launchWorker(parentIssue, target, subIssue.id, null, subIssue.description ?? undefined);
   }
 
   // ─── analysis with cache ──────────────────────────────────────────────────
@@ -257,7 +437,7 @@ export class Orchestrator {
     }
 
     try {
-      await this.tracker.applyLabel(issue.id, this.cfg.tracker.symphony_labels.claimed);
+      await this.tracker.applyLabel(issue.id, this.cfg.tracker.gaggle_labels.claimed);
     } catch (err) {
       logger.error('Failed to apply claimed label', {
         issue_id: issue.id,
@@ -284,21 +464,55 @@ export class Orchestrator {
     const targets = this.state.pending_targets.get(issue.id) ?? [];
     const fanOutWidth = analysis.repo_targets.length;
 
+    // Phase 1: Create all sub-issues upfront (Todo + description).
     for (const target of targets) {
-      if (availableSlots(this.state) === 0) {
-        remaining.push(target);
-        continue;
-      }
-      if (!repoTargetReady(target, issue.id, this.state, this.cfg)) {
-        remaining.push(target);
-        continue;
-      }
+      await this.maybeCreateSubIssue(issue, target, analysis, fanOutWidth);
+    }
 
-      const subIssueId = await this.maybeCreateSubIssue(issue, target, fanOutWidth);
+    // Phase 2: Set up Linear blocker relations for targets that declare depends_on.
+    for (const target of targets) {
+      if (!target.depends_on?.length) continue;
+      const downstreamSubId = this.state.sibling_subissues.get(issue.id)?.get(target.repo_alias);
+      if (!downstreamSubId) continue;
+      for (const upstreamAlias of target.depends_on) {
+        const upstreamSubId = this.state.sibling_subissues.get(issue.id)?.get(upstreamAlias);
+        if (!upstreamSubId) continue;
+        try {
+          await this.tracker.createBlockerRelation(upstreamSubId, downstreamSubId);
+        } catch (err) {
+          logger.warn('Failed to create blocker relation', {
+            upstream: upstreamAlias,
+            downstream: target.repo_alias,
+            error: (err as Error).message,
+          });
+        }
+      }
+    }
+
+    // Phase 3: Dispatch or queue each target.
+    for (const target of targets) {
+      const subIssueId = this.state.sibling_subissues.get(issue.id)?.get(target.repo_alias) ?? null;
       const targetId = subIssueId ?? issue.id;
 
+      // Targets with dependencies wait for their upstream siblings.
+      if (target.depends_on?.length && !repoTargetReady(target, issue.id, this.state, this.cfg)) {
+        try {
+          await this.tracker.applyLabel(targetId, this.cfg.tracker.gaggle_labels.queued);
+        } catch { /* non-fatal */ }
+        remaining.push(target);
+        continue;
+      }
+
+      if (availableSlots(this.state) === 0) {
+        try {
+          await this.tracker.applyLabel(targetId, this.cfg.tracker.gaggle_labels.queued);
+        } catch { /* non-fatal */ }
+        remaining.push(target);
+        continue;
+      }
+
       try {
-        await this.tracker.applyLabel(targetId, this.cfg.tracker.symphony_labels.running);
+        await this.tracker.applyLabel(targetId, this.cfg.tracker.gaggle_labels.running);
       } catch (err) {
         logger.error('Failed to apply running label; skipping dispatch', {
           issue_id: issue.id,
@@ -318,91 +532,51 @@ export class Orchestrator {
       });
 
       try {
-        const repo = this.registry.getContext().repositories.find((r) => r.url === target.repo_url);
         const branch = this.cfg.repositories.find((r) => r.url === target.repo_url)?.default_branch ?? 'main';
-
-        let placeholder = buildLiveSession({
-          issue,
-          repo_target: target,
-          attempt: null,
-          sub_issue_id: subIssueId,
-          cancel: () => {},
-        });
+        const placeholder = buildLiveSession({ issue, repo_target: target, attempt: null, sub_issue_id: subIssueId, cancel: () => {} });
         this.state.running.set(key, placeholder);
 
         const handle = await spawnWorker(
+          { cfg: this.cfg, workspace: this.workspace, issue, repo_target: target, analysis, attempt: null, source_branch: branch },
           {
-            cfg: this.cfg,
-            workspace: this.workspace,
-            issue,
-            repo_target: target,
-            analysis,
-            attempt: null,
-            source_branch: branch,
-          },
-          {
-            onStarted: (pid) => {
+            onStarted: (pid) => { const s = this.state.running.get(key); if (s) { s.archon_pid = pid; s.last_archon_timestamp = new Date().toISOString(); } },
+            onOutput: (line) => { const s = this.state.running.get(key); if (s) { s.last_archon_message = line; s.last_archon_timestamp = new Date().toISOString(); s.turn_count += 1; } },
+            onRunId: (db_run_id) => {
               const s = this.state.running.get(key);
               if (s) {
-                s.archon_pid = pid;
-                s.last_archon_timestamp = new Date().toISOString();
+                s.archon_db_run_id = db_run_id;
+                this.attachPoller(key, db_run_id, issue, target, subIssueId, null);
               }
+              writeRunEntry(this.cfg.registry.base_folder, key, {
+                archon_run_id: db_run_id,
+                parent_issue_id: issue.id,
+                sub_issue_id: subIssueId,
+                repo_alias: target.repo_alias,
+              });
             },
-            onOutput: (line) => {
-              const s = this.state.running.get(key);
-              if (s) {
-                s.last_archon_message = line;
-                s.last_archon_timestamp = new Date().toISOString();
-                s.turn_count += 1;
-              }
-            },
-            onGatePaused: (run_id, gate_message) => {
-              void this.handleGatePaused(issue, target, subIssueId, run_id, gate_message, null);
-            },
-            onExit: (event) => {
-              void this.handleWorkerExit(issue, target, event, null);
-            },
+            onGatePaused: (run_id, gate_message) => { void this.handleGatePaused(issue, target, subIssueId, run_id, gate_message, null); },
+            onExit: (event) => { void this.handleWorkerExit(issue, target, event, null); },
           },
         );
         const sess = this.state.running.get(key);
         if (sess) sess.cancel = handle.cancel;
-        log.info('Worker spawned', { workflow: target.archon_workflow, repo: repo?.name });
+        log.info('Worker spawned', { workflow: target.archon_workflow });
       } catch (err) {
-        logger.error('spawnWorker failed', {
-          issue_id: issue.id,
-          repo_alias: target.repo_alias,
-          error: (err as Error).message,
-        });
+        logger.error('spawnWorker failed', { issue_id: issue.id, repo_alias: target.repo_alias, error: (err as Error).message });
         this.state.running.delete(key);
-        try {
-          await this.tracker.removeLabel(targetId, this.cfg.tracker.symphony_labels.running);
-        } catch {
-          /* ignore */
-        }
+        try { await this.tracker.removeLabel(targetId, this.cfg.tracker.gaggle_labels.running); } catch { /* ignore */ }
         this.scheduleRetry(issue, target, 1, (err as Error).message);
       }
     }
 
     this.state.pending_targets.set(issue.id, remaining);
-    if (remaining.length === 0) {
-      this.state.pending_targets.delete(issue.id);
-    } else {
-      // Apply queued labels for any targets still waiting
-      for (const t of remaining) {
-        const subId = this.state.sibling_subissues.get(issue.id)?.get(t.repo_alias) ?? null;
-        const targetId = subId ?? issue.id;
-        try {
-          await this.tracker.applyLabel(targetId, this.cfg.tracker.symphony_labels.queued);
-        } catch {
-          /* non-fatal */
-        }
-      }
-    }
+    if (remaining.length === 0) this.state.pending_targets.delete(issue.id);
   }
 
   private async maybeCreateSubIssue(
     issue: Issue,
     target: RepoTarget,
+    analysis: IssueAnalysis,
     fanOutWidth: number,
   ): Promise<string | null> {
     if (!this.cfg.tracker.create_sub_issues || fanOutWidth <= 1) return null;
@@ -412,12 +586,14 @@ export class Orchestrator {
 
     try {
       const viewerId = this.cfg.tracker.assigned_to_me ? await this.tracker.resolveViewerId() : null;
-      const stateName = this.cfg.tracker.active_states[0] ?? 'In Progress';
+      // Sub-issues start in Todo so the orchestrator (or poll loop) controls when work begins.
+      const description = buildIssueMessage({ issue, repo_target: target, analysis, attempt: null });
       const sub = await this.tracker.createSubIssue({
         parent_id: issue.id,
         title: `[${target.repo_alias}] ${issue.title}`,
+        description,
         assignee_id: viewerId,
-        state_name: stateName,
+        state_name: 'Todo',
       });
 
       let map = this.state.sibling_subissues.get(issue.id);
@@ -426,11 +602,7 @@ export class Orchestrator {
         this.state.sibling_subissues.set(issue.id, map);
       }
       map.set(target.repo_alias, sub.id);
-      logger.info('Created sub-issue', {
-        issue_id: issue.id,
-        repo_alias: target.repo_alias,
-        sub_issue_id: sub.id,
-      });
+      logger.info('Created sub-issue', { issue_id: issue.id, repo_alias: target.repo_alias, sub_issue_id: sub.id });
       return sub.id;
     } catch (err) {
       logger.warn('Failed to create sub-issue (continuing on parent)', {
@@ -440,6 +612,82 @@ export class Orchestrator {
       });
       return null;
     }
+  }
+
+  // ─── poller attachment ───────────────────────────────────────────────────
+  /**
+   * Attach an ArchonRunPoller to a live session once the DB run-id is known.
+   * The poller provides authoritative status updates independent of subprocess output.
+   */
+  private attachPoller(
+    key: string,
+    runId: string,
+    issue: import('../domain/types.ts').Issue,
+    target: import('../domain/types.ts').RepoTarget,
+    subIssueId: string | null,
+    attempt: number | null,
+  ): void {
+    const poller = new ArchonRunPoller(
+      this.archon,
+      runId,
+      (event) => {
+        const session = this.state.running.get(key);
+
+        switch (event.type) {
+          case 'poller_heartbeat':
+            if (session) session.last_archon_timestamp = event.record.last_activity_at ?? new Date().toISOString();
+            break;
+
+          case 'poller_gate_paused':
+            // Only fire if the orchestrator hasn't already registered this gate from subprocess output.
+            if (!this.state.supervised_gates.has(key)) {
+              void this.handleGatePaused(issue, target, subIssueId, runId, event.gate_message, attempt);
+            }
+            break;
+
+          case 'poller_completed':
+            // Only act if the subprocess exit handler hasn't already cleaned up.
+            if (session) {
+              logger.info('Poller: run completed (subprocess may have missed it)', {
+                issue_id: issue.id, repo_alias: target.repo_alias, run_id: runId,
+              });
+              // The subprocess exit handler is authoritative for cleanup; poller is a safety net.
+            }
+            break;
+
+          case 'poller_failed':
+            logger.warn('Poller: run reached failed/cancelled status', {
+              issue_id: issue.id, repo_alias: target.repo_alias,
+              run_id: runId, status: event.status,
+            });
+            break;
+
+          case 'poller_stalled':
+            if (session) {
+              logger.warn('Poller: stall detected — cancelling worker', {
+                issue_id: issue.id, repo_alias: target.repo_alias, run_id: runId,
+              });
+              session.cancel?.();
+            }
+            break;
+
+          case 'poller_run_not_found':
+            logger.warn('Poller: run not found in Archon API', {
+              issue_id: issue.id, repo_alias: target.repo_alias, run_id: runId,
+            });
+            break;
+        }
+      },
+      {
+        pollIntervalMs: this.cfg.archon.poll_interval_ms,
+        stallTimeoutMs: this.cfg.archon.stall_timeout_ms,
+      },
+    );
+
+    const session = this.state.running.get(key);
+    if (session) session.stopPoller = () => poller.stop();
+
+    poller.start();
   }
 
   // ─── gate handling ───────────────────────────────────────────────────────
@@ -455,17 +703,40 @@ export class Orchestrator {
     const targetId = subIssueId ?? issue.id;
 
     try {
-      await this.tracker.applyLabel(targetId, this.cfg.tracker.symphony_labels.waiting_human);
+      await this.tracker.applyLabel(targetId, this.cfg.tracker.gaggle_labels.waiting_human);
     } catch (err) {
       logger.warn('Failed to apply waiting-human label', { error: (err as Error).message });
     }
 
+    // Try to fetch the actual plan from investigation.md in the Archon artifacts directory.
+    // The artifacts path is derived from the run's working_path by replacing the worktrees
+    // segment: <workspace>/worktrees/... → <workspace>/artifacts/runs/<run_id>/investigation.md
+    let planContent: string | null = null;
+    try {
+      const runDetail = await this.archon.getRunDetail(run_id);
+      const workingPath = runDetail?.run?.working_path;
+      if (workingPath) {
+        const parts = workingPath.replace(/\\/g, '/').split('/');
+        const wtIdx = parts.indexOf('worktrees');
+        if (wtIdx !== -1) {
+          const workspaceBase = parts.slice(0, wtIdx).join(sep);
+          const planPath = join(workspaceBase, 'artifacts', 'runs', run_id, 'investigation.md');
+          if (existsSync(planPath)) {
+            planContent = await Bun.file(planPath).text();
+          }
+        }
+      }
+    } catch {
+      // Non-fatal — fall back to gate_message below
+    }
+
+    const commentBody = planContent
+      ? `🤖 **GaggleDispatch — plan gate**\n\n${planContent}\n\n---\n\n_Reply with **approve** (optionally with notes) to start implementation, or **reject: \\<feedback\\>** to request a revised plan._`
+      : `🤖 **GaggleDispatch — supervised gate**\n\n${gate_message}\n\n_Reply with **approve** or **reject**, optionally followed by your message._`;
+
     let comment_id: string | null = null;
     try {
-      const c = await this.tracker.postComment(
-        targetId,
-        `🤖 **GaggleDispatch — supervised gate**\n\n${gate_message}\n\n_Reply with **approve** or **reject**, optionally followed by your message._`,
-      );
+      const c = await this.tracker.postComment(targetId, commentBody);
       comment_id = c.id;
     } catch (err) {
       logger.warn('Failed to post gate comment', { error: (err as Error).message });
@@ -486,6 +757,7 @@ export class Orchestrator {
       attempt,
     };
     this.state.supervised_gates.set(key, gate);
+    session?.stopPoller?.(); // poller keeps running in supervised_gates via poller_gate_paused
     this.state.running.delete(key); // ← slot freed
 
     if (this.cfg.tracker.gate_waiting_state) {
@@ -508,6 +780,57 @@ export class Orchestrator {
     void session; // touch to silence lint
   }
 
+  private async pollMergedPRs(): Promise<void> {
+    const prReadyState = this.cfg.tracker.pr_ready_state;
+    if (!prReadyState) return;
+
+    let issues: Issue[];
+    try {
+      issues = await this.tracker.fetchIssuesByStates([prReadyState]);
+    } catch (err) {
+      logger.debug('pollMergedPRs: failed to fetch issues', { error: (err as Error).message });
+      return;
+    }
+
+    const doneState = this.cfg.tracker.terminal_states[0] ?? 'Done';
+
+    for (const issue of issues) {
+      let prUrls: string[];
+      try {
+        prUrls = await this.tracker.fetchIssuePRLinks(issue.id);
+      } catch (err) {
+        logger.debug('pollMergedPRs: failed to fetch PR links', {
+          issue_id: issue.id, error: (err as Error).message,
+        });
+        continue;
+      }
+
+      if (prUrls.length === 0) continue;
+
+      let allMerged = true;
+      for (const url of prUrls) {
+        const merged = await checkGitHubPRMerged(url);
+        if (!merged) { allMerged = false; break; }
+      }
+
+      if (!allMerged) continue;
+
+      logger.info('All PRs merged — moving issue to Done', {
+        issue_id: issue.id,
+        issue_identifier: issue.identifier,
+        pr_count: prUrls.length,
+        state: doneState,
+      });
+      try {
+        await this.tracker.updateIssueState(issue.id, doneState);
+      } catch (err) {
+        logger.warn('pollMergedPRs: failed to update issue state', {
+          issue_id: issue.id, error: (err as Error).message,
+        });
+      }
+    }
+  }
+
   private async pollSupervisedGates(): Promise<void> {
     for (const [key, gate] of this.state.supervised_gates) {
       const targetId = gate.sub_issue_id ?? gate.issue_id;
@@ -515,12 +838,12 @@ export class Orchestrator {
       if (this.cfg.archon.gate_timeout_ms > 0 && Date.now() - gate.paused_at > this.cfg.archon.gate_timeout_ms) {
         await this.resolveGateStateTransition(targetId, gate);
         try {
-          await this.tracker.removeLabel(targetId, this.cfg.tracker.symphony_labels.waiting_human);
+          await this.tracker.removeLabel(targetId, this.cfg.tracker.gaggle_labels.waiting_human);
         } catch {
           /* ignore */
         }
         if (gate.run_id) {
-          await archonReject(this.cfg.archon.command, gate.run_id, 'Gate timeout — no human response');
+          await this.archon.rejectRun(gate.run_id, 'Gate timeout — no human response');
         }
         this.state.supervised_gates.delete(key);
         this.scheduleRetry(gate.issue, gate.repo_target, 1, 'gate_timeout');
@@ -537,48 +860,190 @@ export class Orchestrator {
       const reply = findHumanReplyAfter(comments, gate.paused_at);
       if (!reply) continue;
 
-      const intent = classifyApprovalIntent(reply.body);
-      if (intent === 'ambiguous') continue;
+      const thread = comments
+        .filter((c) => Date.parse(c.created_at) > gate.paused_at)
+        .map((c) => ({ author_name: isBotComment(c) ? null : c.author.name, body: c.body }));
+
+      const classification: GateClassification = await classifyGateReply(
+        gate.gate_message,
+        thread,
+        this.cfg.claude.gate_classifier_model,
+        this.cfg.claude.api_key,
+      );
+      const { intent, message: classifiedMessage } = classification;
+      if (intent === 'create_blocker') {
+        await this.handleCreateBlocker(key, gate, classification.blocker!);
+        continue;
+      }
+
+      if (intent === 'ambiguous') {
+        if (!hasBotCommentAfter(comments, Date.parse(reply.created_at))) {
+          try {
+            await this.tracker.postComment(
+              targetId,
+              `🤖 I wasn't sure how to interpret that reply. Please respond with **approve** (or your answer/instructions) to continue, or **reject** to cancel.`,
+            );
+          } catch (err) {
+            logger.warn('Failed to post ambiguous-reply clarification comment', { error: (err as Error).message });
+          }
+        }
+        continue;
+      }
 
       try {
-        await this.tracker.removeLabel(targetId, this.cfg.tracker.symphony_labels.waiting_human);
+        await this.tracker.removeLabel(targetId, this.cfg.tracker.gaggle_labels.waiting_human);
       } catch {
         /* ignore */
       }
       await this.resolveGateStateTransition(targetId, gate);
 
       if (intent === 'approve') {
-        if (gate.run_id) {
-          await archonApprove(this.cfg.archon.command, gate.run_id, reply.body);
-        }
-        // Re-establish running entry; the worker process is still alive and will resume.
+        // Use `archon workflow approve <run_id> <comment>` which (1) stores the
+        // approval with the comment as $<gate-id>.output and (2) auto-resumes the
+        // workflow. The raw HTTP approveRun API only stores the approval without
+        // resuming, losing the human comment for downstream nodes.
         this.state.supervised_gates.delete(key);
-        this.state.running.set(
-          key,
-          buildLiveSession({
-            issue: gate.issue,
-            repo_target: gate.repo_target,
-            attempt: gate.attempt,
-            sub_issue_id: gate.sub_issue_id,
-            cancel: () => {},
-          }),
-        );
+        const session = buildLiveSession({
+          issue: gate.issue,
+          repo_target: gate.repo_target,
+          attempt: gate.attempt,
+          sub_issue_id: gate.sub_issue_id,
+          cancel: () => {},
+        });
+        this.state.running.set(key, session);
         try {
-          await this.tracker.applyLabel(targetId, this.cfg.tracker.symphony_labels.running);
-        } catch {
-          /* ignore */
+          await this.tracker.applyLabel(targetId, this.cfg.tracker.gaggle_labels.running);
+        } catch { /* ignore */ }
+
+        if (gate.run_id) {
+          const resumeHandle = approveAndResumeArchon(
+            this.cfg.archon.command,
+            gate.run_id,
+            classifiedMessage || undefined,
+            this.cfg.archon.turn_timeout_ms,
+            (e) => {
+              const s = this.state.running.get(key);
+              switch (e.type) {
+                case 'archon_started':
+                  if (s) { s.archon_pid = e.pid; s.last_archon_timestamp = new Date().toISOString(); }
+                  break;
+                case 'archon_output':
+                  if (s) { s.last_archon_message = e.line; s.last_archon_timestamp = new Date().toISOString(); s.turn_count += 1; }
+                  break;
+                case 'archon_run_id':
+                  if (s) {
+                    s.archon_db_run_id = e.db_run_id;
+                    this.attachPoller(key, e.db_run_id, gate.issue, gate.repo_target, gate.sub_issue_id, gate.attempt);
+                  }
+                  writeRunEntry(this.cfg.registry.base_folder, key, {
+                    archon_run_id: e.db_run_id,
+                    parent_issue_id: gate.issue_id,
+                    sub_issue_id: gate.sub_issue_id,
+                    repo_alias: gate.repo_alias,
+                  });
+                  break;
+                case 'archon_gate_paused':
+                  void this.handleGatePaused(gate.issue, gate.repo_target, gate.sub_issue_id, e.run_id, e.gate_message, gate.attempt);
+                  break;
+                case 'archon_succeeded':
+                case 'archon_failed':
+                case 'archon_timed_out':
+                case 'archon_stalled':
+                case 'archon_cancelled':
+                  deleteRunEntry(this.cfg.registry.base_folder, key);
+                  void this.handleWorkerExit(gate.issue, gate.repo_target, { type: e.type, exit_code: 'exit_code' in e ? e.exit_code : undefined }, gate.attempt);
+                  break;
+              }
+            },
+          );
+          session.cancel = resumeHandle.cancel;
         }
-        logger.info('Gate approved — worker resuming', { issue_id: gate.issue_id, repo_alias: gate.repo_alias });
+        logger.info('Gate approved — approve+resume worker spawned', { issue_id: gate.issue_id, repo_alias: gate.repo_alias, run_id: gate.run_id });
       } else {
         // reject
         if (gate.run_id) {
-          await archonReject(this.cfg.archon.command, gate.run_id, reply.body);
+          await this.archon.rejectRun(gate.run_id, classifiedMessage);
         }
         this.state.supervised_gates.delete(key);
         this.scheduleRetry(gate.issue, gate.repo_target, 1, 'gate_rejected');
         logger.info('Gate rejected — retry scheduled', { issue_id: gate.issue_id, repo_alias: gate.repo_alias });
       }
     }
+  }
+
+  private async handleCreateBlocker(
+    key: string,
+    gate: SupervisedGateEntry,
+    blocker: { title: string; description: string },
+  ): Promise<void> {
+    const targetId = gate.sub_issue_id ?? gate.issue_id;
+    logger.info('CREATE_BLOCKER gate detected — creating blocker issue', {
+      issue_id: gate.issue_id,
+      blocker_title: blocker.title,
+    });
+
+    let newIssue: { id: string; identifier: string; url: string | null };
+    try {
+      const assigneeId = await this.tracker.resolveViewerId().catch(() => null);
+      newIssue = await this.tracker.createIssue({
+        title: blocker.title,
+        description: blocker.description || undefined,
+        priority: gate.issue.priority ?? undefined,
+        assignee_id: assigneeId,
+        state_name: this.cfg.tracker.active_states[0] ?? 'Todo',
+      });
+    } catch (err) {
+      logger.error('Failed to create blocker issue — leaving gate open', { error: (err as Error).message });
+      return;
+    }
+
+    // New issue BLOCKS the original (or its sub-issue if multi-repo).
+    const blockedId = gate.sub_issue_id ?? gate.issue_id;
+    try {
+      await this.tracker.createBlockerRelation(newIssue.id, blockedId);
+    } catch (err) {
+      logger.warn('Failed to create blocker relation', { error: (err as Error).message });
+    }
+
+    // Claim the blocked issue so it isn't re-dispatched while waiting.
+    try { await this.tracker.applyLabel(targetId, this.cfg.tracker.gaggle_labels.claimed); } catch { /* ignore */ }
+    try { await this.tracker.removeLabel(targetId, this.cfg.tracker.gaggle_labels.waiting_human); } catch { /* ignore */ }
+    try { await this.tracker.removeLabel(targetId, this.cfg.tracker.gaggle_labels.running); } catch { /* ignore */ }
+
+    // Restore issue state (move out of gate_waiting_state if it was applied).
+    await this.resolveGateStateTransition(targetId, gate);
+
+    // Terminate the Archon run.
+    if (gate.run_id) {
+      try {
+        await this.archon.rejectRun(
+          gate.run_id,
+          `Paused: blocker issue ${newIssue.identifier} created. Will restart when it resolves.`,
+        );
+      } catch (err) {
+        logger.warn('Failed to reject Archon run for blocker gate', { error: (err as Error).message });
+      }
+    }
+
+    // Post a comment on the original (parent) issue so humans know what happened.
+    const urlPart = newIssue.url ? ` — [${newIssue.identifier}](${newIssue.url})` : ` — ${newIssue.identifier}`;
+    try {
+      await this.tracker.postComment(
+        gate.issue_id,
+        `🔗 **Blocker created**${urlPart}: ${blocker.title}\n\n` +
+          `Implementation is paused until this issue is resolved. ` +
+          `GaggleDispatch will restart automatically once the blocker reaches a satisfied state.`,
+      );
+    } catch (err) {
+      logger.warn('Failed to post blocker comment', { error: (err as Error).message });
+    }
+
+    this.state.supervised_gates.delete(key);
+    logger.info('Blocker created — implementation paused', {
+      issue_id: gate.issue_id,
+      blocker_id: newIssue.id,
+      blocker_identifier: newIssue.identifier,
+    });
   }
 
   private async resolveGateStateTransition(targetId: string, gate: SupervisedGateEntry): Promise<void> {
@@ -604,17 +1069,57 @@ export class Orchestrator {
     const subIssueId = session?.sub_issue_id ?? this.state.sibling_subissues.get(issue.id)?.get(target.repo_alias) ?? null;
     const targetId = subIssueId ?? issue.id;
 
-    this.state.running.delete(key);
-
     if (event.type === 'archon_succeeded') {
+      // The Archon CLI exits 0 when a workflow pauses at an approval gate, not just when it
+      // truly completes. Check the actual run status before treating as done.
+      const dbRunId = session?.archon_db_run_id ?? null;
+
+      // If we never captured a workflowRunId, the process exited without running a workflow
+      // (e.g. approve command stored approval but resume failed, or process crashed before
+      // workflow_starting log line). Treat as abnormal exit so the issue is retried, not completed.
+      if (!dbRunId) {
+        session?.stopPoller?.();
+        this.state.running.delete(key);
+        try {
+          await this.tracker.removeLabel(targetId, this.cfg.tracker.gaggle_labels.running);
+        } catch { /* ignore */ }
+        const nextAttempt = (attempt ?? 0) + 1;
+        this.scheduleRetry(issue, target, nextAttempt, 'archon_succeeded_without_run_id');
+        logger.warn('Worker exited 0 but never emitted workflowRunId — treating as failure', {
+          issue_id: issue.id, repo_alias: target.repo_alias,
+        });
+        await this.maybeReleaseClaim(issue.id);
+        return;
+      }
+
+      try {
+        const runDetail = await this.archon.getRunDetail(dbRunId);
+        const run = runDetail?.run;
+        if (run?.status === 'paused') {
+          logger.info('Worker exit was gate pause — treating as supervised gate', {
+            issue_id: issue.id, repo_alias: target.repo_alias, archon_run_id: dbRunId,
+          });
+          session?.stopPoller?.();
+          this.state.running.delete(key);
+          const approval = run.metadata?.approval;
+          const gateMessage = approval?.message ?? 'Plan gate — awaiting approval';
+          void this.handleGatePaused(issue, target, subIssueId, dbRunId, gateMessage, attempt);
+          return;
+        }
+      } catch {
+        // Can't verify — fall through to success handling
+      }
+
+      session?.stopPoller?.();
+      this.state.running.delete(key);
       this.state.completed.add(key);
       try {
-        await this.tracker.removeLabel(targetId, this.cfg.tracker.symphony_labels.running);
+        await this.tracker.removeLabel(targetId, this.cfg.tracker.gaggle_labels.running);
       } catch {
         /* ignore */
       }
       try {
-        await this.tracker.updateIssueState(targetId, this.cfg.tracker.terminal_states[0] ?? 'Done');
+        await this.tracker.updateIssueState(targetId, completedState(this.cfg));
       } catch {
         /* ignore */
       }
@@ -626,8 +1131,10 @@ export class Orchestrator {
         repo_alias: target.repo_alias,
       });
     } else {
+      session?.stopPoller?.();
+      this.state.running.delete(key);
       try {
-        await this.tracker.removeLabel(targetId, this.cfg.tracker.symphony_labels.running);
+        await this.tracker.removeLabel(targetId, this.cfg.tracker.gaggle_labels.running);
       } catch {
         /* ignore */
       }
@@ -641,7 +1148,61 @@ export class Orchestrator {
       });
     }
 
+    // Fast-path promotion: immediately dispatch any sibling sub-issues whose blockers are now satisfied.
+    if (event.type === 'archon_succeeded') {
+      await this.promoteQueuedSiblings(issue);
+    }
+
     await this.maybeReleaseClaim(issue.id);
+  }
+
+  /** Promote sibling sub-issues from gaggle:queued → gaggle:running and launch Archon. */
+  private async promoteQueuedSiblings(parentIssue: Issue): Promise<void> {
+    const sibMap = this.state.sibling_subissues.get(parentIssue.id);
+    if (!sibMap || sibMap.size === 0) return;
+
+    const subIds = [...sibMap.values()];
+    let freshSubs: import('../domain/types.ts').Issue[];
+    try {
+      freshSubs = await this.tracker.fetchIssueStatesByIds(subIds);
+    } catch (err) {
+      logger.warn('promoteQueuedSiblings: failed to fetch sibling states', { error: (err as Error).message });
+      return;
+    }
+
+    const queuedLabel = this.cfg.tracker.gaggle_labels.queued.toLowerCase();
+    for (const sub of freshSubs) {
+      if (!sub.labels.some((l) => l === queuedLabel)) continue;
+      if (!this.cfg.tracker.active_states.includes(sub.state)) continue;
+      if (!blockersSatisfied(sub.blocked_by, this.cfg)) continue;
+
+      const alias = this.parseAliasFromTitle(sub.title);
+      if (!alias) continue;
+      const key = workerKey(parentIssue.id, alias);
+      if (this.state.running.has(key) || this.state.completed.has(key)) continue;
+
+      if (availableSlots(this.state) === 0) {
+        logger.info('No slots to promote queued sibling; will retry next tick', {
+          parent_id: parentIssue.id, repo_alias: alias,
+        });
+        continue;
+      }
+
+      const target = this.buildRepoTargetFromSubIssue(sub);
+      if (!target) continue;
+
+      // Remove queued label before launching.
+      try { await this.tracker.removeLabel(sub.id, this.cfg.tracker.gaggle_labels.queued); } catch { /* non-fatal */ }
+
+      // Remove from pending_targets so maybeReleaseClaim stays accurate.
+      const pending = this.state.pending_targets.get(parentIssue.id) ?? [];
+      const remaining = pending.filter((t) => t.repo_alias !== alias);
+      if (remaining.length === 0) this.state.pending_targets.delete(parentIssue.id);
+      else this.state.pending_targets.set(parentIssue.id, remaining);
+
+      logger.info('Promoting queued sibling', { parent_id: parentIssue.id, repo_alias: alias, sub_issue_id: sub.id });
+      await this.launchWorker(parentIssue, target, sub.id, null, sub.description ?? undefined);
+    }
   }
 
   private async maybeReleaseClaim(issue_id: string): Promise<void> {
@@ -654,11 +1215,25 @@ export class Orchestrator {
       this.state.claimed.delete(issue_id);
       this.state.pending_issues.delete(issue_id);
       try {
-        await this.tracker.removeLabel(issue_id, this.cfg.tracker.symphony_labels.claimed);
+        await this.tracker.removeLabel(issue_id, this.cfg.tracker.gaggle_labels.claimed);
       } catch {
         /* ignore */
       }
-      logger.info('Issue claim released', { issue_id });
+      // Transition the parent issue out of active_states so it is not re-dispatched.
+      const terminalState = completedState(this.cfg);
+      try {
+        await this.tracker.updateIssueState(issue_id, terminalState);
+        logger.info('Issue claim released — parent transitioned to terminal state', {
+          issue_id,
+          state: terminalState,
+        });
+      } catch (err) {
+        logger.warn('Issue claim released but could not transition parent to terminal state', {
+          issue_id,
+          state: terminalState,
+          error: (err as Error).message,
+        });
+      }
     }
   }
 
@@ -724,18 +1299,32 @@ export class Orchestrator {
   private async executeRetry(key: string, issue: Issue, target: RepoTarget, attempt: number): Promise<void> {
     this.state.retry_attempts.delete(key);
 
+    // If Archon already succeeded for this (issue, repo) pair, the sub-issue was marked Done.
+    // Do not re-dispatch — release the claim and stop.
+    if (this.state.completed.has(key)) {
+      logger.info('Worker already completed successfully; skipping retry', {
+        issue_id: issue.id,
+        repo_alias: target.repo_alias,
+      });
+      await this.maybeReleaseClaim(issue.id);
+      return;
+    }
+
     // Re-validate state from tracker; if no longer dispatchable, release.
+    // Check both the parent issue AND the sub-issue (if one was created).
     let refreshed: Issue | undefined;
     try {
-      const fresh = await this.tracker.fetchIssueStatesByIds([issue.id]);
+      const subIssueId = this.state.sibling_subissues.get(issue.id)?.get(target.repo_alias);
+      const idToCheck = subIssueId ?? issue.id;
+      const fresh = await this.tracker.fetchIssueStatesByIds([idToCheck]);
       refreshed = fresh[0];
     } catch {
       /* keep stale */
     }
     const current = refreshed ?? issue;
 
-    if (this.cfg.tracker.terminal_states.includes(current.state)) {
-      logger.info('Issue terminal at retry time; releasing', { issue_id: issue.id });
+    if (!this.cfg.tracker.active_states.includes(current.state)) {
+      logger.info('Issue no longer active at retry time; releasing', { issue_id: issue.id, state: current.state });
       await this.maybeReleaseClaim(issue.id);
       return;
     }
@@ -747,7 +1336,10 @@ export class Orchestrator {
 
     const analysis = this.state.analysis_cache.get(issue.id)?.analysis;
     if (!analysis) {
-      logger.warn('No cached analysis at retry; will be re-analyzed on next tick', { issue_id: issue.id });
+      logger.warn('No cached analysis at retry; rescheduling after re-analysis delay', { issue_id: issue.id });
+      // Re-queue with the same attempt number so the retry fires after a short delay,
+      // by which point the next tick will have had a chance to re-analyze the issue.
+      this.scheduleRetry(current, target, attempt, 'no_cached_analysis', 5_000);
       return;
     }
 
@@ -755,7 +1347,7 @@ export class Orchestrator {
     const targetId = subIssueId ?? issue.id;
 
     try {
-      await this.tracker.applyLabel(targetId, this.cfg.tracker.symphony_labels.running);
+      await this.tracker.applyLabel(targetId, this.cfg.tracker.gaggle_labels.running);
     } catch {
       /* ignore */
     }
@@ -793,6 +1385,19 @@ export class Orchestrator {
               s.last_archon_timestamp = new Date().toISOString();
             }
           },
+          onRunId: (db_run_id) => {
+            const s = this.state.running.get(key);
+            if (s) {
+              s.archon_db_run_id = db_run_id;
+              this.attachPoller(key, db_run_id, current, target, subIssueId, attempt);
+            }
+            writeRunEntry(this.cfg.registry.base_folder, key, {
+              archon_run_id: db_run_id,
+              parent_issue_id: current.id,
+              sub_issue_id: subIssueId,
+              repo_alias: target.repo_alias,
+            });
+          },
           onGatePaused: (run_id, gate_message) => {
             void this.handleGatePaused(current, target, subIssueId, run_id, gate_message, attempt);
           },
@@ -811,67 +1416,115 @@ export class Orchestrator {
 
   // ─── reconciliation ──────────────────────────────────────────────────────
   private async reconcileRunningIssues(): Promise<void> {
-    // Stall detection
-    const now = Date.now();
-    for (const [key, session] of this.state.running) {
-      const ts = session.last_archon_timestamp ? Date.parse(session.last_archon_timestamp) : Date.parse(session.started_at);
-      if (this.cfg.archon.stall_timeout_ms > 0 && now - ts > this.cfg.archon.stall_timeout_ms) {
-        logger.warn('Stall detected — terminating worker', {
-          issue_id: session.issue.id,
-          repo_alias: session.repo_alias,
-        });
-        try {
-          session.cancel?.();
-        } catch {
-          /* ignore */
-        }
-        // The worker exit handler will fire on cancel and schedule retry.
-      }
-    }
+    // Stall detection is handled per-session by ArchonRunPoller.
+    // reconcileRunningIssues only reconciles Linear state and detached runs.
 
     const ids = new Set<string>();
     for (const key of this.state.running.keys()) {
       const sep = key.indexOf('__');
       if (sep > 0) ids.add(key.slice(0, sep));
     }
-    if (ids.size === 0) return;
 
-    let refreshed: Issue[];
-    try {
-      refreshed = await this.tracker.fetchIssueStatesByIds([...ids]);
-    } catch (err) {
-      logger.debug('Reconciliation fetch failed; keep workers', { error: (err as Error).message });
-      return;
+    if (ids.size > 0) {
+      let refreshed: Issue[];
+      try {
+        refreshed = await this.tracker.fetchIssueStatesByIds([...ids]);
+      } catch (err) {
+        logger.debug('Reconciliation fetch failed; keep workers', { error: (err as Error).message });
+        refreshed = [];
+      }
+
+      for (const issue of refreshed) {
+        if (this.cfg.tracker.terminal_states.includes(issue.state)) {
+          for (const [key, session] of this.state.running) {
+            if (session.issue.id !== issue.id) continue;
+            try {
+              session.cancel?.();
+            } catch {
+              /* ignore */
+            }
+            this.state.running.delete(key);
+          }
+          this.workspace.cleanAuxiliaryWorkspace(issue.identifier);
+          this.state.analysis_cache.delete(issue.id);
+          await this.maybeReleaseClaim(issue.id);
+        } else if (this.cfg.tracker.active_states.includes(issue.state)) {
+          for (const [, session] of this.state.running) {
+            if (session.issue.id === issue.id) session.issue = issue;
+          }
+        } else {
+          // Neither active nor terminal — stop without cleanup
+          for (const [key, session] of this.state.running) {
+            if (session.issue.id !== issue.id) continue;
+            try {
+              session.cancel?.();
+            } catch {
+              /* ignore */
+            }
+            this.state.running.delete(key);
+          }
+        }
+      }
     }
 
-    for (const issue of refreshed) {
-      if (this.cfg.tracker.terminal_states.includes(issue.state)) {
-        for (const [key, session] of this.state.running) {
-          if (session.issue.id !== issue.id) continue;
-          try {
-            session.cancel?.();
-          } catch {
-            /* ignore */
-          }
-          this.state.running.delete(key);
-        }
-        this.workspace.cleanAuxiliaryWorkspace(issue.identifier);
-        this.state.analysis_cache.delete(issue.id);
-        await this.maybeReleaseClaim(issue.id);
-      } else if (this.cfg.tracker.active_states.includes(issue.state)) {
-        for (const [, session] of this.state.running) {
-          if (session.issue.id === issue.id) session.issue = issue;
-        }
-      } else {
-        // Neither active nor terminal — stop without cleanup
-        for (const [key, session] of this.state.running) {
-          if (session.issue.id !== issue.id) continue;
-          try {
-            session.cancel?.();
-          } catch {
-            /* ignore */
-          }
-          this.state.running.delete(key);
+    // Poll detached Archon runs (processes found still running at startup that we
+    // cannot re-attach to). Check if they have since completed, failed, or paused.
+    // NOTE: this block must run even when state.running is empty (the typical post-crash case).
+    if (this.state.detached_archon_runs.size > 0) {
+      const freshRuns = await this.archon.listRuns();
+      const freshById = new Map<string, ArchonRunRecord>(freshRuns.map((r) => [r.id, r]));
+
+      for (const [key, det] of [...this.state.detached_archon_runs]) {
+        const run = freshById.get(det.archon_run_id);
+        const status = run?.status ?? 'not_found';
+
+        if (status === 'running') continue; // still going
+
+        this.state.detached_archon_runs.delete(key);
+        this.state.running.delete(key); // free the slot
+
+        const targetId = det.sub_issue_id ?? det.parent_issue.id;
+
+        if (status === 'completed') {
+          try { await this.tracker.removeLabel(targetId, this.cfg.tracker.gaggle_labels.running); } catch { /* ignore */ }
+          try { await this.tracker.updateIssueState(targetId, completedState(this.cfg)); } catch { /* ignore */ }
+          this.state.completed.add(key);
+          logger.info('Detached Archon run completed — marked Done', {
+            archon_run_id: det.archon_run_id,
+            repo_alias: det.repo_alias,
+          });
+          await this.promoteQueuedSiblings(det.parent_issue);
+          await this.maybeReleaseClaim(det.parent_issue.id);
+        } else if (status === 'paused') {
+          this.state.supervised_gates.set(key, {
+            run_id: run?.id ?? null,
+            issue_id: det.parent_issue.id,
+            issue: det.parent_issue,
+            repo_alias: det.repo_alias,
+            repo_target: det.repo_target,
+            sub_issue_id: det.sub_issue_id,
+            paused_at: Date.now(),
+            gate_message: run?.metadata?.approval?.message ?? '(detached gate)',
+            comment_id: null,
+            gate_state_applied: false,
+            attempt: null,
+          });
+          try { await this.tracker.removeLabel(targetId, this.cfg.tracker.gaggle_labels.running); } catch { /* ignore */ }
+          try { await this.tracker.applyLabel(targetId, this.cfg.tracker.gaggle_labels.waiting_human); } catch { /* ignore */ }
+          logger.info('Detached Archon run moved to gate — restored supervised gate', {
+            archon_run_id: det.archon_run_id,
+            repo_alias: det.repo_alias,
+          });
+        } else {
+          // failed or not_found — re-queue
+          try { await this.tracker.removeLabel(targetId, this.cfg.tracker.gaggle_labels.running); } catch { /* ignore */ }
+          try { await this.tracker.applyLabel(targetId, this.cfg.tracker.gaggle_labels.queued); } catch { /* ignore */ }
+          this.scheduleRetry(det.parent_issue, det.repo_target, 1, `detached_archon_${status}`);
+          logger.warn('Detached Archon run failed or not found — re-queued', {
+            archon_run_id: det.archon_run_id,
+            repo_alias: det.repo_alias,
+            status,
+          });
         }
       }
     }
@@ -931,54 +1584,262 @@ export class Orchestrator {
   // ─── label-driven recovery (Section 12.4) ────────────────────────────────
   private async recoverFromLinearLabels(): Promise<void> {
     try {
-      const claimed = await this.tracker.fetchIssuesByLabel(this.cfg.tracker.symphony_labels.claimed);
+      const claimed = await this.tracker.fetchIssuesByLabel(this.cfg.tracker.gaggle_labels.claimed);
       for (const issue of claimed) {
         // Only mark as claimed if it's a parent (no parent_id)
         if (!issue.parent_id) this.state.claimed.add(issue.id);
       }
 
-      const running = await this.tracker.fetchIssuesByLabel(this.cfg.tracker.symphony_labels.running);
+      // Load the persisted workerKey→runId map written by launchWorker.
+      const persistedRunIds = allRunEntries(this.cfg.registry.base_folder);
+      // Query Archon's DB once so we can classify each running sub-issue accurately.
+      const archonRuns = await this.archon.listRuns();
+      const archonRunsById = new Map<string, ArchonRunRecord>(archonRuns.map((r) => [r.id, r]));
+      logger.info('Archon status snapshot at startup', {
+        total_runs: archonRuns.length,
+        persisted_run_ids: Object.keys(persistedRunIds).length,
+      });
+
+      const running = await this.tracker.fetchIssuesByLabel(this.cfg.tracker.gaggle_labels.running);
       for (const issue of running) {
-        // We don't have the actual Archon process; treat as crashed → retry.
-        // We only have enough info if this is a sub-issue (parent_id + title prefix).
-        const m = issue.title.match(/^\[([^\]]+)\]/);
-        const aliasGuess = m ? m[1]! : null;
+        // Issues no longer active (terminal or gray-zone) finished/paused while we were down — clean the stale label.
+        if (!this.cfg.tracker.active_states.includes(issue.state ?? '')) {
+          try {
+            await this.tracker.removeLabel(issue.id, this.cfg.tracker.gaggle_labels.running);
+          } catch { /* ignore */ }
+          continue;
+        }
+
         const parentId = issue.parent_id ?? issue.id;
+
+        // Try to get alias from title "[alias] ..." first.
+        // For direct-dispatch (parent issue, no sub-issue), title has no prefix — fall back
+        // to the persisted run registry which always stores repo_alias explicitly.
+        let aliasGuess = this.parseAliasFromTitle(issue.title);
+        if (!aliasGuess) {
+          const fallback = Object.entries(persistedRunIds).find(
+            ([, e]) => e.parent_issue_id === parentId && (e.sub_issue_id === null || e.sub_issue_id === issue.id),
+          );
+          if (fallback) aliasGuess = fallback[1].repo_alias ?? null;
+        }
+
+        // Register in sibling map so other recovery steps can reference this sub-issue.
         if (aliasGuess) {
           let map = this.state.sibling_subissues.get(parentId);
-          if (!map) {
-            map = new Map();
-            this.state.sibling_subissues.set(parentId, map);
-          }
+          if (!map) { map = new Map(); this.state.sibling_subissues.set(parentId, map); }
           map.set(aliasGuess, issue.id);
         }
-        try {
-          await this.tracker.removeLabel(issue.id, this.cfg.tracker.symphony_labels.running);
-        } catch {
-          /* ignore */
+
+        // Look up the exact Archon run via the persisted run id.
+        // Fall back to heuristic repo-basename matching if no persisted entry exists
+        // (e.g. run id was not yet written before the crash).
+        const key = workerKey(parentId, aliasGuess ?? '');
+        const persistedEntry = persistedRunIds[key];
+        let archonRun: ArchonRunRecord | null = persistedEntry
+          ? (archonRunsById.get(persistedEntry.archon_run_id) ?? null)
+          : null;
+
+        if (!archonRun && aliasGuess) {
+          // Fallback: heuristic match by repo basename + recent status.
+          const repoBasename =
+            this.registry.getContext().repositories.find((r) => r.name === aliasGuess)?.local_path
+              .split(/[\\/]/).pop() ?? aliasGuess;
+          archonRun = findArchonRunForRepo(archonRuns, repoBasename, ['running', 'paused', 'completed']);
         }
-        try {
-          await this.tracker.applyLabel(issue.id, this.cfg.tracker.symphony_labels.queued);
-        } catch {
-          /* ignore */
+
+        const stillRunning = archonRun?.status === 'running' ? archonRun : null;
+        const stillPaused = archonRun?.status === 'paused' ? archonRun : null;
+        const justCompleted = archonRun?.status === 'completed' ? archonRun : null;
+
+        if (stillRunning && aliasGuess) {
+          // Archon is still alive. Track as detached; reconciler will poll for completion.
+          const key = workerKey(parentId, aliasGuess);
+          const repoMeta = this.registry.getContext().repositories.find((r) => r.name === aliasGuess);
+          const target: import('../domain/types.ts').RepoTarget = {
+            repo_url: repoMeta?.url ?? '',
+            repo_alias: aliasGuess,
+            local_path: repoMeta?.local_path ?? '',
+            archon_workflow: repoMeta?.default_workflow ?? this.cfg.archon.default_workflow,
+            rationale: issue.description ?? issue.title,
+            components: [],
+          };
+          const parentIssue = this.state.pending_issues.get(parentId) ?? issue;
+          this.state.detached_archon_runs.set(key, {
+            archon_run_id: stillRunning.id,
+            parent_issue: parentIssue as import('../domain/types.ts').Issue,
+            sub_issue_id: issue.parent_id ? issue.id : null,
+            repo_alias: aliasGuess,
+            repo_target: target,
+            recovered_at: Date.now(),
+          });
+          // Count the slot as occupied so we don't over-dispatch.
+          const placeholder = buildLiveSession({
+            issue: parentIssue as import('../domain/types.ts').Issue,
+            repo_target: target,
+            attempt: null,
+            sub_issue_id: issue.parent_id ? issue.id : null,
+            cancel: () => {},
+          });
+          this.state.running.set(key, placeholder);
+          logger.info('Recovered: Archon still running — tracking as detached', {
+            issue_identifier: issue.identifier,
+            repo_alias: aliasGuess,
+            archon_run_id: stillRunning.id,
+          });
+          continue;
         }
-        logger.info('Recovered crashed worker — re-queued for next tick', {
+
+        if (stillPaused && aliasGuess) {
+          // Archon is at a gate — restore as a supervised gate entry.
+          const key = workerKey(parentId, aliasGuess);
+          const repoMeta = this.registry.getContext().repositories.find((r) => r.name === aliasGuess);
+          const target: import('../domain/types.ts').RepoTarget = {
+            repo_url: repoMeta?.url ?? '',
+            repo_alias: aliasGuess,
+            local_path: repoMeta?.local_path ?? '',
+            archon_workflow: repoMeta?.default_workflow ?? this.cfg.archon.default_workflow,
+            rationale: issue.description ?? issue.title,
+            components: [],
+          };
+          const parentIssue = this.state.pending_issues.get(parentId) ?? issue;
+          this.state.supervised_gates.set(key, {
+            run_id: stillPaused.id,
+            issue_id: parentId,
+            issue: parentIssue as import('../domain/types.ts').Issue,
+            repo_alias: aliasGuess,
+            repo_target: target,
+            sub_issue_id: issue.parent_id ? issue.id : null,
+            paused_at: Date.now(),
+            gate_message: stillPaused.metadata?.approval?.message ?? '(recovered gate)',
+            comment_id: null,
+            gate_state_applied: false,
+            attempt: null,
+          });
+          // Swap running → waiting-human so the label is accurate.
+          try { await this.tracker.removeLabel(issue.id, this.cfg.tracker.gaggle_labels.running); } catch { /* ignore */ }
+          try { await this.tracker.applyLabel(issue.id, this.cfg.tracker.gaggle_labels.waiting_human); } catch { /* ignore */ }
+          logger.info('Recovered: Archon paused at gate — restored supervised gate', {
+            issue_identifier: issue.identifier,
+            repo_alias: aliasGuess,
+            archon_run_id: stillPaused.id,
+          });
+          continue;
+        }
+
+        if (justCompleted && aliasGuess) {
+          // Archon finished successfully while we were down. Mark sub-issue Done.
+          try { await this.tracker.removeLabel(issue.id, this.cfg.tracker.gaggle_labels.running); } catch { /* ignore */ }
+          try { await this.tracker.updateIssueState(issue.id, completedState(this.cfg)); } catch { /* ignore */ }
+          this.state.completed.add(workerKey(parentId, aliasGuess));
+          logger.info('Recovered: Archon completed while down — marked Done', {
+            issue_identifier: issue.identifier,
+            repo_alias: aliasGuess,
+            archon_run_id: justCompleted.id,
+          });
+          continue;
+        }
+
+        // Default: Archon crashed or run not found — re-queue for retry on next tick.
+        try { await this.tracker.removeLabel(issue.id, this.cfg.tracker.gaggle_labels.running); } catch { /* ignore */ }
+        try { await this.tracker.applyLabel(issue.id, this.cfg.tracker.gaggle_labels.queued); } catch { /* ignore */ }
+        logger.info('Recovered: Archon not found or crashed — re-queued', {
           issue_identifier: issue.identifier,
           repo_alias: aliasGuess ?? '(unknown)',
         });
       }
 
-      const waiting = await this.tracker.fetchIssuesByLabel(this.cfg.tracker.symphony_labels.waiting_human);
+      // Recover sub-issues that were queued but not yet dispatched.
+      const queued = await this.tracker.fetchIssuesByLabel(this.cfg.tracker.gaggle_labels.queued);
+      const parentIdsToPromote = new Set<string>();
+      for (const issue of queued) {
+        if (!issue.parent_id) continue; // only sub-issues carry gaggle:queued
+        if (!this.cfg.tracker.active_states.includes(issue.state ?? '')) continue;
+        const aliasGuess = this.parseAliasFromTitle(issue.title);
+        if (!aliasGuess) continue;
+        const parentId = issue.parent_id;
+        let map = this.state.sibling_subissues.get(parentId);
+        if (!map) { map = new Map(); this.state.sibling_subissues.set(parentId, map); }
+        map.set(aliasGuess, issue.id);
+        parentIdsToPromote.add(parentId);
+        logger.info('Recovered queued sub-issue', {
+          issue_identifier: issue.identifier, parent_id: parentId, repo_alias: aliasGuess,
+        });
+      }
+
+      // Promote any queued siblings whose blockers are already satisfied (e.g. BE merged while orchestrator was down).
+      for (const parentId of parentIdsToPromote) {
+        let parentIssue = this.state.pending_issues.get(parentId);
+        if (!parentIssue) {
+          try {
+            const fetched = await this.tracker.fetchIssueStatesByIds([parentId]);
+            parentIssue = fetched[0];
+          } catch { /* ignore */ }
+        }
+        if (parentIssue) {
+          this.state.pending_issues.set(parentId, parentIssue);
+          await this.promoteQueuedSiblings(parentIssue);
+        }
+      }
+
+      // Orphaned claimed parents: check whether all recovered siblings (if any) have already
+      // completed.  Three cases:
+      //   (a) Running sub whose Archon run completed → sibling_subissues IS populated but every
+      //       entry is in state.completed.  Work is done → release to terminal.
+      //   (b) No running/queued siblings at all but a persisted run entry shows Archon completed
+      //       (crash after handleWorkerExit removed the running label but before
+      //       maybeReleaseClaim) → release to terminal.
+      //   (c) No siblings and no completed run → crash before the first worker was ever launched
+      //       → un-claim only so the poll loop re-dispatches on the next tick.
+      for (const parentId of [...this.state.claimed]) {
+        const sibMap = this.state.sibling_subissues.get(parentId);
+        // Skip parents that still have active siblings (running, queued, or awaiting gate).
+        const allSibsCompleted =
+          !sibMap || sibMap.size === 0 ||
+          [...sibMap.keys()].every((alias) => this.state.completed.has(workerKey(parentId, alias)));
+        if (!allSibsCompleted) continue;
+
+        // Determine whether actual work ran for this parent.
+        const workDone =
+          (sibMap && sibMap.size > 0) || // at least one sibling completed during recovery
+          Object.values(persistedRunIds).some(
+            (e) => e.parent_issue_id === parentId && archonRunsById.get(e.archon_run_id)?.status === 'completed',
+          );
+
+        if (workDone) {
+          logger.info('Orphaned claimed parent detected on startup (work completed) — releasing', { parent_id: parentId });
+          await this.maybeReleaseClaim(parentId);
+        } else {
+          logger.info('Orphaned claimed parent detected on startup (no work started) — un-claiming for re-dispatch', { parent_id: parentId });
+          this.state.claimed.delete(parentId);
+          this.state.pending_issues.delete(parentId);
+          try { await this.tracker.removeLabel(parentId, this.cfg.tracker.gaggle_labels.claimed); } catch { /* ignore */ }
+        }
+      }
+
+      const waiting = await this.tracker.fetchIssuesByLabel(this.cfg.tracker.gaggle_labels.waiting_human);
+      // Build lookups from issue_id → repo_alias and issue_id → archon_run_id using persisted
+      // run entries, so parent issues (no [alias] title prefix) can have their gates fully
+      // recovered after a restart — including the run_id needed to approve/reject in Archon.
+      const persistedRuns = allRunEntries(this.cfg.registry.base_folder);
+      const runAliasById = new Map<string, string>();
+      const runIdById = new Map<string, string>();
+      for (const entry of Object.values(persistedRuns)) {
+        runAliasById.set(entry.parent_issue_id, entry.repo_alias);
+        runIdById.set(entry.parent_issue_id, entry.archon_run_id);
+      }
+
       for (const issue of waiting) {
         const m = issue.title.match(/^\[([^\]]+)\]/);
-        const aliasGuess = m ? m[1]! : null;
         const parentId = issue.parent_id ?? issue.id;
+        // Prefer title-derived alias (sub-issues), fall back to persisted run entry (parent issues).
+        const aliasGuess = m ? m[1]! : (runAliasById.get(parentId) ?? null);
         if (!aliasGuess) continue;
-        // Reconstruct a partial supervised_gates entry; Archon process is gone but
-        // when human replies we can at least clean up the labels + state.
+        // Reconstruct the supervised_gates entry, restoring the Archon run_id so that
+        // approve/reject can be forwarded even after the hub was restarted.
+        const recoveredRunId = runIdById.get(parentId) ?? null;
         const key = workerKey(parentId, aliasGuess);
         this.state.supervised_gates.set(key, {
-          run_id: null,
+          run_id: recoveredRunId,
           issue_id: parentId,
           issue: { ...issue, id: parentId },
           repo_alias: aliasGuess,
@@ -1008,15 +1869,50 @@ export class Orchestrator {
 }
 
 // ─── helpers ────────────────────────────────────────────────────────────────
+/** Returns true if the GitHub PR at prUrl is in MERGED state, false on any error or non-merged state. */
+export async function checkGitHubPRMerged(prUrl: string): Promise<boolean> {
+  try {
+    const proc = Bun.spawn(
+      ['gh', 'pr', 'view', prUrl, '--json', 'state', '-q', '.state'],
+      { stdout: 'pipe', stderr: 'ignore' },
+    );
+    const [, text] = await Promise.all([proc.exited, new Response(proc.stdout).text()]);
+    return text.trim() === 'MERGED';
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Returns true if a comment was authored by the orchestrator.
+ * Checks both author name (for dedicated bot accounts) and body prefix (for personal API keys
+ * where all comments share the same author name regardless of origin).
+ */
+export function isBotComment(c: { body: string; author: { name: string | null } }): boolean {
+  if (c.author.name !== null && /symphony|gaggle|bot/i.test(c.author.name)) return true;
+  return c.body.trimStart().startsWith('🤖');
+}
+
 export function findHumanReplyAfter(
   comments: { id: string; body: string; author: { id: string | null; name: string | null }; created_at: string }[],
   pausedAt: number,
-): { body: string } | null {
+): { id: string; body: string; created_at: string } | null {
   const filtered = comments
     .filter((c) => Date.parse(c.created_at) > pausedAt)
-    .filter((c) => c.author.name !== null && !/symphony|gaggle|bot/i.test(c.author.name ?? ''));
+    .filter((c) => c.author.name !== null && !isBotComment(c));
   if (filtered.length === 0) return null;
-  return { body: filtered[filtered.length - 1]!.body };
+  const last = filtered[filtered.length - 1]!;
+  return { id: last.id, body: last.body, created_at: last.created_at };
+}
+
+/** Returns true if there is a bot/orchestrator comment posted strictly after afterMs. */
+export function hasBotCommentAfter(
+  comments: { body: string; author: { name: string | null }; created_at: string }[],
+  afterMs: number,
+): boolean {
+  return comments.some(
+    (c) => Date.parse(c.created_at) > afterMs && isBotComment(c),
+  );
 }
 
 export function classifyApprovalIntent(body: string): 'approve' | 'reject' | 'ambiguous' {
