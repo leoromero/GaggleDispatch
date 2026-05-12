@@ -1273,7 +1273,40 @@ export class Orchestrator {
       });
     }
 
+    // Phase 5c.2: if the transition reached a target-terminal state, fan
+    // the target_terminal event up to the parent SM so it can transition
+    // claimed → done | cancelled when all targets finish. maybeReleaseClaim
+    // remains as the legacy path for the parallel state.claimed bookkeeping.
+    if (transition.to === 'succeeded' || transition.to === 'failed') {
+      const currentParent = this.state.parent_machine_states.get(issue.id) ?? 'unclaimed';
+      if (currentParent === 'claimed') {
+        await this.emitParentEvent('claimed', {
+          kind: 'target_terminal',
+          alias: target.repo_alias,
+          outcome: transition.to,
+        }, {
+          cfg: this.cfg,
+          parent_issue: issue,
+          targets: this.buildParentTargetsMap(issue.id),
+        });
+      }
+    }
+
     await this.maybeReleaseClaim(issue.id);
+  }
+
+  /** Build a snapshot of `alias → TargetState` for every target known to the
+   *  SM under the given parent, for use as the `targets` field of the parent
+   *  TransitionContext. */
+  private buildParentTargetsMap(parentId: string): ReadonlyMap<string, TargetState> {
+    const out = new Map<string, TargetState>();
+    const prefix = parentId + '__';
+    for (const [key, smState] of this.state.target_machine_states) {
+      if (key.startsWith(prefix)) {
+        out.set(key.slice(prefix.length), smState);
+      }
+    }
+    return out;
   }
 
   /** Promote sibling sub-issues from gaggle:queued → gaggle:running and launch Archon. */
