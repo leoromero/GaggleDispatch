@@ -49,6 +49,16 @@ import { classifyGateReply, type GateClassification } from './gate-classifier.ts
 const APPROVE_KEYWORDS = /^(approve[d]?|yes|y|lgtm|ship\s+it|go|continue|implement|do\s+it|looks?\s+good|lg|ok(ay)?|sure|proceed|start|build|make\s+it|let'?s\s+go|confirm(ed)?|✅|👍)\b/i;
 const REJECT_KEYWORDS = /^(reject(ed)?|no|n|cancel(led)?|abort|stop|don'?t|nope|👎)\b/i;
 
+interface RecoveryContext {
+  claimedIssues: Issue[];
+  runningIssues: Issue[];
+  queuedIssues: Issue[];
+  waitingIssues: Issue[];
+  archonRuns: ArchonRunRecord[];
+  archonRunsById: Map<string, ArchonRunRecord>;
+  persistedRunIds: ReturnType<typeof allRunEntries>;
+}
+
 export interface OrchestratorDeps {
   cfg: ServiceConfig;
   tracker: LinearClient;
@@ -1584,287 +1594,310 @@ export class Orchestrator {
   // ─── label-driven recovery (Section 12.4) ────────────────────────────────
   private async recoverFromLinearLabels(): Promise<void> {
     try {
-      const claimed = await this.tracker.fetchIssuesByLabel(this.cfg.tracker.gaggle_labels.claimed);
-      for (const issue of claimed) {
-        // Only mark as claimed if it's a parent (no parent_id)
-        if (!issue.parent_id) this.state.claimed.add(issue.id);
+      const ctx = await this.loadRecoveryContext();
+      this.recoverClaimedParents(ctx);
+      await this.recoverRunningIssues(ctx);
+      await this.recoverQueuedIssues(ctx);
+      await this.releaseOrphanedClaims(ctx);
+      this.recoverWaitingIssues(ctx);
+    } catch (err) {
+      logger.warn('Label-driven recovery encountered an error', { error: (err as Error).message });
+    }
+  }
+
+  private async loadRecoveryContext(): Promise<RecoveryContext> {
+    const [claimedIssues, runningIssues, queuedIssues, waitingIssues, archonRuns] = await Promise.all([
+      this.tracker.fetchIssuesByLabel(this.cfg.tracker.gaggle_labels.claimed),
+      this.tracker.fetchIssuesByLabel(this.cfg.tracker.gaggle_labels.running),
+      this.tracker.fetchIssuesByLabel(this.cfg.tracker.gaggle_labels.queued),
+      this.tracker.fetchIssuesByLabel(this.cfg.tracker.gaggle_labels.waiting_human),
+      this.archon.listRuns(),
+    ]);
+    const persistedRunIds = allRunEntries(this.cfg.registry.base_folder);
+    const archonRunsById = new Map<string, ArchonRunRecord>(archonRuns.map((r) => [r.id, r]));
+    logger.info('Archon status snapshot at startup', {
+      total_runs: archonRuns.length,
+      persisted_run_ids: Object.keys(persistedRunIds).length,
+    });
+    return { claimedIssues, runningIssues, queuedIssues, waitingIssues, archonRuns, archonRunsById, persistedRunIds };
+  }
+
+  private recoverClaimedParents(ctx: RecoveryContext): void {
+    for (const issue of ctx.claimedIssues) {
+      // Only mark as claimed if it's a parent (no parent_id)
+      if (!issue.parent_id) this.state.claimed.add(issue.id);
+    }
+  }
+
+  private async recoverRunningIssues(ctx: RecoveryContext): Promise<void> {
+    for (const issue of ctx.runningIssues) {
+      // Issues no longer active (terminal or gray-zone) finished/paused while we were down — clean the stale label.
+      if (!this.cfg.tracker.active_states.includes(issue.state ?? '')) {
+        try {
+          await this.tracker.removeLabel(issue.id, this.cfg.tracker.gaggle_labels.running);
+        } catch { /* ignore */ }
+        continue;
       }
 
-      // Load the persisted workerKey→runId map written by launchWorker.
-      const persistedRunIds = allRunEntries(this.cfg.registry.base_folder);
-      // Query Archon's DB once so we can classify each running sub-issue accurately.
-      const archonRuns = await this.archon.listRuns();
-      const archonRunsById = new Map<string, ArchonRunRecord>(archonRuns.map((r) => [r.id, r]));
-      logger.info('Archon status snapshot at startup', {
-        total_runs: archonRuns.length,
-        persisted_run_ids: Object.keys(persistedRunIds).length,
-      });
+      const parentId = issue.parent_id ?? issue.id;
 
-      const running = await this.tracker.fetchIssuesByLabel(this.cfg.tracker.gaggle_labels.running);
-      for (const issue of running) {
-        // Issues no longer active (terminal or gray-zone) finished/paused while we were down — clean the stale label.
-        if (!this.cfg.tracker.active_states.includes(issue.state ?? '')) {
-          try {
-            await this.tracker.removeLabel(issue.id, this.cfg.tracker.gaggle_labels.running);
-          } catch { /* ignore */ }
-          continue;
-        }
+      const aliasGuess = this.resolveAliasForRunningIssue(issue, parentId, ctx);
 
-        const parentId = issue.parent_id ?? issue.id;
-
-        // Try to get alias from title "[alias] ..." first.
-        // For direct-dispatch (parent issue, no sub-issue), title has no prefix — fall back
-        // to the persisted run registry which always stores repo_alias explicitly.
-        let aliasGuess = this.parseAliasFromTitle(issue.title);
-        if (!aliasGuess) {
-          const fallback = Object.entries(persistedRunIds).find(
-            ([, e]) => e.parent_issue_id === parentId && (e.sub_issue_id === null || e.sub_issue_id === issue.id),
-          );
-          if (fallback) aliasGuess = fallback[1].repo_alias ?? null;
-        }
-
-        // Register in sibling map so other recovery steps can reference this sub-issue.
-        if (aliasGuess) {
-          let map = this.state.sibling_subissues.get(parentId);
-          if (!map) { map = new Map(); this.state.sibling_subissues.set(parentId, map); }
-          map.set(aliasGuess, issue.id);
-        }
-
-        // Look up the exact Archon run via the persisted run id.
-        // Fall back to heuristic repo-basename matching if no persisted entry exists
-        // (e.g. run id was not yet written before the crash).
-        const key = workerKey(parentId, aliasGuess ?? '');
-        const persistedEntry = persistedRunIds[key];
-        let archonRun: ArchonRunRecord | null = persistedEntry
-          ? (archonRunsById.get(persistedEntry.archon_run_id) ?? null)
-          : null;
-
-        if (!archonRun && aliasGuess) {
-          // Fallback: heuristic match by repo basename + recent status.
-          const repoBasename =
-            this.registry.getContext().repositories.find((r) => r.name === aliasGuess)?.local_path
-              .split(/[\\/]/).pop() ?? aliasGuess;
-          archonRun = findArchonRunForRepo(archonRuns, repoBasename, ['running', 'paused', 'completed']);
-        }
-
-        const stillRunning = archonRun?.status === 'running' ? archonRun : null;
-        const stillPaused = archonRun?.status === 'paused' ? archonRun : null;
-        const justCompleted = archonRun?.status === 'completed' ? archonRun : null;
-
-        if (stillRunning && aliasGuess) {
-          // Archon is still alive. Track as detached; reconciler will poll for completion.
-          const key = workerKey(parentId, aliasGuess);
-          const repoMeta = this.registry.getContext().repositories.find((r) => r.name === aliasGuess);
-          const target: import('../domain/types.ts').RepoTarget = {
-            repo_url: repoMeta?.url ?? '',
-            repo_alias: aliasGuess,
-            local_path: repoMeta?.local_path ?? '',
-            archon_workflow: repoMeta?.default_workflow ?? this.cfg.archon.default_workflow,
-            rationale: issue.description ?? issue.title,
-            components: [],
-          };
-          const parentIssue = this.state.pending_issues.get(parentId) ?? issue;
-          this.state.detached_archon_runs.set(key, {
-            archon_run_id: stillRunning.id,
-            parent_issue: parentIssue as import('../domain/types.ts').Issue,
-            sub_issue_id: issue.parent_id ? issue.id : null,
-            repo_alias: aliasGuess,
-            repo_target: target,
-            recovered_at: Date.now(),
-          });
-          // Count the slot as occupied so we don't over-dispatch.
-          const placeholder = buildLiveSession({
-            issue: parentIssue as import('../domain/types.ts').Issue,
-            repo_target: target,
-            attempt: null,
-            sub_issue_id: issue.parent_id ? issue.id : null,
-            cancel: () => {},
-          });
-          this.state.running.set(key, placeholder);
-          logger.info('Recovered: Archon still running — tracking as detached', {
-            issue_identifier: issue.identifier,
-            repo_alias: aliasGuess,
-            archon_run_id: stillRunning.id,
-          });
-          continue;
-        }
-
-        if (stillPaused && aliasGuess) {
-          // Archon is at a gate — restore as a supervised gate entry.
-          const key = workerKey(parentId, aliasGuess);
-          const repoMeta = this.registry.getContext().repositories.find((r) => r.name === aliasGuess);
-          const target: import('../domain/types.ts').RepoTarget = {
-            repo_url: repoMeta?.url ?? '',
-            repo_alias: aliasGuess,
-            local_path: repoMeta?.local_path ?? '',
-            archon_workflow: repoMeta?.default_workflow ?? this.cfg.archon.default_workflow,
-            rationale: issue.description ?? issue.title,
-            components: [],
-          };
-          const parentIssue = this.state.pending_issues.get(parentId) ?? issue;
-          this.state.supervised_gates.set(key, {
-            run_id: stillPaused.id,
-            issue_id: parentId,
-            issue: parentIssue as import('../domain/types.ts').Issue,
-            repo_alias: aliasGuess,
-            repo_target: target,
-            sub_issue_id: issue.parent_id ? issue.id : null,
-            paused_at: Date.now(),
-            gate_message: stillPaused.metadata?.approval?.message ?? '(recovered gate)',
-            comment_id: null,
-            gate_state_applied: false,
-            attempt: null,
-          });
-          // Swap running → waiting-human so the label is accurate.
-          try { await this.tracker.removeLabel(issue.id, this.cfg.tracker.gaggle_labels.running); } catch { /* ignore */ }
-          try { await this.tracker.applyLabel(issue.id, this.cfg.tracker.gaggle_labels.waiting_human); } catch { /* ignore */ }
-          logger.info('Recovered: Archon paused at gate — restored supervised gate', {
-            issue_identifier: issue.identifier,
-            repo_alias: aliasGuess,
-            archon_run_id: stillPaused.id,
-          });
-          continue;
-        }
-
-        if (justCompleted && aliasGuess) {
-          // Archon finished successfully while we were down. Mark sub-issue Done.
-          try { await this.tracker.removeLabel(issue.id, this.cfg.tracker.gaggle_labels.running); } catch { /* ignore */ }
-          try { await this.tracker.updateIssueState(issue.id, completedState(this.cfg)); } catch { /* ignore */ }
-          this.state.completed.add(workerKey(parentId, aliasGuess));
-          logger.info('Recovered: Archon completed while down — marked Done', {
-            issue_identifier: issue.identifier,
-            repo_alias: aliasGuess,
-            archon_run_id: justCompleted.id,
-          });
-          continue;
-        }
-
-        // Default: Archon crashed or run not found — re-queue for retry on next tick.
-        try { await this.tracker.removeLabel(issue.id, this.cfg.tracker.gaggle_labels.running); } catch { /* ignore */ }
-        try { await this.tracker.applyLabel(issue.id, this.cfg.tracker.gaggle_labels.queued); } catch { /* ignore */ }
-        logger.info('Recovered: Archon not found or crashed — re-queued', {
-          issue_identifier: issue.identifier,
-          repo_alias: aliasGuess ?? '(unknown)',
-        });
-      }
-
-      // Recover sub-issues that were queued but not yet dispatched.
-      const queued = await this.tracker.fetchIssuesByLabel(this.cfg.tracker.gaggle_labels.queued);
-      const parentIdsToPromote = new Set<string>();
-      for (const issue of queued) {
-        if (!issue.parent_id) continue; // only sub-issues carry gaggle:queued
-        if (!this.cfg.tracker.active_states.includes(issue.state ?? '')) continue;
-        const aliasGuess = this.parseAliasFromTitle(issue.title);
-        if (!aliasGuess) continue;
-        const parentId = issue.parent_id;
+      // Register in sibling map so other recovery steps can reference this sub-issue.
+      if (aliasGuess) {
         let map = this.state.sibling_subissues.get(parentId);
         if (!map) { map = new Map(); this.state.sibling_subissues.set(parentId, map); }
         map.set(aliasGuess, issue.id);
-        parentIdsToPromote.add(parentId);
-        logger.info('Recovered queued sub-issue', {
-          issue_identifier: issue.identifier, parent_id: parentId, repo_alias: aliasGuess,
-        });
       }
 
-      // Promote any queued siblings whose blockers are already satisfied (e.g. BE merged while orchestrator was down).
-      for (const parentId of parentIdsToPromote) {
-        let parentIssue = this.state.pending_issues.get(parentId);
-        if (!parentIssue) {
-          try {
-            const fetched = await this.tracker.fetchIssueStatesByIds([parentId]);
-            parentIssue = fetched[0];
-          } catch { /* ignore */ }
-        }
-        if (parentIssue) {
-          this.state.pending_issues.set(parentId, parentIssue);
-          await this.promoteQueuedSiblings(parentIssue);
-        }
-      }
+      const archonRun = this.resolveArchonRun(parentId, aliasGuess, ctx);
 
-      // Orphaned claimed parents: check whether all recovered siblings (if any) have already
-      // completed.  Three cases:
-      //   (a) Running sub whose Archon run completed → sibling_subissues IS populated but every
-      //       entry is in state.completed.  Work is done → release to terminal.
-      //   (b) No running/queued siblings at all but a persisted run entry shows Archon completed
-      //       (crash after handleWorkerExit removed the running label but before
-      //       maybeReleaseClaim) → release to terminal.
-      //   (c) No siblings and no completed run → crash before the first worker was ever launched
-      //       → un-claim only so the poll loop re-dispatches on the next tick.
-      for (const parentId of [...this.state.claimed]) {
-        const sibMap = this.state.sibling_subissues.get(parentId);
-        // Skip parents that still have active siblings (running, queued, or awaiting gate).
-        const allSibsCompleted =
-          !sibMap || sibMap.size === 0 ||
-          [...sibMap.keys()].every((alias) => this.state.completed.has(workerKey(parentId, alias)));
-        if (!allSibsCompleted) continue;
+      const stillRunning = archonRun?.status === 'running' ? archonRun : null;
+      const stillPaused = archonRun?.status === 'paused' ? archonRun : null;
+      const justCompleted = archonRun?.status === 'completed' ? archonRun : null;
 
-        // Determine whether actual work ran for this parent.
-        const workDone =
-          (sibMap && sibMap.size > 0) || // at least one sibling completed during recovery
-          Object.values(persistedRunIds).some(
-            (e) => e.parent_issue_id === parentId && archonRunsById.get(e.archon_run_id)?.status === 'completed',
-          );
-
-        if (workDone) {
-          logger.info('Orphaned claimed parent detected on startup (work completed) — releasing', { parent_id: parentId });
-          await this.maybeReleaseClaim(parentId);
-        } else {
-          logger.info('Orphaned claimed parent detected on startup (no work started) — un-claiming for re-dispatch', { parent_id: parentId });
-          this.state.claimed.delete(parentId);
-          this.state.pending_issues.delete(parentId);
-          try { await this.tracker.removeLabel(parentId, this.cfg.tracker.gaggle_labels.claimed); } catch { /* ignore */ }
-        }
-      }
-
-      const waiting = await this.tracker.fetchIssuesByLabel(this.cfg.tracker.gaggle_labels.waiting_human);
-      // Build lookups from issue_id → repo_alias and issue_id → archon_run_id using persisted
-      // run entries, so parent issues (no [alias] title prefix) can have their gates fully
-      // recovered after a restart — including the run_id needed to approve/reject in Archon.
-      const persistedRuns = allRunEntries(this.cfg.registry.base_folder);
-      const runAliasById = new Map<string, string>();
-      const runIdById = new Map<string, string>();
-      for (const entry of Object.values(persistedRuns)) {
-        runAliasById.set(entry.parent_issue_id, entry.repo_alias);
-        runIdById.set(entry.parent_issue_id, entry.archon_run_id);
-      }
-
-      for (const issue of waiting) {
-        const m = issue.title.match(/^\[([^\]]+)\]/);
-        const parentId = issue.parent_id ?? issue.id;
-        // Prefer title-derived alias (sub-issues), fall back to persisted run entry (parent issues).
-        const aliasGuess = m ? m[1]! : (runAliasById.get(parentId) ?? null);
-        if (!aliasGuess) continue;
-        // Reconstruct the supervised_gates entry, restoring the Archon run_id so that
-        // approve/reject can be forwarded even after the hub was restarted.
-        const recoveredRunId = runIdById.get(parentId) ?? null;
+      if (stillRunning && aliasGuess) {
+        // Archon is still alive. Track as detached; reconciler will poll for completion.
         const key = workerKey(parentId, aliasGuess);
-        this.state.supervised_gates.set(key, {
-          run_id: recoveredRunId,
-          issue_id: parentId,
-          issue: { ...issue, id: parentId },
+        const target = this.buildRepoTargetForAlias(aliasGuess, issue);
+        const parentIssue = this.state.pending_issues.get(parentId) ?? issue;
+        this.state.detached_archon_runs.set(key, {
+          archon_run_id: stillRunning.id,
+          parent_issue: parentIssue as Issue,
+          sub_issue_id: issue.parent_id ? issue.id : null,
           repo_alias: aliasGuess,
-          repo_target: {
-            repo_url: '',
-            repo_alias: aliasGuess,
-            local_path: '',
-            archon_workflow: '',
-            rationale: '',
-            components: [],
-          },
+          repo_target: target,
+          recovered_at: Date.now(),
+        });
+        // Count the slot as occupied so we don't over-dispatch.
+        const placeholder = buildLiveSession({
+          issue: parentIssue as Issue,
+          repo_target: target,
+          attempt: null,
+          sub_issue_id: issue.parent_id ? issue.id : null,
+          cancel: () => {},
+        });
+        this.state.running.set(key, placeholder);
+        logger.info('Recovered: Archon still running — tracking as detached', {
+          issue_identifier: issue.identifier,
+          repo_alias: aliasGuess,
+          archon_run_id: stillRunning.id,
+        });
+        continue;
+      }
+
+      if (stillPaused && aliasGuess) {
+        // Archon is at a gate — restore as a supervised gate entry.
+        const key = workerKey(parentId, aliasGuess);
+        const target = this.buildRepoTargetForAlias(aliasGuess, issue);
+        const parentIssue = this.state.pending_issues.get(parentId) ?? issue;
+        this.state.supervised_gates.set(key, {
+          run_id: stillPaused.id,
+          issue_id: parentId,
+          issue: parentIssue as Issue,
+          repo_alias: aliasGuess,
+          repo_target: target,
           sub_issue_id: issue.parent_id ? issue.id : null,
           paused_at: Date.now(),
-          gate_message: '(recovered after restart)',
+          gate_message: stillPaused.metadata?.approval?.message ?? '(recovered gate)',
           comment_id: null,
           gate_state_applied: false,
           attempt: null,
         });
-        logger.info('Recovered supervised gate (Archon process gone)', {
+        // Swap running → waiting-human so the label is accurate.
+        try { await this.tracker.removeLabel(issue.id, this.cfg.tracker.gaggle_labels.running); } catch { /* ignore */ }
+        try { await this.tracker.applyLabel(issue.id, this.cfg.tracker.gaggle_labels.waiting_human); } catch { /* ignore */ }
+        logger.info('Recovered: Archon paused at gate — restored supervised gate', {
           issue_identifier: issue.identifier,
+          repo_alias: aliasGuess,
+          archon_run_id: stillPaused.id,
         });
+        continue;
       }
-    } catch (err) {
-      logger.warn('Label-driven recovery encountered an error', { error: (err as Error).message });
+
+      if (justCompleted && aliasGuess) {
+        // Archon finished successfully while we were down. Mark sub-issue Done.
+        try { await this.tracker.removeLabel(issue.id, this.cfg.tracker.gaggle_labels.running); } catch { /* ignore */ }
+        try { await this.tracker.updateIssueState(issue.id, completedState(this.cfg)); } catch { /* ignore */ }
+        this.state.completed.add(workerKey(parentId, aliasGuess));
+        logger.info('Recovered: Archon completed while down — marked Done', {
+          issue_identifier: issue.identifier,
+          repo_alias: aliasGuess,
+          archon_run_id: justCompleted.id,
+        });
+        continue;
+      }
+
+      // Default: Archon crashed or run not found — re-queue for retry on next tick.
+      try { await this.tracker.removeLabel(issue.id, this.cfg.tracker.gaggle_labels.running); } catch { /* ignore */ }
+      try { await this.tracker.applyLabel(issue.id, this.cfg.tracker.gaggle_labels.queued); } catch { /* ignore */ }
+      logger.info('Recovered: Archon not found or crashed — re-queued', {
+        issue_identifier: issue.identifier,
+        repo_alias: aliasGuess ?? '(unknown)',
+      });
     }
+  }
+
+  private async recoverQueuedIssues(ctx: RecoveryContext): Promise<void> {
+    // Recover sub-issues that were queued but not yet dispatched.
+    const parentIdsToPromote = new Set<string>();
+    for (const issue of ctx.queuedIssues) {
+      if (!issue.parent_id) continue; // only sub-issues carry gaggle:queued
+      if (!this.cfg.tracker.active_states.includes(issue.state ?? '')) continue;
+      const aliasGuess = this.parseAliasFromTitle(issue.title);
+      if (!aliasGuess) continue;
+      const parentId = issue.parent_id;
+      let map = this.state.sibling_subissues.get(parentId);
+      if (!map) { map = new Map(); this.state.sibling_subissues.set(parentId, map); }
+      map.set(aliasGuess, issue.id);
+      parentIdsToPromote.add(parentId);
+      logger.info('Recovered queued sub-issue', {
+        issue_identifier: issue.identifier, parent_id: parentId, repo_alias: aliasGuess,
+      });
+    }
+
+    // Promote any queued siblings whose blockers are already satisfied (e.g. BE merged while orchestrator was down).
+    for (const parentId of parentIdsToPromote) {
+      let parentIssue = this.state.pending_issues.get(parentId);
+      if (!parentIssue) {
+        try {
+          const fetched = await this.tracker.fetchIssueStatesByIds([parentId]);
+          parentIssue = fetched[0];
+        } catch { /* ignore */ }
+      }
+      if (parentIssue) {
+        this.state.pending_issues.set(parentId, parentIssue);
+        await this.promoteQueuedSiblings(parentIssue);
+      }
+    }
+  }
+
+  private async releaseOrphanedClaims(ctx: RecoveryContext): Promise<void> {
+    // Orphaned claimed parents: check whether all recovered siblings (if any) have already
+    // completed.  Three cases:
+    //   (a) Running sub whose Archon run completed → sibling_subissues IS populated but every
+    //       entry is in state.completed.  Work is done → release to terminal.
+    //   (b) No running/queued siblings at all but a persisted run entry shows Archon completed
+    //       (crash after handleWorkerExit removed the running label but before
+    //       maybeReleaseClaim) → release to terminal.
+    //   (c) No siblings and no completed run → crash before the first worker was ever launched
+    //       → un-claim only so the poll loop re-dispatches on the next tick.
+    for (const parentId of [...this.state.claimed]) {
+      const sibMap = this.state.sibling_subissues.get(parentId);
+      // Skip parents that still have active siblings (running, queued, or awaiting gate).
+      const allSibsCompleted =
+        !sibMap || sibMap.size === 0 ||
+        [...sibMap.keys()].every((alias) => this.state.completed.has(workerKey(parentId, alias)));
+      if (!allSibsCompleted) continue;
+
+      // Determine whether actual work ran for this parent.
+      const workDone =
+        (sibMap && sibMap.size > 0) || // at least one sibling completed during recovery
+        Object.values(ctx.persistedRunIds).some(
+          (e) => e.parent_issue_id === parentId && ctx.archonRunsById.get(e.archon_run_id)?.status === 'completed',
+        );
+
+      if (workDone) {
+        logger.info('Orphaned claimed parent detected on startup (work completed) — releasing', { parent_id: parentId });
+        await this.maybeReleaseClaim(parentId);
+      } else {
+        logger.info('Orphaned claimed parent detected on startup (no work started) — un-claiming for re-dispatch', { parent_id: parentId });
+        this.state.claimed.delete(parentId);
+        this.state.pending_issues.delete(parentId);
+        try { await this.tracker.removeLabel(parentId, this.cfg.tracker.gaggle_labels.claimed); } catch { /* ignore */ }
+      }
+    }
+  }
+
+  private recoverWaitingIssues(ctx: RecoveryContext): void {
+    // Build lookups from issue_id → repo_alias and issue_id → archon_run_id using persisted
+    // run entries, so parent issues (no [alias] title prefix) can have their gates fully
+    // recovered after a restart — including the run_id needed to approve/reject in Archon.
+    const runAliasById = new Map<string, string>();
+    const runIdById = new Map<string, string>();
+    for (const entry of Object.values(ctx.persistedRunIds)) {
+      runAliasById.set(entry.parent_issue_id, entry.repo_alias);
+      runIdById.set(entry.parent_issue_id, entry.archon_run_id);
+    }
+
+    for (const issue of ctx.waitingIssues) {
+      const m = issue.title.match(/^\[([^\]]+)\]/);
+      const parentId = issue.parent_id ?? issue.id;
+      // Prefer title-derived alias (sub-issues), fall back to persisted run entry (parent issues).
+      const aliasGuess = m ? m[1]! : (runAliasById.get(parentId) ?? null);
+      if (!aliasGuess) continue;
+      // Reconstruct the supervised_gates entry, restoring the Archon run_id so that
+      // approve/reject can be forwarded even after the hub was restarted.
+      const recoveredRunId = runIdById.get(parentId) ?? null;
+      const key = workerKey(parentId, aliasGuess);
+      this.state.supervised_gates.set(key, {
+        run_id: recoveredRunId,
+        issue_id: parentId,
+        issue: { ...issue, id: parentId },
+        repo_alias: aliasGuess,
+        repo_target: {
+          repo_url: '',
+          repo_alias: aliasGuess,
+          local_path: '',
+          archon_workflow: '',
+          rationale: '',
+          components: [],
+        },
+        sub_issue_id: issue.parent_id ? issue.id : null,
+        paused_at: Date.now(),
+        gate_message: '(recovered after restart)',
+        comment_id: null,
+        gate_state_applied: false,
+        attempt: null,
+      });
+      logger.info('Recovered supervised gate (Archon process gone)', {
+        issue_identifier: issue.identifier,
+      });
+    }
+  }
+
+  private resolveAliasForRunningIssue(
+    issue: Issue,
+    parentId: string,
+    ctx: RecoveryContext,
+  ): string | null {
+    const fromTitle = this.parseAliasFromTitle(issue.title);
+    if (fromTitle) return fromTitle;
+    const fallback = Object.entries(ctx.persistedRunIds).find(
+      ([, e]) => e.parent_issue_id === parentId && (e.sub_issue_id === null || e.sub_issue_id === issue.id),
+    );
+    return fallback?.[1].repo_alias ?? null;
+  }
+
+  private resolveArchonRun(
+    parentId: string,
+    alias: string | null,
+    ctx: RecoveryContext,
+  ): ArchonRunRecord | null {
+    const key = workerKey(parentId, alias ?? '');
+    const persistedEntry = ctx.persistedRunIds[key];
+    let run: ArchonRunRecord | null = persistedEntry
+      ? (ctx.archonRunsById.get(persistedEntry.archon_run_id) ?? null)
+      : null;
+    if (!run && alias) {
+      const repoBasename =
+        this.registry.getContext().repositories.find((r) => r.name === alias)?.local_path
+          .split(/[\\/]/).pop() ?? alias;
+      run = findArchonRunForRepo(ctx.archonRuns, repoBasename, ['running', 'paused', 'completed']);
+    }
+    return run;
+  }
+
+  private buildRepoTargetForAlias(alias: string, issue: Issue): RepoTarget {
+    const repoMeta = this.registry.getContext().repositories.find((r) => r.name === alias);
+    return {
+      repo_url: repoMeta?.url ?? '',
+      repo_alias: alias,
+      local_path: repoMeta?.local_path ?? '',
+      archon_workflow: repoMeta?.default_workflow ?? this.cfg.archon.default_workflow,
+      rationale: issue.description ?? issue.title,
+      components: [],
+    };
   }
 }
 
