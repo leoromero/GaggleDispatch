@@ -107,6 +107,9 @@ export function buildServiceConfig(def: WorkflowDefinition): ServiceConfig {
       'tracker.gaggle_labels.waiting_human',
       'gaggle:waiting-human',
     ),
+    analyzing: asString(gaggleLabelsRaw.analyzing, 'tracker.gaggle_labels.analyzing', 'gaggle:analyzing'),
+    dispatching: asString(gaggleLabelsRaw.dispatching, 'tracker.gaggle_labels.dispatching', 'gaggle:dispatching'),
+    retrying: asString(gaggleLabelsRaw.retrying, 'tracker.gaggle_labels.retrying', 'gaggle:retrying'),
   };
 
   const deployRaw = asObject(trackerRaw.deploy_env_labels, 'tracker.deploy_env_labels');

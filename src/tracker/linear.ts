@@ -401,7 +401,7 @@ export class LinearClient {
     return id;
   }
 
-  /** Eagerly create the four state-machine labels (Section 12.4). */
+  /** Eagerly create all state-machine labels (Section 12.4). */
   async ensureGaggleLabels(): Promise<void> {
     const team = await this.resolveTeam();
     for (const label of [
@@ -409,6 +409,9 @@ export class LinearClient {
       this.cfg.tracker.gaggle_labels.queued,
       this.cfg.tracker.gaggle_labels.running,
       this.cfg.tracker.gaggle_labels.waiting_human,
+      this.cfg.tracker.gaggle_labels.analyzing,
+      this.cfg.tracker.gaggle_labels.dispatching,
+      this.cfg.tracker.gaggle_labels.retrying,
     ]) {
       await this.ensureLabelExists(team.id, label);
     }

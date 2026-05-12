@@ -40,6 +40,12 @@ export interface GaggleLabels {
   queued: string;
   running: string;
   waiting_human: string;
+  /** Applied to the parent issue while the IssueAnalyzer is running. */
+  analyzing: string;
+  /** Applied to a target between SM dispatch_attempted and worker_started. */
+  dispatching: string;
+  /** Applied to a target between failed attempts (worker_failed → retry_due). */
+  retrying: string;
 }
 
 export interface TrackerConfig {
