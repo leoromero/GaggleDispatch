@@ -231,7 +231,7 @@ export type Effect =
 
   // In-memory state (live sessions, detached runs, gates, completed set)
   | { kind: 'register_detached_run'; identity: TargetIdentity; target: RepoTarget; run_id: string }
-  | { kind: 'register_supervised_gate'; identity: TargetIdentity; target: RepoTarget; run_id: string; message: string }
+  | { kind: 'register_supervised_gate'; identity: TargetIdentity; target: RepoTarget; run_id: string; message: string; attempt: number | null }
   | { kind: 'release_parent_claim'; parent_id: string }
   | { kind: 'invalidate_analysis_cache'; issue_id: string }
 
@@ -553,7 +553,7 @@ export const targetTransition: TargetTransitionFn = (state, event, ctx) => {
       const effects: Effect[] = [
         { kind: 'remove_label', issue_id: tid, label: 'gaggle:running' },
         { kind: 'apply_label', issue_id: tid, label: 'gaggle:waiting-human' },
-        { kind: 'register_supervised_gate', identity: ctx.identity, target: ctx.target, run_id: event.run_id, message: event.message },
+        { kind: 'register_supervised_gate', identity: ctx.identity, target: ctx.target, run_id: event.run_id, message: event.message, attempt: ctx.attempt },
       ];
       if (ctx.cfg.tracker.gate_waiting_state) {
         effects.push({ kind: 'set_linear_state', issue_id: tid, state: ctx.cfg.tracker.gate_waiting_state });

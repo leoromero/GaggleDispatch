@@ -748,6 +748,14 @@ export class Orchestrator {
   }
 
   // ─── gate handling ───────────────────────────────────────────────────────
+  /**
+   * Worker paused at a supervised approval gate. The state machine handles
+   * label swap (running → waiting-human), supervised_gates registration, and
+   * the optional gate_waiting_state transition. The orchestrator handles the
+   * plan-fetch + comment-post inline (file system reads + comment id capture
+   * the SM doesn't model) and patches comment_id / gate_state_applied onto
+   * the gate entry after the applier has registered it.
+   */
   private async handleGatePaused(
     issue: Issue,
     target: RepoTarget,
@@ -759,15 +767,8 @@ export class Orchestrator {
     const key = workerKey(issue.id, target.repo_alias);
     const targetId = subIssueId ?? issue.id;
 
-    try {
-      await this.tracker.applyLabel(targetId, this.cfg.tracker.gaggle_labels.waiting_human);
-    } catch (err) {
-      logger.warn('Failed to apply waiting-human label', { error: (err as Error).message });
-    }
-
-    // Try to fetch the actual plan from investigation.md in the Archon artifacts directory.
-    // The artifacts path is derived from the run's working_path by replacing the worktrees
-    // segment: <workspace>/worktrees/... → <workspace>/artifacts/runs/<run_id>/investigation.md
+    // 1. Fetch the plan from the Archon artifacts directory (file system read,
+    //    not modeled by the SM). Falls back to the gate_message on any failure.
     let planContent: string | null = null;
     try {
       const runDetail = await this.archon.getRunDetail(run_id);
@@ -791,6 +792,10 @@ export class Orchestrator {
       ? `🤖 **GaggleDispatch — plan gate**\n\n${planContent}\n\n---\n\n_Reply with **approve** (optionally with notes) to start implementation, or **reject: \\<feedback\\>** to request a revised plan._`
       : `🤖 **GaggleDispatch — supervised gate**\n\n${gate_message}\n\n_Reply with **approve** or **reject**, optionally followed by your message._`;
 
+    // 2. Post the comment. The SM emits post_comment effects in some
+    //    transitions, but here we need the comment id back to store on the gate
+    //    entry, which the applier doesn't currently return — so this stays
+    //    inline for now.
     let comment_id: string | null = null;
     try {
       const c = await this.tracker.postComment(targetId, commentBody);
@@ -799,30 +804,46 @@ export class Orchestrator {
       logger.warn('Failed to post gate comment', { error: (err as Error).message });
     }
 
+    // 3. Session lifecycle (not modeled by SM).
     const session = this.state.running.get(key);
-    const gate: SupervisedGateEntry = {
-      run_id,
-      issue_id: issue.id,
-      issue,
-      repo_alias: target.repo_alias,
-      repo_target: target,
-      sub_issue_id: subIssueId,
-      paused_at: Date.now(),
-      gate_message,
-      comment_id,
-      gate_state_applied: false,
-      attempt,
-    };
-    this.state.supervised_gates.set(key, gate);
-    session?.stopPoller?.(); // poller keeps running in supervised_gates via poller_gate_paused
-    this.state.running.delete(key); // ← slot freed
+    session?.stopPoller?.();
+    this.state.running.delete(key);
 
-    if (this.cfg.tracker.gate_waiting_state) {
-      try {
-        await this.tracker.updateIssueState(targetId, this.cfg.tracker.gate_waiting_state);
+    // 4. Drive the SM transition: applies waiting-human, removes running,
+    //    registers the supervised_gate entry, and optionally moves Linear
+    //    state to gate_waiting_state if configured.
+    const identity: TargetIdentity = {
+      parent_issue_id: issue.id,
+      repo_alias: target.repo_alias,
+      target_issue_id: targetId,
+    };
+    const ctx: TargetTransitionContext = {
+      cfg: this.cfg,
+      identity,
+      parent_issue: issue,
+      target,
+      siblings: new Map(),
+      attempt: attempt ?? 0,
+    };
+    // pending_issues must be populated for the applier's register_supervised_gate
+    // to capture the full Issue snapshot; ensure it's there.
+    if (!this.state.pending_issues.has(issue.id)) {
+      this.state.pending_issues.set(issue.id, issue);
+    }
+    const transition = targetTransition('running', { kind: 'gate_paused', run_id, message: gate_message }, ctx);
+    await this.effectApplier.applyAll(transition.effects);
+
+    // 5. Patch up the gate entry with details the SM didn't carry:
+    //    - comment_id: only known after posting (above)
+    //    - gate_state_applied: optimistically true when gate_waiting_state is
+    //      configured. If the set_linear_state effect failed inside the applier
+    //      it was logged and swallowed; the resolve step that reads this flag
+    //      will idempotently retry on resume.
+    const gate = this.state.supervised_gates.get(key);
+    if (gate) {
+      gate.comment_id = comment_id;
+      if (this.cfg.tracker.gate_waiting_state) {
         gate.gate_state_applied = true;
-      } catch (err) {
-        logger.warn('Failed to apply gate_waiting_state', { error: (err as Error).message });
       }
     }
 

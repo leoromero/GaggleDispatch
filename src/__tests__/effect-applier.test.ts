@@ -268,6 +268,7 @@ describe('EffectApplier: timers & in-memory state', () => {
       target: makeRepoTarget({ repo_alias: 'trialmatch-be' }),
       run_id: 'run-1',
       message: 'review plan',
+      attempt: null,
     });
     const gate = state.supervised_gates.get('p1__trialmatch-be');
     expect(gate).toBeDefined();
@@ -289,6 +290,7 @@ describe('EffectApplier: timers & in-memory state', () => {
       target: makeRepoTarget({ repo_alias: 'mono' }),
       run_id: 'run-2',
       message: 'mono',
+      attempt: null,
     });
     expect(state.supervised_gates.get('p1__mono')?.sub_issue_id).toBeNull();
   });

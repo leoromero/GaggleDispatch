@@ -216,7 +216,7 @@ export class EffectApplier {
           gate_message: effect.message,
           comment_id: null,
           gate_state_applied: false,
-          attempt: null,
+          attempt: effect.attempt,
         });
         return;
       }
