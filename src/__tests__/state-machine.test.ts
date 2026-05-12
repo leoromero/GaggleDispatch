@@ -71,6 +71,14 @@ describe('parentTransition: valid', () => {
     expect(hasEffect(t.effects, 'apply_label', (e) => e.kind === 'apply_label' && e.label === 'analyzing')).toBe(true);
   });
 
+  test('unclaimed + analysis_succeeded → claimed (cached-analysis dispatch)', () => {
+    const t = parentTransition('unclaimed', { kind: 'analysis_succeeded', targets: [makeRepoTarget()] }, pctx());
+    expect(t.to).toBe('claimed');
+    expect(hasEffect(t.effects, 'apply_label', (e) => e.kind === 'apply_label' && e.label === 'claimed')).toBe(true);
+    // No analyzing label was applied, so no remove_label effect
+    expect(hasEffect(t.effects, 'remove_label')).toBe(false);
+  });
+
   test('analyzing + analysis_succeeded → claimed', () => {
     const t = parentTransition('analyzing', { kind: 'analysis_succeeded', targets: [makeRepoTarget()] }, pctx());
     expect(t.to).toBe('claimed');
@@ -136,6 +144,7 @@ describe('parentTransition: invalid pairs throw', () => {
 
   const VALID = new Set<string>([
     'unclaimed:analysis_started',
+    'unclaimed:analysis_succeeded', // cached-analysis dispatch path
     'analyzing:analysis_succeeded',
     'analyzing:analysis_failed',
     'analyzing:parent_externally_terminal',

@@ -504,6 +504,8 @@ describe('shouldDispatch eligibility', () => {
     await runTick(o);
     expect(calls.some((c) => c.op === 'analyze' && c.args[0] === 'i1')).toBe(true);
     expect(calls.some((c) => c.op === 'applyLabel' && c.args[0] === 'i1' && c.args[1] === 'gaggle:claimed')).toBe(true);
+    // Phase 5c: parent SM state map should now show 'claimed' (driven via emitParentEvent).
+    expect(o.getState().parent_machine_states.get('i1')).toBe('claimed');
   });
 
   test('does not re-dispatch an issue that was just dispatched (claimed set)', async () => {

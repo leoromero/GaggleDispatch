@@ -375,6 +375,16 @@ export const parentTransition: ParentTransitionFn = (state, event, ctx) => {
         effects: [{ kind: 'apply_label', issue_id: parentId, label: 'analyzing' }],
       };
     }
+    // Cached-analysis dispatches skip 'analyzing' entirely and go straight to
+    // claimed when the orchestrator picks up the issue. Allow analysis_succeeded
+    // from unclaimed; effects differ from the analyzing→claimed path (no
+    // gaggle:analyzing label to remove).
+    if (event.kind === 'analysis_succeeded') {
+      return {
+        from: 'unclaimed', to: 'claimed',
+        effects: [{ kind: 'apply_label', issue_id: parentId, label: 'claimed' }],
+      };
+    }
     throw new InvalidTransitionError(state, event.kind, 'parent');
   }
 

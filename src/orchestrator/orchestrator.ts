@@ -47,7 +47,11 @@ import { writeRunEntry, deleteRunEntry, allRunEntries, allRetryEntries, deleteRe
 import { classifyGateReply, type GateClassification } from './gate-classifier.ts';
 import {
   classifyTargetState,
+  parentTransition,
   targetTransition,
+  type ParentEvent,
+  type ParentTransition,
+  type ParentTransitionContext,
   type TargetEvent,
   type TargetIdentity,
   type TargetState,
@@ -618,13 +622,28 @@ export class Orchestrator {
       this.state.pending_targets.set(issue.id, [...analysis.repo_targets]);
     }
 
-    try {
-      await this.tracker.applyLabel(issue.id, this.cfg.tracker.gaggle_labels.claimed);
-    } catch (err) {
-      logger.error('Failed to apply claimed label', {
-        issue_id: issue.id,
-        error: (err as Error).message,
+    // Drive the parent SM unclaimed → claimed (the SM allows analysis_succeeded
+    // from unclaimed, applying the gaggle:claimed label as an effect). If the
+    // parent is already in 'claimed' (recovered or re-entered), this is a no-op
+    // path that's not valid in the SM, so guard.
+    const currentParent = this.state.parent_machine_states.get(issue.id) ?? 'unclaimed';
+    if (currentParent === 'unclaimed' || currentParent === 'analyzing') {
+      await this.emitParentEvent(currentParent, { kind: 'analysis_succeeded', targets: analysis.repo_targets }, {
+        cfg: this.cfg,
+        parent_issue: issue,
+        targets: new Map(),
       });
+    } else {
+      // Parent already claimed (e.g. from recovery) — make sure the label is
+      // present in Linear. Idempotent.
+      try {
+        await this.tracker.applyLabel(issue.id, this.cfg.tracker.gaggle_labels.claimed);
+      } catch (err) {
+        logger.error('Failed to apply claimed label', {
+          issue_id: issue.id,
+          error: (err as Error).message,
+        });
+      }
     }
 
     await this.drainPendingTargets(issue, analysis);
@@ -1018,6 +1037,19 @@ export class Orchestrator {
     await this.effectApplier.applyAll(transition.effects);
     const key = workerKey(ctx.identity.parent_issue_id, ctx.identity.repo_alias);
     this.state.target_machine_states.set(key, transition.to);
+    return transition;
+  }
+
+  /** Parent SM analogue of emitTargetEvent. Records the resulting state in
+   *  state.parent_machine_states keyed by parent issue id. */
+  private async emitParentEvent(
+    fromState: 'unclaimed' | 'analyzing' | 'claimed' | 'done' | 'cancelled',
+    event: ParentEvent,
+    ctx: ParentTransitionContext,
+  ): Promise<ParentTransition> {
+    const transition = parentTransition(fromState, event, ctx);
+    await this.effectApplier.applyAll(transition.effects);
+    this.state.parent_machine_states.set(ctx.parent_issue.id, transition.to);
     return transition;
   }
 
@@ -1662,10 +1694,12 @@ export class Orchestrator {
       // Only mark as claimed if it's a parent (no parent_id). Also stash the
       // Issue snapshot in pending_issues so later recovery passes — and the
       // EffectApplier's spawnWorker / scheduleRetry hooks — can resolve the
-      // parent without a Linear round-trip.
+      // parent without a Linear round-trip. Hydrate parent_machine_states so
+      // the SM and legacy state.claimed agree on the parent's current state.
       if (!issue.parent_id) {
         this.state.claimed.add(issue.id);
         this.state.pending_issues.set(issue.id, issue);
+        this.state.parent_machine_states.set(issue.id, 'claimed');
       }
     }
   }
