@@ -46,7 +46,7 @@ export interface CancelWorkerHook {
 }
 
 export interface ScheduleRetryHook {
-  (key: WorkerKey, delayMs: number): void;
+  (key: WorkerKey, delayMs: number, attempt: number): void;
 }
 
 export interface CreateBlockerHook {
@@ -184,7 +184,7 @@ export class EffectApplier {
 
       // ─── Timers ────────────────────────────────────────────────────────
       case 'schedule_retry_timer':
-        this.deps.scheduleRetry(effect.key, effect.delay_ms);
+        this.deps.scheduleRetry(effect.key, effect.delay_ms, effect.attempt);
         return;
 
       // ─── In-memory state ───────────────────────────────────────────────

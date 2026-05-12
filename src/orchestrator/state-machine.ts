@@ -225,8 +225,9 @@ export type Effect =
   | { kind: 'persist_retry'; key: WorkerKey; meta: RetryMeta }
   | { kind: 'delete_retry'; key: WorkerKey }
 
-  // Timer
-  | { kind: 'schedule_retry_timer'; key: WorkerKey; delay_ms: number }
+  // Timer. `attempt` is included so the orchestrator's scheduleRetry hook can
+  // reconstruct the call without consulting in-memory state.
+  | { kind: 'schedule_retry_timer'; key: WorkerKey; delay_ms: number; attempt: number }
 
   // In-memory state (live sessions, detached runs, gates, completed set)
   | { kind: 'register_detached_run'; identity: TargetIdentity; target: RepoTarget; run_id: string }
@@ -738,7 +739,7 @@ function retryOrFail(
       { kind: 'apply_label', issue_id: tid, label: 'gaggle:retrying' },
       { kind: 'delete_run', key },
       { kind: 'persist_retry', key, meta: { attempt: nextAttempt, due_at_ms: Date.now() + delayMs, reason } },
-      { kind: 'schedule_retry_timer', key, delay_ms: delayMs },
+      { kind: 'schedule_retry_timer', key, delay_ms: delayMs, attempt: nextAttempt },
     ],
   };
 }

@@ -45,7 +45,14 @@ import type { RegistryLoaderHandle } from '../registry/loader.ts';
 import type { SyncerHandle } from '../registry/repo-syncer.ts';
 import { writeRunEntry, deleteRunEntry, allRunEntries } from '../registry/run-registry.ts';
 import { classifyGateReply, type GateClassification } from './gate-classifier.ts';
-import { classifyTargetState, type TargetIdentity } from './state-machine.ts';
+import {
+  classifyTargetState,
+  targetTransition,
+  type TargetEvent,
+  type TargetIdentity,
+  type TargetTransitionContext,
+} from './state-machine.ts';
+import { EffectApplier } from './effect-applier.ts';
 
 const APPROVE_KEYWORDS = /^(approve[d]?|yes|y|lgtm|ship\s+it|go|continue|implement|do\s+it|looks?\s+good|lg|ok(ay)?|sure|proceed|start|build|make\s+it|let'?s\s+go|confirm(ed)?|✅|👍)\b/i;
 const REJECT_KEYWORDS = /^(reject(ed)?|no|n|cancel(led)?|abort|stop|don'?t|nope|👎)\b/i;
@@ -80,6 +87,7 @@ export class Orchestrator {
   private registry: RegistryLoaderHandle;
   private syncer: SyncerHandle | null;
   private archon: ArchonClient;
+  private effectApplier: EffectApplier;
   private tickTimer: ReturnType<typeof setTimeout> | null = null;
   private stopped = false;
   private analyzing = new Set<string>();
@@ -96,6 +104,44 @@ export class Orchestrator {
 
     deps.registry.on(() => {
       this.invalidateAnalysisCache();
+    });
+
+    // Wire the EffectApplier with hooks back into orchestrator-owned machinery.
+    // Hot paths that haven't been converted yet throw from their hooks — those
+    // effects won't fire until the corresponding transition is wired up.
+    this.effectApplier = new EffectApplier({
+      cfg: this.cfg,
+      tracker: this.tracker,
+      archon: this.archon,
+      workspace: this.workspace,
+      state: this.state,
+      registryBaseFolder: this.cfg.registry.base_folder,
+      spawnWorker: async () => {
+        throw new Error('spawnWorker hook not yet wired (dispatch path still uses inline logic)');
+      },
+      cancelWorker: (key) => {
+        const sess = this.state.running.get(key);
+        try { sess?.cancel?.(); } catch { /* ignore */ }
+      },
+      scheduleRetry: (key, delayMs, attempt) => {
+        const sep = key.indexOf('__');
+        if (sep < 0) return;
+        const parentId = key.slice(0, sep);
+        const alias = key.slice(sep + 2);
+        const issue = this.state.pending_issues.get(parentId);
+        if (!issue) {
+          logger.warn('scheduleRetry hook: parent issue not in pending_issues', { key });
+          return;
+        }
+        const target = this.buildRepoTargetForAlias(alias, issue);
+        this.scheduleRetry(issue, target, attempt, null, delayMs);
+      },
+      createBlocker: async () => {
+        throw new Error('createBlocker hook not yet wired (gate handler still uses inline logic)');
+      },
+      createSubIssue: async () => {
+        throw new Error('createSubIssue hook not yet wired (dispatch path still uses inline logic)');
+      },
     });
   }
 
@@ -1069,6 +1115,20 @@ export class Orchestrator {
   }
 
   // ─── worker exit ─────────────────────────────────────────────────────────
+  /**
+   * Worker exit handler. Determines the appropriate target state machine event
+   * (worker_succeeded / worker_failed) and drives the transition through
+   * targetTransition + EffectApplier. The supervised-gate special case (Archon
+   * exited 0 but is actually paused) is handled inline before the SM call,
+   * because handleGatePaused does plan-fetch + commenting work the SM doesn't
+   * yet model.
+   *
+   * Legacy bookkeeping kept outside the SM:
+   *   - session.stopPoller() and state.running.delete() — session lifecycle
+   *   - state.completed.add() — used by shouldDispatch and executeRetry
+   *   - 1s "verify" continuation retry (Section 9.4) on success
+   *   - promoteQueuedSiblings + maybeReleaseClaim — parent-state coordination
+   */
   private async handleWorkerExit(
     issue: Issue,
     target: RepoTarget,
@@ -1079,30 +1139,12 @@ export class Orchestrator {
     const session = this.state.running.get(key);
     const subIssueId = session?.sub_issue_id ?? this.state.sibling_subissues.get(issue.id)?.get(target.repo_alias) ?? null;
     const targetId = subIssueId ?? issue.id;
+    const dbRunId = session?.archon_db_run_id ?? null;
 
-    if (event.type === 'archon_succeeded') {
-      // The Archon CLI exits 0 when a workflow pauses at an approval gate, not just when it
-      // truly completes. Check the actual run status before treating as done.
-      const dbRunId = session?.archon_db_run_id ?? null;
-
-      // If we never captured a workflowRunId, the process exited without running a workflow
-      // (e.g. approve command stored approval but resume failed, or process crashed before
-      // workflow_starting log line). Treat as abnormal exit so the issue is retried, not completed.
-      if (!dbRunId) {
-        session?.stopPoller?.();
-        this.state.running.delete(key);
-        try {
-          await this.tracker.removeLabel(targetId, this.cfg.tracker.gaggle_labels.running);
-        } catch { /* ignore */ }
-        const nextAttempt = (attempt ?? 0) + 1;
-        this.scheduleRetry(issue, target, nextAttempt, 'archon_succeeded_without_run_id');
-        logger.warn('Worker exited 0 but never emitted workflowRunId — treating as failure', {
-          issue_id: issue.id, repo_alias: target.repo_alias,
-        });
-        await this.maybeReleaseClaim(issue.id);
-        return;
-      }
-
+    // Pre-SM: detect the gate-pause-disguised-as-success case and defer to the
+    // gate handler. The Archon CLI exits 0 when the workflow pauses at an
+    // approval gate; we must distinguish that from a true completion.
+    if (event.type === 'archon_succeeded' && dbRunId) {
       try {
         const runDetail = await this.archon.getRunDetail(dbRunId);
         const run = runDetail?.run;
@@ -1118,50 +1160,58 @@ export class Orchestrator {
           return;
         }
       } catch {
-        // Can't verify — fall through to success handling
+        // Can't verify — fall through to the regular success/failure flow.
       }
+    }
 
-      session?.stopPoller?.();
-      this.state.running.delete(key);
+    // Choose the SM event. `archon_succeeded` without a run id means the
+    // process never emitted workflow_starting → treat as a failure so we retry.
+    let smEvent: TargetEvent;
+    if (event.type === 'archon_succeeded' && dbRunId) {
+      smEvent = { kind: 'worker_succeeded' };
+    } else if (event.type === 'archon_succeeded') {
+      smEvent = { kind: 'worker_failed', reason: 'archon_succeeded_without_run_id' };
+    } else {
+      smEvent = { kind: 'worker_failed', reason: event.type };
+    }
+
+    // Session lifecycle is not modeled by the SM.
+    session?.stopPoller?.();
+    this.state.running.delete(key);
+
+    const ctx: TargetTransitionContext = {
+      cfg: this.cfg,
+      identity: {
+        parent_issue_id: issue.id,
+        repo_alias: target.repo_alias,
+        target_issue_id: targetId,
+      },
+      parent_issue: issue,
+      target,
+      siblings: new Map(), // not consulted by running → succeeded/retrying transitions
+      attempt: attempt ?? 0,
+    };
+    const transition = targetTransition('running', smEvent, ctx);
+    await this.effectApplier.applyAll(transition.effects);
+
+    if (transition.to === 'succeeded') {
       this.state.completed.add(key);
-      try {
-        await this.tracker.removeLabel(targetId, this.cfg.tracker.gaggle_labels.running);
-      } catch {
-        /* ignore */
-      }
-      try {
-        await this.tracker.updateIssueState(targetId, completedState(this.cfg));
-      } catch {
-        /* ignore */
-      }
-      // Continuation retry per Section 9.4 (1s, attempt 1) — represents the "verify" pass
+      // Continuation retry per Section 9.4 (1s, attempt 1) — represents the
+      // "verify" pass. Not yet modeled by the SM.
       this.scheduleRetry(issue, target, 1, null, 1000);
       logger.info('Worker succeeded', {
         issue_id: issue.id,
         issue_identifier: issue.identifier,
         repo_alias: target.repo_alias,
       });
+      await this.promoteQueuedSiblings(issue);
     } else {
-      session?.stopPoller?.();
-      this.state.running.delete(key);
-      try {
-        await this.tracker.removeLabel(targetId, this.cfg.tracker.gaggle_labels.running);
-      } catch {
-        /* ignore */
-      }
-      const nextAttempt = (attempt ?? 0) + 1;
-      this.scheduleRetry(issue, target, nextAttempt, event.type);
       logger.warn('Worker exited abnormally', {
         issue_id: issue.id,
         repo_alias: target.repo_alias,
         type: event.type,
-        next_attempt: nextAttempt,
+        next_attempt: (attempt ?? 0) + 1,
       });
-    }
-
-    // Fast-path promotion: immediately dispatch any sibling sub-issues whose blockers are now satisfied.
-    if (event.type === 'archon_succeeded') {
-      await this.promoteQueuedSiblings(issue);
     }
 
     await this.maybeReleaseClaim(issue.id);
@@ -1357,6 +1407,13 @@ export class Orchestrator {
     const subIssueId = this.state.sibling_subissues.get(issue.id)?.get(target.repo_alias) ?? null;
     const targetId = subIssueId ?? issue.id;
 
+    // worker_failed → retrying applies gaggle:retrying via the SM; remove it
+    // now that we're moving back to dispatching/running. Cheap no-op if absent.
+    try {
+      await this.tracker.removeLabel(targetId, 'gaggle:retrying');
+    } catch {
+      /* ignore */
+    }
     try {
       await this.tracker.applyLabel(targetId, this.cfg.tracker.gaggle_labels.running);
     } catch {

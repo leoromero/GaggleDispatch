@@ -65,7 +65,7 @@ function makeApplier(overrides: { archonShouldThrow?: boolean } = {}) {
     registryBaseFolder: baseFolder,
     spawnWorker: async (args) => { calls.push({ op: 'spawnWorker', args: [args] }); },
     cancelWorker: (key) => { calls.push({ op: 'cancelWorker', args: [key] }); },
-    scheduleRetry: (key, delayMs) => { calls.push({ op: 'scheduleRetry', args: [key, delayMs] }); },
+    scheduleRetry: (key, delayMs, attempt) => { calls.push({ op: 'scheduleRetry', args: [key, delayMs, attempt] }); },
     createBlocker: async (spec, blocksId) => { calls.push({ op: 'createBlocker', args: [spec, blocksId] }); },
     createSubIssue: async (parentId, target) => { calls.push({ op: 'createSubIssue', args: [parentId, target.repo_alias] }); },
   };
@@ -254,10 +254,10 @@ describe('EffectApplier: persistence', () => {
 // ─── Timers & in-memory state ──────────────────────────────────────────────
 
 describe('EffectApplier: timers & in-memory state', () => {
-  test('schedule_retry_timer → hook', async () => {
+  test('schedule_retry_timer → hook with attempt', async () => {
     const { applier, calls } = makeApplier();
-    await applier.apply({ kind: 'schedule_retry_timer', key: 'p1__trialmatch-be', delay_ms: 5_000 });
-    expect(hasCall(calls, 'scheduleRetry', ['p1__trialmatch-be', 5_000])).toBe(true);
+    await applier.apply({ kind: 'schedule_retry_timer', key: 'p1__trialmatch-be', delay_ms: 5_000, attempt: 2 });
+    expect(hasCall(calls, 'scheduleRetry', ['p1__trialmatch-be', 5_000, 2])).toBe(true);
   });
 
   test('register_supervised_gate adds an entry to state.supervised_gates', async () => {
