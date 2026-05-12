@@ -12,7 +12,8 @@
  */
 
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
-import { mkdirSync, rmSync } from 'node:fs';
+import { mkdirSync, rmSync, readFileSync } from 'node:fs';
+import { join } from 'node:path';
 import { Orchestrator } from '../orchestrator/orchestrator.ts';
 import type { LinearClient } from '../tracker/linear.ts';
 import type { IssueAnalyzer } from '../analyzer/issue-analyzer.ts';
@@ -23,7 +24,7 @@ import type {
   RegistryContext,
   ServiceConfig,
 } from '../domain/types.ts';
-import { writeRunEntry } from '../registry/run-registry.ts';
+import { writeRunEntry, writeRetryEntry } from '../registry/run-registry.ts';
 import { ArchonClient, type ArchonRunRecord } from '../executor/archon-client.ts';
 import { makeIssue, makeRegistryContext, makeServiceConfig, makeRepoTarget } from './helpers/fixtures.ts';
 
@@ -720,6 +721,74 @@ describe('crash recovery — recoverFromLinearLabels', () => {
     expect(gate).toBeDefined();
     expect(gate?.repo_alias).toBe('trialmatch-be');
     expect(gate?.sub_issue_id).toBe('sub-be');
+  });
+
+  test('retrying sub-issue with persisted retry → timer rescheduled with persisted attempt', async () => {
+    const BASE = mkdirSync(`/tmp/gaggle-test-retry-${Date.now()}`, { recursive: true }) as unknown as string ?? `/tmp/gaggle-test-retry-${Date.now()}`;
+    const WORKER_KEY = 'p1__trialmatch-be';
+    try {
+      // Pre-populate the retry registry with attempt=3 due in the past
+      // (should reschedule with delay=0, attempt preserved).
+      writeRetryEntry(BASE, WORKER_KEY, {
+        parent_issue_id: 'p1',
+        sub_issue_id: 'sub-be',
+        repo_alias: 'trialmatch-be',
+        attempt: 3,
+        due_at_ms: Date.now() - 10_000,
+        reason: 'previous_crash',
+      });
+
+      const parent = makeIssue({ id: 'p1', identifier: 'SYM-100', parent_id: null, state: 'In Progress', labels: ['gaggle:claimed'] });
+      const retryingSub = makeIssue({
+        id: 'sub-be', identifier: 'SYM-101', parent_id: 'p1',
+        title: '[trialmatch-be] Fix the feature',
+        state: 'In Progress', labels: ['gaggle:retrying'],
+      });
+      const { o } = makeRecoveryOrchestrator({
+        'gaggle:claimed': [parent],
+        'gaggle:running': [],
+        'gaggle:queued': [],
+        'gaggle:waiting-human': [],
+        'gaggle:retrying': [retryingSub],
+      }, { baseFolder: BASE });
+
+      await o.start();
+
+      const entry = o.getState().retry_attempts.get(WORKER_KEY);
+      expect(entry).toBeDefined();
+      expect(entry?.attempt).toBe(3);
+      expect(o.getState().sibling_subissues.get('p1')?.get('trialmatch-be')).toBe('sub-be');
+      // Parent issue snapshot must be populated for the spawnWorker hook to work later.
+      expect(o.getState().pending_issues.has('p1')).toBe(true);
+    } finally {
+      rmSync(BASE, { recursive: true, force: true });
+    }
+  });
+
+  test('orphaned retry entries (persisted but no matching label) are pruned', async () => {
+    const BASE = mkdirSync(`/tmp/gaggle-test-orphan-retry-${Date.now()}`, { recursive: true }) as unknown as string ?? `/tmp/gaggle-test-orphan-retry-${Date.now()}`;
+    try {
+      // Persist a retry entry but DO NOT label any issue gaggle:retrying.
+      writeRetryEntry(BASE, 'p1__stale', {
+        parent_issue_id: 'p1', sub_issue_id: 'stale-sub', repo_alias: 'stale',
+        attempt: 2, due_at_ms: Date.now(), reason: null,
+      });
+
+      const { o } = makeRecoveryOrchestrator({
+        'gaggle:claimed': [],
+        'gaggle:running': [],
+        'gaggle:queued': [],
+        'gaggle:waiting-human': [],
+        'gaggle:retrying': [],
+      }, { baseFolder: BASE });
+
+      await o.start();
+      // The orphaned entry should have been deleted by recoverRetryingIssues.
+      const remaining = JSON.parse(readFileSync(join(BASE, 'gaggle-runs.json'), 'utf8')) as { retries: Record<string, unknown> };
+      expect(remaining.retries['p1__stale']).toBeUndefined();
+    } finally {
+      rmSync(BASE, { recursive: true, force: true });
+    }
   });
 
   test('running sub-issue with persisted run id → matched by exact id, tracked as detached', async () => {

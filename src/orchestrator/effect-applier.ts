@@ -25,7 +25,7 @@ import type { Issue, OrchestratorState, RepoTarget, ServiceConfig } from '../dom
 import type { LinearClient } from '../tracker/linear.ts';
 import type { ArchonClient } from '../executor/archon-client.ts';
 import type { WorkspaceManager } from '../workspace/workspace-manager.ts';
-import { writeRunEntry, deleteRunEntry } from '../registry/run-registry.ts';
+import { writeRunEntry, deleteRunEntry, writeRetryEntry, deleteRetryEntry } from '../registry/run-registry.ts';
 import { workerKey as makeWorkerKey } from './state.ts';
 import { logger } from '../util/logger.ts';
 import type { BlockerSpec, Effect, TargetIdentity, WorkerKey } from './state-machine.ts';
@@ -168,18 +168,31 @@ export class EffectApplier {
       case 'delete_run':
         deleteRunEntry(this.deps.registryBaseFolder, effect.key);
         return;
-      case 'persist_retry':
-        // Retry persistence requires extending run-registry; tracked for the
-        // integration phase. No-op for now — retries survive within a single
-        // orchestrator process, same as today.
-        logger.debug('persist_retry (registry extension pending)', {
-          key: effect.key,
+      case 'persist_retry': {
+        // Resolve sub_issue_id / repo_alias from the WorkerKey + in-memory
+        // sibling map so the retry entry is self-describing and recovery can
+        // schedule the next retry without consulting other state.
+        const sep = effect.key.indexOf('__');
+        if (sep < 0) {
+          logger.warn('persist_retry: malformed WorkerKey', { key: effect.key });
+          return;
+        }
+        const parent_issue_id = effect.key.slice(0, sep);
+        const repo_alias = effect.key.slice(sep + 2);
+        const sub_issue_id =
+          this.deps.state.sibling_subissues.get(parent_issue_id)?.get(repo_alias) ?? null;
+        writeRetryEntry(this.deps.registryBaseFolder, effect.key, {
+          parent_issue_id,
+          sub_issue_id,
+          repo_alias,
           attempt: effect.meta.attempt,
           due_at_ms: effect.meta.due_at_ms,
+          reason: effect.meta.reason,
         });
         return;
+      }
       case 'delete_retry':
-        logger.debug('delete_retry (registry extension pending)', { key: effect.key });
+        deleteRetryEntry(this.deps.registryBaseFolder, effect.key);
         return;
 
       // ─── Timers ────────────────────────────────────────────────────────

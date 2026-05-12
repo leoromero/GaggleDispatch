@@ -240,14 +240,32 @@ describe('EffectApplier: persistence', () => {
     expect(data.entries['p1__trialmatch-be']).toBeUndefined();
   });
 
-  test('persist_retry is currently a no-op (logs only)', async () => {
-    const { applier } = makeApplier();
-    // Should not throw
+  test('persist_retry writes a retry entry to gaggle-runs.json', async () => {
+    const { applier, baseFolder, state } = makeApplier();
+    // Set up sibling_subissues so the applier can resolve sub_issue_id.
+    state.sibling_subissues.set('p1', new Map([['trialmatch-be', 'sub-be']]));
     await applier.apply({
       kind: 'persist_retry',
       key: 'p1__trialmatch-be',
-      meta: { attempt: 2, due_at_ms: Date.now() + 10_000, reason: 'crash' },
+      meta: { attempt: 2, due_at_ms: 1_700_000_000_000, reason: 'crash' },
     });
+    const file = join(baseFolder, 'gaggle-runs.json');
+    expect(existsSync(file)).toBe(true);
+    const data = JSON.parse(readFileSync(file, 'utf8')) as { retries: Record<string, { attempt: number; sub_issue_id: string | null }> };
+    expect(data.retries['p1__trialmatch-be'].attempt).toBe(2);
+    expect(data.retries['p1__trialmatch-be'].sub_issue_id).toBe('sub-be');
+  });
+
+  test('delete_retry removes the entry', async () => {
+    const { applier, baseFolder } = makeApplier();
+    await applier.apply({
+      kind: 'persist_retry',
+      key: 'p1__trialmatch-be',
+      meta: { attempt: 2, due_at_ms: 100, reason: 'x' },
+    });
+    await applier.apply({ kind: 'delete_retry', key: 'p1__trialmatch-be' });
+    const data = JSON.parse(readFileSync(join(baseFolder, 'gaggle-runs.json'), 'utf8')) as { retries: Record<string, unknown> };
+    expect(data.retries['p1__trialmatch-be']).toBeUndefined();
   });
 });
 

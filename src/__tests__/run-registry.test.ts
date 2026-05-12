@@ -12,6 +12,10 @@ import {
   readRunEntry,
   deleteRunEntry,
   allRunEntries,
+  writeRetryEntry,
+  readRetryEntry,
+  deleteRetryEntry,
+  allRetryEntries,
 } from '../registry/run-registry.ts';
 
 let tmpDir: string;
@@ -124,5 +128,53 @@ describe('run-registry', () => {
     expect(() => JSON.parse(raw)).not.toThrow();
     const parsed = JSON.parse(raw) as { entries: Record<string, unknown> };
     expect(Object.keys(parsed.entries)).toEqual(['k2', 'k3']);
+  });
+});
+
+describe('retry-registry', () => {
+  test('returns null for an unknown retry key', () => {
+    expect(readRetryEntry(tmpDir, 'SYM-1__myrepo')).toBeNull();
+  });
+
+  test('allRetryEntries returns empty object when file does not exist', () => {
+    expect(allRetryEntries(tmpDir)).toEqual({});
+  });
+
+  test('writeRetryEntry persists attempt + due_at_ms + reason', () => {
+    writeRetryEntry(tmpDir, 'SYM-1__be', {
+      parent_issue_id: 'p1', sub_issue_id: 'sub-be', repo_alias: 'be',
+      attempt: 3, due_at_ms: 1_700_000_000_000, reason: 'crash',
+    });
+    const entry = readRetryEntry(tmpDir, 'SYM-1__be');
+    expect(entry?.attempt).toBe(3);
+    expect(entry?.due_at_ms).toBe(1_700_000_000_000);
+    expect(entry?.reason).toBe('crash');
+    expect(typeof entry?.updated_at).toBe('string');
+  });
+
+  test('deleteRetryEntry removes the entry', () => {
+    writeRetryEntry(tmpDir, 'k1', { parent_issue_id: 'p', sub_issue_id: null, repo_alias: 'r', attempt: 1, due_at_ms: 1, reason: null });
+    expect(readRetryEntry(tmpDir, 'k1')).not.toBeNull();
+    deleteRetryEntry(tmpDir, 'k1');
+    expect(readRetryEntry(tmpDir, 'k1')).toBeNull();
+  });
+
+  test('retry and run entries coexist in the same file under different maps', () => {
+    writeRunEntry(tmpDir, 'k1', { archon_run_id: 'a', parent_issue_id: 'p', sub_issue_id: null, repo_alias: 'r' });
+    writeRetryEntry(tmpDir, 'k1', { parent_issue_id: 'p', sub_issue_id: null, repo_alias: 'r', attempt: 2, due_at_ms: 100, reason: 'x' });
+    expect(readRunEntry(tmpDir, 'k1')?.archon_run_id).toBe('a');
+    expect(readRetryEntry(tmpDir, 'k1')?.attempt).toBe(2);
+    // Independent lifecycles
+    deleteRunEntry(tmpDir, 'k1');
+    expect(readRunEntry(tmpDir, 'k1')).toBeNull();
+    expect(readRetryEntry(tmpDir, 'k1')?.attempt).toBe(2);
+  });
+
+  test('writeRetryEntry overwrites an existing entry for the same key', () => {
+    writeRetryEntry(tmpDir, 'k1', { parent_issue_id: 'p', sub_issue_id: null, repo_alias: 'r', attempt: 1, due_at_ms: 1, reason: 'a' });
+    writeRetryEntry(tmpDir, 'k1', { parent_issue_id: 'p', sub_issue_id: null, repo_alias: 'r', attempt: 5, due_at_ms: 999, reason: 'b' });
+    const entry = readRetryEntry(tmpDir, 'k1');
+    expect(entry?.attempt).toBe(5);
+    expect(entry?.reason).toBe('b');
   });
 });

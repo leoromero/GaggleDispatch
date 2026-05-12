@@ -43,7 +43,7 @@ import { blockersSatisfied, repoTargetReady } from './readiness.ts';
 import { defaultGateResumeState, completedState } from '../config/service-config.ts';
 import type { RegistryLoaderHandle } from '../registry/loader.ts';
 import type { SyncerHandle } from '../registry/repo-syncer.ts';
-import { writeRunEntry, deleteRunEntry, allRunEntries } from '../registry/run-registry.ts';
+import { writeRunEntry, deleteRunEntry, allRunEntries, allRetryEntries, deleteRetryEntry } from '../registry/run-registry.ts';
 import { classifyGateReply, type GateClassification } from './gate-classifier.ts';
 import {
   classifyTargetState,
@@ -62,9 +62,11 @@ interface RecoveryContext {
   runningIssues: Issue[];
   queuedIssues: Issue[];
   waitingIssues: Issue[];
+  retryingIssues: Issue[];
   archonRuns: ArchonRunRecord[];
   archonRunsById: Map<string, ArchonRunRecord>;
   persistedRunIds: ReturnType<typeof allRunEntries>;
+  persistedRetries: ReturnType<typeof allRetryEntries>;
 }
 
 export interface OrchestratorDeps {
@@ -1587,6 +1589,7 @@ export class Orchestrator {
       this.recoverClaimedParents(ctx);
       await this.recoverRunningIssues(ctx);
       await this.recoverQueuedIssues(ctx);
+      await this.recoverRetryingIssues(ctx);
       await this.releaseOrphanedClaims(ctx);
       this.recoverWaitingIssues(ctx);
     } catch (err) {
@@ -1595,26 +1598,35 @@ export class Orchestrator {
   }
 
   private async loadRecoveryContext(): Promise<RecoveryContext> {
-    const [claimedIssues, runningIssues, queuedIssues, waitingIssues, archonRuns] = await Promise.all([
+    const [claimedIssues, runningIssues, queuedIssues, waitingIssues, retryingIssues, archonRuns] = await Promise.all([
       this.tracker.fetchIssuesByLabel(this.cfg.tracker.gaggle_labels.claimed),
       this.tracker.fetchIssuesByLabel(this.cfg.tracker.gaggle_labels.running),
       this.tracker.fetchIssuesByLabel(this.cfg.tracker.gaggle_labels.queued),
       this.tracker.fetchIssuesByLabel(this.cfg.tracker.gaggle_labels.waiting_human),
+      this.tracker.fetchIssuesByLabel(this.cfg.tracker.gaggle_labels.retrying),
       this.archon.listRuns(),
     ]);
     const persistedRunIds = allRunEntries(this.cfg.registry.base_folder);
+    const persistedRetries = allRetryEntries(this.cfg.registry.base_folder);
     const archonRunsById = new Map<string, ArchonRunRecord>(archonRuns.map((r) => [r.id, r]));
     logger.info('Archon status snapshot at startup', {
       total_runs: archonRuns.length,
       persisted_run_ids: Object.keys(persistedRunIds).length,
+      persisted_retries: Object.keys(persistedRetries).length,
     });
-    return { claimedIssues, runningIssues, queuedIssues, waitingIssues, archonRuns, archonRunsById, persistedRunIds };
+    return { claimedIssues, runningIssues, queuedIssues, waitingIssues, retryingIssues, archonRuns, archonRunsById, persistedRunIds, persistedRetries };
   }
 
   private recoverClaimedParents(ctx: RecoveryContext): void {
     for (const issue of ctx.claimedIssues) {
-      // Only mark as claimed if it's a parent (no parent_id)
-      if (!issue.parent_id) this.state.claimed.add(issue.id);
+      // Only mark as claimed if it's a parent (no parent_id). Also stash the
+      // Issue snapshot in pending_issues so later recovery passes — and the
+      // EffectApplier's spawnWorker / scheduleRetry hooks — can resolve the
+      // parent without a Linear round-trip.
+      if (!issue.parent_id) {
+        this.state.claimed.add(issue.id);
+        this.state.pending_issues.set(issue.id, issue);
+      }
     }
   }
 
@@ -1653,7 +1665,7 @@ export class Orchestrator {
         target_labels: new Set(['gaggle:running']),
         linear_state: issue.state ?? '',
         archon_run: archonRun,
-        persisted_retry: null, // retry-registry extension pending
+        persisted_retry: ctx.persistedRetries[workerKey(parentId, aliasGuess ?? '')] ?? null,
       });
 
       // Without an alias the classifier still works, but the recovery handlers
@@ -1777,6 +1789,98 @@ export class Orchestrator {
       if (parentIssue) {
         this.state.pending_issues.set(parentId, parentIssue);
         await this.promoteQueuedSiblings(parentIssue);
+      }
+    }
+  }
+
+  /**
+   * Restore retry timers for targets that were in `retrying` state when the
+   * orchestrator crashed. Reads the persisted retry-registry and reschedules
+   * each entry's timer at `max(0, due_at_ms - now)`, preserving the original
+   * attempt count and back-off schedule.
+   *
+   * Entries whose corresponding issue no longer carries gaggle:retrying are
+   * deleted from disk (orphaned, e.g. user manually cleared the label).
+   */
+  private async recoverRetryingIssues(ctx: RecoveryContext): Promise<void> {
+    const retryIssueIds = new Set(ctx.retryingIssues.map((i) => i.id));
+
+    for (const issue of ctx.retryingIssues) {
+      if (!this.cfg.tracker.active_states.includes(issue.state ?? '')) {
+        try {
+          await this.tracker.removeLabel(issue.id, this.cfg.tracker.gaggle_labels.retrying);
+        } catch { /* ignore */ }
+        continue;
+      }
+
+      const parentId = issue.parent_id ?? issue.id;
+      const aliasFromTitle = this.parseAliasFromTitle(issue.title);
+      // Fall back to looking up the alias via the persisted retry entry by
+      // sub_issue_id (for cases where the issue title carries no [alias]
+      // prefix because it IS the parent in a mono-repo setup).
+      let alias: string | null = aliasFromTitle;
+      if (!alias) {
+        const entry = Object.values(ctx.persistedRetries).find(
+          (e) => e.parent_issue_id === parentId && (e.sub_issue_id === null || e.sub_issue_id === issue.id),
+        );
+        alias = entry?.repo_alias ?? null;
+      }
+      if (!alias) {
+        logger.warn('Recovered retrying issue with no resolvable alias; skipping', {
+          issue_id: issue.id, issue_identifier: issue.identifier,
+        });
+        continue;
+      }
+
+      const key = workerKey(parentId, alias);
+      const retry = ctx.persistedRetries[key];
+
+      // Register in sibling map so downstream coordination sees this target.
+      let sibMap = this.state.sibling_subissues.get(parentId);
+      if (!sibMap) { sibMap = new Map(); this.state.sibling_subissues.set(parentId, sibMap); }
+      sibMap.set(alias, issue.id);
+
+      // Resolve the parent Issue snapshot (needed by the spawnWorker hook).
+      let parentIssue = this.state.pending_issues.get(parentId);
+      if (!parentIssue) {
+        if (parentId === issue.id) {
+          parentIssue = issue;
+        } else {
+          try {
+            const fetched = await this.tracker.fetchIssueStatesByIds([parentId]);
+            parentIssue = fetched[0];
+          } catch { /* ignore */ }
+        }
+      }
+      if (!parentIssue) {
+        logger.warn('Cannot resolve parent issue for retrying target; skipping', {
+          retrying_issue_id: issue.id, parent_id: parentId,
+        });
+        continue;
+      }
+      this.state.pending_issues.set(parentId, parentIssue);
+
+      const target = this.buildRepoTargetForAlias(alias, parentIssue);
+      const attempt = retry?.attempt ?? 1;
+      const reason = retry?.reason ?? 'recovered_from_disk';
+      const delay = retry ? Math.max(0, retry.due_at_ms - Date.now()) : 0;
+
+      this.scheduleRetry(parentIssue, target, attempt, reason, delay);
+      logger.info('Recovered retrying target — retry timer rescheduled', {
+        issue_identifier: issue.identifier,
+        parent_id: parentId,
+        repo_alias: alias,
+        attempt,
+        delay_ms: delay,
+      });
+    }
+
+    // Clean up orphaned retry entries — persisted but no matching label.
+    for (const [retryKey, entry] of Object.entries(ctx.persistedRetries)) {
+      const targetIssueId = entry.sub_issue_id ?? entry.parent_issue_id;
+      if (!retryIssueIds.has(targetIssueId)) {
+        deleteRetryEntry(this.cfg.registry.base_folder, retryKey);
+        logger.info('Pruned orphaned retry entry', { key: retryKey });
       }
     }
   }
