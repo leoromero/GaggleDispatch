@@ -481,7 +481,7 @@ describe('shouldDispatch eligibility', () => {
     const issue = makeIssue({ id: 'i1', state: 'In Progress' });
     const { o, calls } = makeDispatchOrchestrator([issue]);
     // Pre-populate completed set as if this issue was already worked on
-    o.getState().completed.add('i1__repo-a');
+    o.getState().target_machine_states.set('i1__repo-a', 'succeeded');
     await runTick(o);
     expect(calls.some((c) => c.op === 'analyze')).toBe(false);
     expect(calls.some((c) => c.op === 'applyLabel' && (c.args[1] as string).includes('claimed'))).toBe(false);
@@ -1086,7 +1086,7 @@ describe('shouldDispatchSubIssue eligibility', () => {
       blocked_by: [],
     });
     const { o } = makeDispatchOrchestrator([sub]);
-    o.getState().completed.add('p1__trialmatch-be');
+    o.getState().target_machine_states.set('p1__trialmatch-be', 'succeeded');
     const result = (o as unknown as { shouldDispatchSubIssue(i: typeof sub): boolean }).shouldDispatchSubIssue(sub);
     expect(result).toBe(false);
   });
@@ -1126,8 +1126,8 @@ describe('reconcileRunningIssues — detached run transitions', () => {
     expect(state.detached_archon_runs.size).toBe(0);
     // Marked completed in Linear
     expect(calls.some((c) => c.op === 'updateIssueState' && c.args[0] === 'sub-be' && c.args[1] === 'Done')).toBe(true);
-    // Added to completed set
-    expect(state.completed.has('p1__trialmatch-be')).toBe(true);
+    // Recorded as succeeded in the SM state map
+    expect(state.target_machine_states.get('p1__trialmatch-be')).toBe('succeeded');
   });
 
   test('failed detached run → sub-issue re-queued', async () => {
@@ -1356,7 +1356,7 @@ describe('scheduleRetry — max retries and completed guard', () => {
     const state = o.getState();
     state.claimed.add('p1');
     state.pending_issues.set('p1', issue);
-    state.completed.add('p1__trialmatch-be');
+    state.target_machine_states.set('p1__trialmatch-be', 'succeeded');
 
     await (o as unknown as { executeRetry(k: string, i: typeof issue, t: typeof target, a: number): Promise<void> })
       .executeRetry('p1__trialmatch-be', issue, target, 1);

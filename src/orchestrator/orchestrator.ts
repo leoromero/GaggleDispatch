@@ -331,8 +331,8 @@ export class Orchestrator {
       if (key.startsWith(issue.id + '__')) return false;
     }
     // If any target for this issue was already completed this session, skip re-dispatch.
-    for (const key of this.state.completed) {
-      if (key.startsWith(issue.id + '__')) return false;
+    for (const [key, smState] of this.state.target_machine_states) {
+      if (smState === 'succeeded' && key.startsWith(issue.id + '__')) return false;
     }
     if (!blockersSatisfied(issue.blocked_by, this.cfg)) return false;
 
@@ -360,7 +360,7 @@ export class Orchestrator {
     const parentId = issue.parent_id!;
     const key = workerKey(parentId, alias);
     if (this.state.running.has(key)) return false;
-    if (this.state.completed.has(key)) return false;
+    if (this.state.target_machine_states.get(key) === 'succeeded') return false;
     // Native Linear blockers must be satisfied (set via createBlockerRelation).
     if (!blockersSatisfied(issue.blocked_by, this.cfg)) return false;
     return true;
@@ -1152,7 +1152,8 @@ export class Orchestrator {
    *
    * Legacy bookkeeping kept outside the SM:
    *   - session.stopPoller() and state.running.delete() — session lifecycle
-   *   - state.completed.add() — used by shouldDispatch and executeRetry
+   *   - target_machine_states['succeeded'] — populated by emitTargetEvent;
+   *     queried by shouldDispatch / executeRetry / releaseOrphanedClaims
    *   - 1s "verify" continuation retry (Section 9.4) on success
    *   - promoteQueuedSiblings + maybeReleaseClaim — parent-state coordination
    */
@@ -1221,7 +1222,7 @@ export class Orchestrator {
     const transition = await this.emitTargetEvent('running', smEvent, ctx);
 
     if (transition.to === 'succeeded') {
-      this.state.completed.add(key);
+      // target_machine_states is already populated by emitTargetEvent above.
       // Continuation retry per Section 9.4 (1s, attempt 1) — represents the
       // "verify" pass. Not yet modeled by the SM.
       this.scheduleRetry(issue, target, 1, null, 1000);
@@ -1266,7 +1267,7 @@ export class Orchestrator {
       const alias = this.parseAliasFromTitle(sub.title);
       if (!alias) continue;
       const key = workerKey(parentIssue.id, alias);
-      if (this.state.running.has(key) || this.state.completed.has(key)) continue;
+      if (this.state.running.has(key) || this.state.target_machine_states.get(key) === 'succeeded') continue;
 
       if (availableSlots(this.state) === 0) {
         logger.info('No slots to promote queued sibling; will retry next tick', {
@@ -1388,7 +1389,7 @@ export class Orchestrator {
 
     // If Archon already succeeded for this (issue, repo) pair, the sub-issue was marked Done.
     // Do not re-dispatch — release the claim and stop.
-    if (this.state.completed.has(key)) {
+    if (this.state.target_machine_states.get(key) === 'succeeded') {
       logger.info('Worker already completed successfully; skipping retry', {
         issue_id: issue.id,
         repo_alias: target.repo_alias,
@@ -1528,7 +1529,7 @@ export class Orchestrator {
         if (status === 'completed') {
           try { await this.tracker.removeLabel(targetId, this.cfg.tracker.gaggle_labels.running); } catch { /* ignore */ }
           try { await this.tracker.updateIssueState(targetId, completedState(this.cfg)); } catch { /* ignore */ }
-          this.state.completed.add(key);
+          this.state.target_machine_states.set(key, 'succeeded');
           logger.info('Detached Archon run completed — marked Done', {
             archon_run_id: det.archon_run_id,
             repo_alias: det.repo_alias,
@@ -1774,7 +1775,7 @@ export class Orchestrator {
           // Archon finished while we were down — mark target Done.
           try { await this.tracker.removeLabel(issue.id, this.cfg.tracker.gaggle_labels.running); } catch { /* ignore */ }
           try { await this.tracker.updateIssueState(issue.id, completedState(this.cfg)); } catch { /* ignore */ }
-          this.state.completed.add(workerKey(parentId, aliasGuess!));
+          this.state.target_machine_states.set(workerKey(parentId, aliasGuess!), 'succeeded');
           logger.info('Recovered: Archon completed while down — marked Done', {
             issue_identifier: issue.identifier,
             repo_alias: aliasGuess!,
@@ -1928,7 +1929,7 @@ export class Orchestrator {
     // Orphaned claimed parents: check whether all recovered siblings (if any) have already
     // completed.  Three cases:
     //   (a) Running sub whose Archon run completed → sibling_subissues IS populated but every
-    //       entry is in state.completed.  Work is done → release to terminal.
+    //       entry has target_machine_states === 'succeeded'.  Work is done → release to terminal.
     //   (b) No running/queued siblings at all but a persisted run entry shows Archon completed
     //       (crash after handleWorkerExit removed the running label but before
     //       maybeReleaseClaim) → release to terminal.
@@ -1939,7 +1940,7 @@ export class Orchestrator {
       // Skip parents that still have active siblings (running, queued, or awaiting gate).
       const allSibsCompleted =
         !sibMap || sibMap.size === 0 ||
-        [...sibMap.keys()].every((alias) => this.state.completed.has(workerKey(parentId, alias)));
+        [...sibMap.keys()].every((alias) => this.state.target_machine_states.get(workerKey(parentId, alias)) === 'succeeded');
       if (!allSibsCompleted) continue;
 
       // Determine whether actual work ran for this parent.
