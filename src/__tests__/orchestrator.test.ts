@@ -441,10 +441,10 @@ describe('shouldDispatch eligibility', () => {
     expect(calls.some((c) => c.op === 'analyze')).toBe(false);
   });
 
-  test('skips issues already in state.claimed', async () => {
+  test('skips issues with parent SM in claimed state', async () => {
     const issue = makeIssue({ id: 'i1', state: 'In Progress' });
     const { o, calls } = makeDispatchOrchestrator([issue]);
-    o.getState().claimed.add('i1');
+    o.getState().parent_machine_states.set('i1', 'claimed');
     await runTick(o);
     expect(calls.some((c) => c.op === 'analyze')).toBe(false);
   });

@@ -330,7 +330,7 @@ export class Orchestrator {
     if (issue.parent_id) return false;
     const gaggleLabels =Object.values(this.cfg.tracker.gaggle_labels).map((l) => l.toLowerCase());
     if (issue.labels.some((l) => gaggleLabels.includes(l))) return false;
-    if (this.state.claimed.has(issue.id)) return false;
+    if (this.isParentActive(issue.id)) return false;
     for (const key of this.state.running.keys()) {
       if (key.startsWith(issue.id + '__')) return false;
     }
@@ -569,11 +569,22 @@ export class Orchestrator {
     if (!sibMap) { sibMap = new Map(); this.state.sibling_subissues.set(parentId, sibMap); }
     sibMap.set(target.repo_alias, subIssue.id);
 
-    // Claim parent if not already done.
-    if (!this.state.claimed.has(parentId)) {
+    // Claim parent if not already active. Drive the parent SM unclaimed →
+    // claimed (the SM emits the apply_label effect); also keep legacy state.claimed
+    // in sync until phase 5e removes it.
+    if (!this.isParentActive(parentId)) {
       this.state.claimed.add(parentId);
       this.state.pending_issues.set(parentId, parentIssue);
-      try { await this.tracker.applyLabel(parentId, this.cfg.tracker.gaggle_labels.claimed); } catch { /* ignore */ }
+      const fromState = this.state.parent_machine_states.get(parentId) ?? 'unclaimed';
+      if (fromState === 'unclaimed' || fromState === 'analyzing') {
+        await this.emitParentEvent(fromState, { kind: 'analysis_succeeded', targets: [target] }, {
+          cfg: this.cfg,
+          parent_issue: parentIssue,
+          targets: new Map(),
+        });
+      } else {
+        try { await this.tracker.applyLabel(parentId, this.cfg.tracker.gaggle_labels.claimed); } catch { /* ignore */ }
+      }
     }
 
     await this.launchWorker(parentIssue, target, subIssue.id, null, subIssue.description ?? undefined);
@@ -1295,6 +1306,14 @@ export class Orchestrator {
     await this.maybeReleaseClaim(issue.id);
   }
 
+  /** A parent is "active" (currently being worked on) if its SM state is
+   *  either analyzing or claimed. Used by shouldDispatch and
+   *  dispatchSubIssueFromPoll to skip already-active parents. */
+  private isParentActive(parentId: string): boolean {
+    const s = this.state.parent_machine_states.get(parentId);
+    return s === 'analyzing' || s === 'claimed';
+  }
+
   /** Build a snapshot of `alias → TargetState` for every target known to the
    *  SM under the given parent, for use as the `targets` field of the parent
    *  TransitionContext. */
@@ -2002,7 +2021,11 @@ export class Orchestrator {
     //       maybeReleaseClaim) → release to terminal.
     //   (c) No siblings and no completed run → crash before the first worker was ever launched
     //       → un-claim only so the poll loop re-dispatches on the next tick.
-    for (const parentId of [...this.state.claimed]) {
+    const claimedParentIds: string[] = [];
+    for (const [pid, smState] of this.state.parent_machine_states) {
+      if (smState === 'claimed') claimedParentIds.push(pid);
+    }
+    for (const parentId of claimedParentIds) {
       const sibMap = this.state.sibling_subissues.get(parentId);
       // Skip parents that still have active siblings (running, queued, or awaiting gate).
       const allSibsCompleted =
@@ -2023,6 +2046,7 @@ export class Orchestrator {
       } else {
         logger.info('Orphaned claimed parent detected on startup (no work started) — un-claiming for re-dispatch', { parent_id: parentId });
         this.state.claimed.delete(parentId);
+        this.state.parent_machine_states.delete(parentId);
         this.state.pending_issues.delete(parentId);
         try { await this.tracker.removeLabel(parentId, this.cfg.tracker.gaggle_labels.claimed); } catch { /* ignore */ }
       }
