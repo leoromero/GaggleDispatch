@@ -100,6 +100,7 @@ The **Issue Analyzer** then sends Claude the full registry context (front matter
 |---|---|
 | `gaggle setup` | Interactive API key wizard (LINEAR_API_KEY, ANTHROPIC_API_KEY) |
 | `gaggle init` | Bootstrap WORKFLOW.md and workflow_templates/ |
+| `gaggle auth linear` | Run the Linear OAuth authorization flow (when `tracker.auth.mode: oauth`) |
 | `gaggle repo add <url>` | Register a repository in the Source Registry |
 | `gaggle repo remove <url\|slug>` | Deregister a repository (preserves local checkout) |
 | `gaggle repo list [--json]` | List registered repos with sync status |
@@ -114,12 +115,72 @@ All commands accept `--cwd <path>` to point at a different project directory.
 
 The CLI is the **only** sanctioned way to mutate `WORKFLOW.md`'s `repositories` list — operators must not hand-edit it. All mutating commands acquire an advisory lock at `<base_folder>/.gaggle.lock` (10s timeout, with informative holder messaging on contention).
 
-## Configuration cheatsheet (WORKFLOW.md)
+## Authenticating with Linear
+
+GaggleDispatch supports two ways of authenticating against the Linear API.
+
+### API key (default, simplest)
+
+Set `LINEAR_API_KEY` in your environment with a personal API key from Linear → Settings → API → Personal API keys. All API calls (comments, label changes, state transitions) are attributed to that user.
 
 ```yaml
 tracker:
   kind: linear
   api_key: $LINEAR_API_KEY
+  # auth section omitted — defaults to mode: api_key
+```
+
+### OAuth `actor=app` (recommended for teams)
+
+Acts as a dedicated OAuth application instead of impersonating a personal user. Comments and labels are attributed to the registered app with its own icon and name. Required for team-shared gaggles where you don't want every action coming from one person's account.
+
+**One-time setup**:
+
+1. **Register the OAuth app in Linear** — Settings → API → OAuth applications → Create new application. Set the redirect URI to `http://127.0.0.1:8765/oauth/callback` (or your own; whatever you register here must match `tracker.auth.redirect_uri` exactly).
+
+2. **Save the client_id and client_secret**. Export the secret:
+   ```bash
+   export LINEAR_OAUTH_CLIENT_SECRET=lin_oauth_csec_xxx
+   ```
+
+3. **Configure WORKFLOW.md**:
+   ```yaml
+   tracker:
+     kind: linear
+     # api_key still required for backward-compat (validation), but ignored when mode is oauth
+     api_key: $LINEAR_API_KEY
+     auth:
+       mode: oauth
+       client_id: lin_oauth_xxx
+       # client_secret defaults to $LINEAR_OAUTH_CLIENT_SECRET — env var picks it up
+       # redirect_uri defaults to http://127.0.0.1:8765/oauth/callback
+       # scopes defaults to [read, write]
+   ```
+
+4. **Authorize**:
+   ```bash
+   gaggle auth linear
+   ```
+   This opens your browser to Linear's authorize page, captures the redirect, exchanges the code for tokens, and stores them at `~/.config/gaggle/auth.json` (Unix) or `%APPDATA%\gaggle\auth.json` (Windows). The orchestrator refreshes the access token silently on every request — no further interaction is needed unless tokens are revoked.
+
+5. **Run the orchestrator**:
+   ```bash
+   gaggle start         # or gaggle hub start
+   ```
+
+**Troubleshooting**:
+
+- **`Port 8765 is already in use`** — another `gaggle init` or `gaggle auth linear` is running, or a stale process is bound to the port. Stop it and retry, or change `tracker.auth.redirect_uri` to a different port (and update the Linear OAuth app's registered redirect URI to match).
+- **`Linear OAuth tokens not found`** — run `gaggle auth linear` to authorize.
+- **`Linear HTTP 401` after working previously** — the refresh token was probably revoked in Linear admin. Re-run `gaggle auth linear`.
+- **Redirect URI mismatch** — the URI in `tracker.auth.redirect_uri` must match the one registered in your Linear OAuth app character-for-character, including the path and port.
+
+## Configuration cheatsheet (WORKFLOW.md)
+
+```yaml
+tracker:
+  kind: linear
+  api_key: $LINEAR_API_KEY                # used when auth.mode = api_key (default)
   project_slug: SYM                       # Linear team key
   active_states: [Todo, In Progress]
   terminal_states: [Done, Cancelled, Closed]
@@ -127,6 +188,12 @@ tracker:
   create_sub_issues: true                 # one sub-issue per repo on fan-out > 1
   gate_waiting_state: Waiting for Review  # parked lane on the board
   gate_resume_state: In Progress
+  auth:                                   # optional — omit for api_key mode
+    mode: oauth                           # api_key | oauth
+    client_id: lin_oauth_xxx              # from your Linear OAuth app
+    client_secret: $LINEAR_OAUTH_CLIENT_SECRET
+    redirect_uri: http://127.0.0.1:8765/oauth/callback
+    scopes: [read, write]
 
 polling:
   interval_ms: 30000

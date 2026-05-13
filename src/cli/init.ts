@@ -128,6 +128,37 @@ export async function runInit(opts: { cwd?: string }): Promise<void> {
   const defaultWorkflow = await readLine('Default Archon workflow', 'gaggle/gaggle-fix-issue');
   const analyzerModel = await readLine('Claude analyzer model', 'claude-sonnet-4-5');
 
+  // Linear auth mode. OAuth (actor=app) gives the gaggle a separate identity
+  // so comments/labels are attributed to the registered OAuth app instead of
+  // a personal user. API key still works for solo/local use.
+  console.log('');
+  console.log(chalk.dim('Linear authentication:'));
+  console.log(chalk.dim('  api_key  — uses $LINEAR_API_KEY (acts as the user who created the key)'));
+  console.log(chalk.dim('  oauth    — register a Linear OAuth app, acts as the app itself (recommended)'));
+  const authMode = (await readLine('Auth mode (api_key/oauth)', 'api_key')).toLowerCase();
+  let oauthBlock: Record<string, unknown> | null = null;
+  if (authMode === 'oauth') {
+    console.log('');
+    console.log(chalk.dim('First create an OAuth application in Linear:'));
+    console.log(chalk.dim('  Settings → API → OAuth applications → Create new application'));
+    console.log(chalk.dim('  Set the redirect URI to: http://127.0.0.1:8765/oauth/callback'));
+    console.log(chalk.dim('  (override below if you registered a different one)'));
+    console.log('');
+    const clientId = await readLine('  OAuth client_id (from Linear)');
+    if (!clientId) {
+      console.log(chalk.yellow('  No client_id provided — defaulting to api_key mode'));
+    } else {
+      const redirectUri = await readLine('  Redirect URI', 'http://127.0.0.1:8765/oauth/callback');
+      oauthBlock = {
+        mode: 'oauth',
+        client_id: clientId,
+        client_secret: '$LINEAR_OAUTH_CLIENT_SECRET',
+        redirect_uri: redirectUri,
+        scopes: ['read', 'write'],
+      };
+    }
+  }
+
   const config: Record<string, unknown> = {
     tracker: {
       kind: 'linear',
@@ -139,6 +170,7 @@ export async function runInit(opts: { cwd?: string }): Promise<void> {
       create_sub_issues: true,
       ...(gateWaitingState ? { gate_waiting_state: gateWaitingState } : {}),
       ...(gateResumeState ? { gate_resume_state: gateResumeState } : {}),
+      ...(oauthBlock ? { auth: oauthBlock } : {}),
     },
     polling: { interval_ms: 30_000 },
     workspace: { root: '~/gaggle_workspaces' },
@@ -205,9 +237,17 @@ export async function runInit(opts: { cwd?: string }): Promise<void> {
 
   console.log('');
   info('Next steps:');
-  console.log('  1. gaggle setup     # configure LINEAR_API_KEY and ANTHROPIC_API_KEY');
-  console.log('  2. gaggle sync      # clone repos and parse gaggle.md files');
-  console.log('  3. gaggle start     # start the orchestrator');
+  if (oauthBlock) {
+    console.log('  1. export LINEAR_OAUTH_CLIENT_SECRET=...   # from the Linear OAuth app');
+    console.log('  2. export ANTHROPIC_API_KEY=...');
+    console.log('  3. gaggle auth linear   # browser pops up; authorize the app');
+    console.log('  4. gaggle sync          # clone repos and parse gaggle.md files');
+    console.log('  5. gaggle start         # start the orchestrator');
+  } else {
+    console.log('  1. gaggle setup     # configure LINEAR_API_KEY and ANTHROPIC_API_KEY');
+    console.log('  2. gaggle sync      # clone repos and parse gaggle.md files');
+    console.log('  3. gaggle start     # start the orchestrator');
+  }
 
   closeRl();
 }
