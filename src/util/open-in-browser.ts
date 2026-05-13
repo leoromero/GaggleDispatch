@@ -10,10 +10,27 @@
 import { logger } from './logger.ts';
 
 export async function openInBrowser(url: string): Promise<void> {
-  const cmd =
-    process.platform === 'win32' ? ['cmd', '/c', 'start', '""', url] :
-    process.platform === 'darwin' ? ['open', url] :
-    ['xdg-open', url];
+  // Windows quirk: `cmd /c start <url>` treats & in the URL as a command
+  // separator, mangling OAuth URLs (the query string drops everything after
+  // the first param). Pass the full `start "" "<url>"` invocation as a
+  // single string after /c so cmd's own parser handles the quoting and
+  // preserves & inside the quoted URL.
+  //
+  // macOS/Linux pass the URL directly to `open`/`xdg-open` which spawn
+  // without a shell — no escaping needed.
+  let cmd: string[];
+  if (process.platform === 'win32') {
+    // Escape any embedded quotes in the URL (unlikely for OAuth URLs but
+    // defensive). The outer quotes around ${url} are what tell cmd to keep
+    // the URL as a single token.
+    const escaped = url.replace(/"/g, '\\"');
+    cmd = ['cmd', '/c', `start "" "${escaped}"`];
+  } else if (process.platform === 'darwin') {
+    cmd = ['open', url];
+  } else {
+    cmd = ['xdg-open', url];
+  }
+
   try {
     const proc = Bun.spawn(cmd, { stdout: 'ignore', stderr: 'ignore' });
     // Don't await — the browser launch is fire-and-forget. We just want to
