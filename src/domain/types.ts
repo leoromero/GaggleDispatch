@@ -53,6 +53,18 @@ export interface GaggleLabels {
   failed: string;
 }
 
+export interface AuthConfig {
+  /** `api_key` (legacy, uses cfg.tracker.api_key) or `oauth` (recommended). */
+  mode: 'api_key' | 'oauth';
+  // OAuth-only fields. Empty strings when mode === 'api_key'.
+  client_id: string;
+  client_secret: string;
+  /** Must match the URI registered in the Linear OAuth app, character for
+   *  character (including path). */
+  redirect_uri: string;
+  scopes: string[];
+}
+
 export interface TrackerConfig {
   kind: 'linear';
   endpoint: string;
@@ -70,6 +82,7 @@ export interface TrackerConfig {
   gate_resume_state: string | null;
   pr_ready_state: string | null;
   gaggle_labels: GaggleLabels;
+  auth: AuthConfig;
 }
 
 export interface PollingConfig {

@@ -223,6 +223,18 @@ hub
     await runHubStart({ only: opts.only });
   });
 
+// ── auth ────────────────────────────────────────────────────────────────────
+const auth = program.command('auth').description('Authorize gaggle with external services');
+
+auth
+  .command('linear')
+  .description('Run the Linear OAuth authorization flow and store tokens')
+  .option('--cwd <path>', 'working directory containing WORKFLOW.md')
+  .action(async (opts: { cwd?: string }) => {
+    const { runAuthLinear } = await import('./auth.ts');
+    await runAuthLinear({ cwd: opts.cwd });
+  });
+
 program.parseAsync(process.argv).catch((err) => {
   if (err instanceof GaggleError) {
     console.error(chalk.red(`✗ [${err.code}] ${err.message}`));

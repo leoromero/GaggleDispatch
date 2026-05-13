@@ -76,7 +76,21 @@ export async function runPs(opts: { cwd?: string }): Promise<void> {
 
   let tracker: LinearClient;
   try {
-    tracker = new LinearClient(cfg);
+    if (cfg.tracker.auth.mode === 'oauth') {
+      const oauthMod = await import('../tracker/linear-auth.ts');
+      const auth = new oauthMod.OAuthAuth({
+        client_id: cfg.tracker.auth.client_id,
+        client_secret: cfg.tracker.auth.client_secret,
+      });
+      if (!auth.hasTokens()) {
+        console.error(chalk.red('✗ Linear OAuth tokens not found. Run `gaggle init` or `gaggle auth linear`.'));
+        process.exit(1);
+      }
+      tracker = new LinearClient(cfg, auth);
+    } else {
+      const { ApiKeyAuth } = await import('../tracker/linear-auth.ts');
+      tracker = new LinearClient(cfg, new ApiKeyAuth(cfg.tracker.api_key));
+    }
   } catch (err) {
     console.error(chalk.red(`✗ Cannot connect to Linear: ${(err as Error).message}`));
     process.exit(1);

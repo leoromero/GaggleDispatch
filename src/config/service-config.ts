@@ -10,6 +10,7 @@ import { ConfigValidationError } from '../domain/errors.ts';
 import type {
   ArchonConfig,
   AgentConfig,
+  AuthConfig,
   ClaudeConfig,
   HooksConfig,
   PollingConfig,
@@ -22,6 +23,7 @@ import type {
   WorkflowTemplatesConfig,
   WorkspaceConfig,
 } from '../domain/types.ts';
+import { validateRedirectUri } from '../tracker/linear-oauth.ts';
 import { expandEnvString, expandPath, isInside } from '../util/paths.ts';
 
 function asObject(v: unknown, name: string): Record<string, unknown> {
@@ -84,6 +86,52 @@ function asBool(v: unknown, name: string, def: boolean): boolean {
 function resolveSecretOrLiteral(v: string | undefined): string {
   if (v === undefined || v === null) return '';
   return expandEnvString(v);
+}
+
+/** Parse the optional `tracker.auth` block. Defaults to `mode: api_key` for
+ *  backward compatibility with WORKFLOW.md files that don't declare auth.
+ *  Throws ConfigValidationError on invalid OAuth shape. */
+function parseAuthConfig(raw: unknown): AuthConfig {
+  if (raw === undefined || raw === null) {
+    return {
+      mode: 'api_key',
+      client_id: '',
+      client_secret: '',
+      redirect_uri: '',
+      scopes: [],
+    };
+  }
+  const obj = asObject(raw, 'tracker.auth');
+  const mode = asString(obj.mode, 'tracker.auth.mode', 'api_key');
+  if (mode !== 'api_key' && mode !== 'oauth') {
+    throw new ConfigValidationError(`tracker.auth.mode must be 'api_key' or 'oauth', got '${mode}'`);
+  }
+  if (mode === 'api_key') {
+    return { mode, client_id: '', client_secret: '', redirect_uri: '', scopes: [] };
+  }
+  const client_id = asString(obj.client_id, 'tracker.auth.client_id', '');
+  if (!client_id) {
+    throw new ConfigValidationError(
+      "tracker.auth.client_id is required when tracker.auth.mode is 'oauth'",
+    );
+  }
+  const client_secret = resolveSecretOrLiteral(
+    asOptionalString(obj.client_secret, 'tracker.auth.client_secret') ?? '$LINEAR_OAUTH_CLIENT_SECRET',
+  );
+  if (!client_secret) {
+    throw new ConfigValidationError(
+      "tracker.auth.client_secret is empty (after $VAR resolution); set LINEAR_OAUTH_CLIENT_SECRET",
+    );
+  }
+  const redirect_uri = asString(
+    obj.redirect_uri,
+    'tracker.auth.redirect_uri',
+    'http://127.0.0.1:8765/oauth/callback',
+  );
+  const validationError = validateRedirectUri(redirect_uri);
+  if (validationError) throw new ConfigValidationError(validationError);
+  const scopes = asArrayOfStrings(obj.scopes, 'tracker.auth.scopes', ['read', 'write']);
+  return { mode: 'oauth', client_id, client_secret, redirect_uri, scopes };
 }
 
 export function buildServiceConfig(def: WorkflowDefinition): ServiceConfig {
@@ -155,6 +203,7 @@ export function buildServiceConfig(def: WorkflowDefinition): ServiceConfig {
     gate_resume_state: asOptionalString(trackerRaw.gate_resume_state, 'tracker.gate_resume_state'),
     pr_ready_state: asOptionalString(trackerRaw.pr_ready_state, 'tracker.pr_ready_state'),
     gaggle_labels,
+    auth: parseAuthConfig(trackerRaw.auth),
   };
 
   // ── polling ──────────────────────────────────────────────────────────────

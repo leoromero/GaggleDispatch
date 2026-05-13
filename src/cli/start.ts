@@ -9,13 +9,30 @@ import { loadConfig, fatal } from './common.ts';
 import { runSyncPass, startPeriodicSyncer } from '../registry/repo-syncer.ts';
 import { startRegistryLoader } from '../registry/loader.ts';
 import { LinearClient } from '../tracker/linear.ts';
+import { ApiKeyAuth, OAuthAuth } from '../tracker/linear-auth.ts';
 import { IssueAnalyzer } from '../analyzer/issue-analyzer.ts';
+import type { ServiceConfig } from '../domain/types.ts';
 import { WorkspaceManager } from '../workspace/workspace-manager.ts';
 import { Orchestrator } from '../orchestrator/orchestrator.ts';
 import { logger } from '../util/logger.ts';
 import { watchFile } from '../config/watcher.ts';
 import { startGaggleApi } from '../hub/gaggle-api.ts';
 import { writeSidecar, removeSidecar } from '../hub/sidecar.ts';
+
+/** Construct a LinearClient with the auth provider selected by the config. */
+async function buildLinearClient(cfg: ServiceConfig): Promise<LinearClient> {
+  if (cfg.tracker.auth.mode === 'oauth') {
+    const auth = new OAuthAuth({
+      client_id: cfg.tracker.auth.client_id,
+      client_secret: cfg.tracker.auth.client_secret,
+    });
+    if (!auth.hasTokens()) {
+      fatal('Linear OAuth tokens not found. Run `gaggle init` or `gaggle auth linear` to authorize.');
+    }
+    return new LinearClient(cfg, auth);
+  }
+  return new LinearClient(cfg, new ApiKeyAuth(cfg.tracker.api_key));
+}
 
 export async function runStart(opts: {
   cwd?: string;
@@ -27,7 +44,14 @@ export async function runStart(opts: {
   console.log(chalk.cyan('Preflight checks…'));
   if (!(await commandExists('gh'))) fatal(`'gh' CLI not found in PATH.`);
   if (!(await commandExists('git'))) fatal(`'git' not found in PATH.`);
-  if (!cfg.tracker.api_key) fatal(`tracker.api_key (LINEAR_API_KEY) is empty after $VAR resolution.`);
+  if (cfg.tracker.auth.mode === 'api_key') {
+    if (!cfg.tracker.api_key) fatal(`tracker.api_key (LINEAR_API_KEY) is empty after $VAR resolution.`);
+  } else {
+    // OAuth: tokens come from auth.json. If they're missing, surface a clear
+    // error pointing at the recovery command.
+    const stored = (await import('../tracker/auth-store.ts')).loadStoredTokens();
+    if (!stored) fatal(`Linear OAuth tokens not found. Run \`gaggle init\` or \`gaggle auth linear\` to authorize.`);
+  }
   // Claude auth is handled by the subprocess env (CLAUDE_API_KEY / CLAUDE_CODE_OAUTH_TOKEN /
   // CLAUDE_USE_GLOBAL_AUTH). No preflight check needed here — auth failures surface at analysis time.
 
@@ -54,7 +78,7 @@ export async function runStart(opts: {
     fatal('Registry context has no repositories with sync_status=ok. Add a gaggle.md to at least one registered repo.');
   }
 
-  const tracker = new LinearClient(cfg);
+  const tracker = await buildLinearClient(cfg);
   const analyzer = new IssueAnalyzer(cfg);
   const workspace = new WorkspaceManager(cfg);
   workspace.ensureAuxRoot();

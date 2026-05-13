@@ -113,6 +113,13 @@ export function makeServiceConfig(overrides: Partial<ServiceConfig> = {}): Servi
         retrying: 'gaggle:retrying',
         failed: 'gaggle:failed',
       },
+      auth: {
+        mode: 'api_key',
+        client_id: '',
+        client_secret: '',
+        redirect_uri: '',
+        scopes: [],
+      },
     },
     polling: { interval_ms: 30_000 },
     workspace: { root: '/tmp/aux' },

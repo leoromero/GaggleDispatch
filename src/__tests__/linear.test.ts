@@ -70,6 +70,45 @@ describe('LinearClient.query', () => {
     enqueue({ });
     await expect(c.resolveViewerId()).rejects.toThrow('Linear response missing data');
   });
+
+  test('401 + AuthProvider says refresh — retries once with the refreshed header', async () => {
+    // Auth provider that returns 'first', refreshes once, then returns 'second'.
+    let calls = 0;
+    let refreshed = false;
+    const auth = {
+      async getAuthorizationHeader() {
+        calls++;
+        return refreshed ? 'second' : 'first';
+      },
+      async refreshOnUnauthorized() {
+        refreshed = true;
+        return true;
+      },
+    };
+    const cfg = makeServiceConfig();
+    const client = new LinearClient(cfg, auth, http);
+    // First fetch: 401. Second fetch (after refresh): success.
+    enqueue({ status: 401, body: 'unauthorized' });
+    enqueue({ data: { viewer: { id: 'u1', name: 'X', email: 'x@y' } } });
+    const id = await client.resolveViewerId();
+    expect(id).toBe('u1');
+    expect(http.calls.length).toBe(2);
+    expect(http.calls[0]?.headers.Authorization).toBe('first');
+    expect(http.calls[1]?.headers.Authorization).toBe('second');
+    expect(calls).toBe(2);
+  });
+
+  test('401 + AuthProvider refuses refresh → propagates as LinearError', async () => {
+    const auth = {
+      async getAuthorizationHeader() { return 'k'; },
+      async refreshOnUnauthorized() { return false; },
+    };
+    const cfg = makeServiceConfig();
+    const client = new LinearClient(cfg, auth, http);
+    enqueue({ status: 401, body: 'unauthorized' });
+    await expect(client.resolveViewerId()).rejects.toThrow('Linear HTTP 401');
+    expect(http.calls.length).toBe(1); // no retry
+  });
 });
 
 describe('LinearClient constructor', () => {
