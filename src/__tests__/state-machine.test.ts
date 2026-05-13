@@ -293,26 +293,46 @@ describe('targetTransition: valid', () => {
     expect(hasEffect(t.effects, 'spawn_worker', (e) => e.kind === 'spawn_worker' && e.attempt === 2)).toBe(true);
     expect(hasEffect(t.effects, 'delete_retry')).toBe(true);
   });
+
+  test('failed + retry_requested → dispatching (operator-driven retry)', () => {
+    const t = targetTransition('failed', { kind: 'retry_requested', message: 'retry please' }, tctx());
+    expect(t.to).toBe('dispatching');
+    expect(hasEffect(t.effects, 'remove_label', (e) => e.kind === 'remove_label' && e.label === 'failed')).toBe(true);
+    expect(hasEffect(t.effects, 'apply_label', (e) => e.kind === 'apply_label' && e.label === 'dispatching')).toBe(true);
+    expect(hasEffect(t.effects, 'spawn_worker')).toBe(true);
+    expect(hasEffect(t.effects, 'post_comment', (e) => e.kind === 'post_comment' && /retry triggered/i.test(e.body))).toBe(true);
+  });
+
+  test('failed + retry_requested with no message → still works (acknowledgement comment is generic)', () => {
+    const t = targetTransition('failed', { kind: 'retry_requested', message: null }, tctx());
+    expect(t.to).toBe('dispatching');
+    expect(hasEffect(t.effects, 'post_comment', (e) => e.kind === 'post_comment' && /spawning a fresh worker/i.test(e.body))).toBe(true);
+  });
 });
 
 // ─── Target SM: parent_terminal accepted from every non-terminal state ─────
 
 describe('targetTransition: parent_terminal universal handling', () => {
-  const nonTerminalStates: TargetState[] = ['queued', 'dispatching', 'running', 'gate_waiting', 'retrying'];
-  for (const s of nonTerminalStates) {
+  // `failed` is review-pending, not truly terminal — parent_terminal from
+  // `failed` is valid (operator force-closed parent) and cleans up the label.
+  // Only `succeeded` is terminal in the parent_terminal sense.
+  const nonSucceededStates: TargetState[] = ['queued', 'dispatching', 'running', 'gate_waiting', 'retrying', 'failed'];
+  for (const s of nonSucceededStates) {
     test(`${s} + parent_terminal → failed`, () => {
       const t = targetTransition(s, { kind: 'parent_terminal' }, tctx());
       expect(t.to).toBe('failed');
     });
   }
-  for (const s of ['succeeded', 'failed'] as TargetState[]) {
-    test(`${s} + parent_terminal throws (already terminal)`, () => {
-      expect(() => targetTransition(s, { kind: 'parent_terminal' }, tctx())).toThrow(InvalidTransitionError);
-    });
-  }
+  test('succeeded + parent_terminal throws (truly terminal)', () => {
+    expect(() => targetTransition('succeeded', { kind: 'parent_terminal' }, tctx())).toThrow(InvalidTransitionError);
+  });
   test('running + parent_terminal also cancels the worker', () => {
     const t = targetTransition('running', { kind: 'parent_terminal' }, tctx());
     expect(hasEffect(t.effects, 'cancel_worker')).toBe(true);
+  });
+  test('failed + parent_terminal removes the gaggle:failed label', () => {
+    const t = targetTransition('failed', { kind: 'parent_terminal' }, tctx());
+    expect(hasEffect(t.effects, 'remove_label', (e) => e.kind === 'remove_label' && e.label === 'failed')).toBe(true);
   });
 });
 
@@ -433,6 +453,7 @@ describe('targetTransition: invalid pairs throw', () => {
     { kind: 'gate_create_blocker', blocker: { title: 't', description: 'd' } },
     { kind: 'gate_timed_out' },
     { kind: 'retry_due' },
+    { kind: 'retry_requested', message: null },
     { kind: 'upstream_unblocked' },
     { kind: 'parent_terminal' },
   ];
@@ -443,6 +464,7 @@ describe('targetTransition: invalid pairs throw', () => {
     'running:worker_emitted_run_id', 'running:worker_succeeded', 'running:worker_failed', 'running:gate_paused', 'running:parent_terminal',
     'gate_waiting:gate_approved', 'gate_waiting:gate_rejected', 'gate_waiting:gate_create_blocker', 'gate_waiting:gate_timed_out', 'gate_waiting:parent_terminal',
     'retrying:retry_due', 'retrying:parent_terminal',
+    'failed:retry_requested', 'failed:parent_terminal',
   ]);
 
   for (const s of allStates) {

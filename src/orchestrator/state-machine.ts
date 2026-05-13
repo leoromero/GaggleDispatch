@@ -136,9 +136,14 @@ export type ParentEvent =
  * succeeded     Terminal. Archon completed; target_issue_id moved to Linear
  *               terminal state. No labels. Emits `target_terminal` to parent.
  *
- * failed        Terminal. Retries exhausted, or parent went terminal externally.
- *               target_issue_id moved to Linear Cancelled. No labels. Emits
- *               `target_terminal` to parent.
+ * failed        Parked for human review under the no-auto-retry policy. The
+ *               target carries `gaggle:failed` and the human-facing comment
+ *               explains the reason. Exits via `retry_requested` (operator
+ *               typed "retry" on the issue) → dispatching, or
+ *               `parent_terminal` (operator force-closed the parent) →
+ *               final cancelled cleanup. Emits `target_terminal` to parent
+ *               on entry; parent SM stays in `claimed` while any target is
+ *               here so the issue remains in operator dashboards.
  */
 export type TargetState =
   | 'queued'
@@ -166,6 +171,7 @@ export type TargetEvent =
   | { kind: 'gate_create_blocker'; blocker: BlockerSpec }
   | { kind: 'gate_timed_out' }
   | { kind: 'retry_due' }
+  | { kind: 'retry_requested'; message: string | null }
   | { kind: 'upstream_unblocked' }
   | { kind: 'parent_terminal' };
 
@@ -492,21 +498,23 @@ export const targetTransition: TargetTransitionFn = (state, event, ctx) => {
   const tid = ctx.identity.target_issue_id;
   const key = workerKeyOf(ctx.identity);
 
-  // ─── parent_terminal is accepted from every non-terminal state ──────────
+  // ─── parent_terminal is accepted from every non-succeeded state ────────
+  // `failed` is review-pending (operator can retry), not truly terminal, so
+  // a parent_terminal from `failed` is valid and cleans up the gaggle:failed
+  // label. Only `succeeded` truly cannot accept parent_terminal — it's
+  // already terminal in the happy direction.
   if (event.kind === 'parent_terminal') {
-    if (state === 'succeeded' || state === 'failed') {
+    if (state === 'succeeded') {
       throw new InvalidTransitionError(state, event.kind, 'target');
     }
     const effects: Effect[] = [];
-    // Remove whatever target-level label this state owns.
-    // parent_terminal is only valid from non-terminal target states; `failed`
-    // and `succeeded` are terminal so they don't appear here.
     const labelForState: Partial<Record<TargetState, TargetLabelKind>> = {
       queued: 'queued',
       dispatching: 'dispatching',
       running: 'running',
       gate_waiting: 'waiting_human',
       retrying: 'retrying',
+      failed: 'failed',
     };
     const label = labelForState[state];
     if (label) effects.push({ kind: 'remove_label', issue_id: tid, label });
@@ -648,7 +656,28 @@ export const targetTransition: TargetTransitionFn = (state, event, ctx) => {
     throw new InvalidTransitionError(state, event.kind, 'target');
   }
 
-  // succeeded | failed — terminal.
+  if (state === 'failed') {
+    if (event.kind === 'retry_requested') {
+      // Operator-driven retry. Removes gaggle:failed, swaps to gaggle:dispatching,
+      // spawns a fresh worker. Posts an acknowledgement comment so the operator
+      // sees their request was picked up.
+      const ackBody = event.message
+        ? `▶ **GaggleDispatch — retry triggered**\n\nOperator requested retry: "${event.message}"\n\nSpawning a fresh worker.`
+        : `▶ **GaggleDispatch — retry triggered**\n\nSpawning a fresh worker.`;
+      return {
+        from: 'failed', to: 'dispatching',
+        effects: [
+          { kind: 'remove_label', issue_id: tid, label: 'failed' },
+          { kind: 'apply_label', issue_id: tid, label: 'dispatching' },
+          { kind: 'post_comment', issue_id: tid, body: ackBody },
+          { kind: 'spawn_worker', identity: ctx.identity, target: ctx.target, attempt: ctx.attempt },
+        ],
+      };
+    }
+    throw new InvalidTransitionError(state, event.kind, 'target');
+  }
+
+  // succeeded — terminal.
   throw new InvalidTransitionError(state, event.kind, 'target');
 };
 

@@ -939,6 +939,163 @@ describe('hot path: pollSupervisedGates timeout', () => {
   });
 });
 
+describe('hot path: pollFailedTargets retry trigger', () => {
+  function makeFailedOrchestrator(opts: {
+    failedIssue: Issue;
+    parentIssue?: Issue;
+    commentsByIssue: Record<string, Array<{ id: string; body: string; author: { id: string | null; name: string | null }; created_at: string }>>;
+  }) {
+    const cfg = makeServiceConfig();
+    const calls: TrackerCall[] = [];
+    const tracker = {
+      ensureGaggleLabels: async () => {},
+      resolveViewerId: async () => 'u1',
+      fetchCandidateIssues: async () => [],
+      fetchIssuesByLabel: async (label: string) => {
+        calls.push({ op: 'fetchIssuesByLabel', args: [label] });
+        return label === 'gaggle:failed' ? [opts.failedIssue] : [];
+      },
+      fetchIssuesByStates: async () => [],
+      fetchIssueStatesByIds: async () => opts.parentIssue ? [opts.parentIssue] : [],
+      fetchIssueComments: async (id: string) => opts.commentsByIssue[id] ?? [],
+      applyLabel: async (id: string, label: string) => { calls.push({ op: 'applyLabel', args: [id, label] }); },
+      removeLabel: async (id: string, label: string) => { calls.push({ op: 'removeLabel', args: [id, label] }); },
+      postComment: async (id: string, body: string) => { calls.push({ op: 'postComment', args: [id, body.slice(0, 80)] }); return { id: 'c-new' }; },
+      updateIssueState: async (id: string, s: string) => { calls.push({ op: 'updateIssueState', args: [id, s] }); },
+      createSubIssue: async () => ({ id: 'sub1', identifier: 'SYM-99' }),
+      createBlockerRelation: async () => {},
+    } as unknown as LinearClient;
+
+    const reg = makeFakeRegistry();
+    const o = new Orchestrator({
+      cfg, tracker,
+      analyzer: { analyze: async () => ({ issue_id: 'x', analysis_summary: '', repo_targets: [] }) } as unknown as IssueAnalyzer,
+      workspace: { ensureAuxRoot: () => {}, cleanAuxiliaryWorkspace: () => {} } as unknown as WorkspaceManager,
+      registry: reg.handle,
+      syncer: null,
+      archonClient: makeFakeArchonClient(),
+    });
+    orchestrators.push(o);
+    return { o, calls, cfg };
+  }
+
+  test('"retry" comment on a gaggle:failed sub-issue → retry_requested fires; gaggle:dispatching applied', async () => {
+    const parent = makeIssue({ id: 'p1', identifier: 'SYM-400', parent_id: null, state: 'In Progress' });
+    const failed = makeIssue({
+      id: 'sub-fe', identifier: 'SYM-401', parent_id: 'p1',
+      title: '[trialmatch-fe] Implement X', state: 'In Progress',
+      labels: ['gaggle:failed'],
+    });
+    const { o, calls } = makeFailedOrchestrator({
+      failedIssue: failed,
+      parentIssue: parent,
+      commentsByIssue: {
+        'sub-fe': [
+          { id: 'c1', body: '❌ **GaggleDispatch — worker failed**\n\nReason: `crash`', author: { id: 'bot', name: 'GaggleBot' }, created_at: '2026-05-13T13:00:00Z' },
+          { id: 'c2', body: 'retry', author: { id: 'u2', name: 'Leo' }, created_at: '2026-05-13T14:00:00Z' },
+        ],
+      },
+    });
+
+    // Pre-condition: SM thinks the target is in failed (from a prior worker_failed transition)
+    o.getState().parent_machine_states.set('p1', 'claimed');
+    o.getState().target_machine_states.set('p1__trialmatch-fe', 'failed');
+    o.getState().sibling_subissues.set('p1', new Map([['trialmatch-fe', 'sub-fe']]));
+
+    await (o as unknown as { pollFailedTargets(): Promise<void> }).pollFailedTargets();
+
+    // SM transition: failed → dispatching
+    expect(o.getState().target_machine_states.get('p1__trialmatch-fe')).toBe('dispatching');
+    // Linear: gaggle:failed removed, gaggle:dispatching applied
+    expect(calls.some((c) => c.op === 'removeLabel' && c.args[1] === 'gaggle:failed')).toBe(true);
+    expect(calls.some((c) => c.op === 'applyLabel' && c.args[1] === 'gaggle:dispatching')).toBe(true);
+    // Acknowledgement comment posted
+    expect(calls.some((c) => c.op === 'postComment' && /retry triggered/i.test(c.args[1] as string))).toBe(true);
+  });
+
+  test('"cancel" comment → gaggle:failed removed, acknowledgement comment; target SM stays failed', async () => {
+    const parent = makeIssue({ id: 'p1', identifier: 'SYM-410', parent_id: null, state: 'In Progress' });
+    const failed = makeIssue({
+      id: 'sub-fe', identifier: 'SYM-411', parent_id: 'p1',
+      title: '[trialmatch-fe] Try Y', state: 'In Progress',
+      labels: ['gaggle:failed'],
+    });
+    const { o, calls } = makeFailedOrchestrator({
+      failedIssue: failed,
+      parentIssue: parent,
+      commentsByIssue: {
+        'sub-fe': [
+          { id: 'c1', body: '❌ **GaggleDispatch — worker failed**\n\nReason: `boom`', author: { id: 'bot', name: 'GaggleBot' }, created_at: '2026-05-13T13:00:00Z' },
+          { id: 'c2', body: 'cancel this', author: { id: 'u2', name: 'Leo' }, created_at: '2026-05-13T14:00:00Z' },
+        ],
+      },
+    });
+
+    o.getState().target_machine_states.set('p1__trialmatch-fe', 'failed');
+    o.getState().sibling_subissues.set('p1', new Map([['trialmatch-fe', 'sub-fe']]));
+
+    await (o as unknown as { pollFailedTargets(): Promise<void> }).pollFailedTargets();
+
+    expect(o.getState().target_machine_states.get('p1__trialmatch-fe')).toBe('failed');
+    expect(calls.some((c) => c.op === 'removeLabel' && c.args[1] === 'gaggle:failed')).toBe(true);
+    expect(calls.some((c) => c.op === 'postComment' && /cancellation acknowledged/i.test(c.args[1] as string))).toBe(true);
+    // No retry spawn
+    expect(calls.some((c) => c.op === 'applyLabel' && c.args[1] === 'gaggle:dispatching')).toBe(false);
+  });
+
+  test('ambiguous comment → posts clarification, no SM transition', async () => {
+    const parent = makeIssue({ id: 'p1', identifier: 'SYM-420' });
+    const failed = makeIssue({
+      id: 'sub-fe', identifier: 'SYM-421', parent_id: 'p1',
+      title: '[trialmatch-fe] Z', state: 'In Progress', labels: ['gaggle:failed'],
+    });
+    const { o, calls } = makeFailedOrchestrator({
+      failedIssue: failed,
+      parentIssue: parent,
+      commentsByIssue: {
+        'sub-fe': [
+          { id: 'c1', body: '❌ **GaggleDispatch — worker failed**', author: { id: 'bot', name: 'GaggleBot' }, created_at: '2026-05-13T13:00:00Z' },
+          { id: 'c2', body: 'hmm what happened?', author: { id: 'u2', name: 'Leo' }, created_at: '2026-05-13T14:00:00Z' },
+        ],
+      },
+    });
+
+    o.getState().target_machine_states.set('p1__trialmatch-fe', 'failed');
+    o.getState().sibling_subissues.set('p1', new Map([['trialmatch-fe', 'sub-fe']]));
+
+    await (o as unknown as { pollFailedTargets(): Promise<void> }).pollFailedTargets();
+
+    // No state transition
+    expect(o.getState().target_machine_states.get('p1__trialmatch-fe')).toBe('failed');
+    // Clarification posted
+    expect(calls.some((c) => c.op === 'postComment' && /wasn't sure how to interpret/i.test(c.args[1] as string))).toBe(true);
+    // No label changes
+    expect(calls.some((c) => c.op === 'removeLabel' && c.args[1] === 'gaggle:failed')).toBe(false);
+  });
+
+  test('no human reply yet → no-op (idempotent across poll iterations)', async () => {
+    const failed = makeIssue({
+      id: 'sub-fe', identifier: 'SYM-431', parent_id: 'p1',
+      title: '[trialmatch-fe] W', state: 'In Progress', labels: ['gaggle:failed'],
+    });
+    const { o, calls } = makeFailedOrchestrator({
+      failedIssue: failed,
+      commentsByIssue: {
+        'sub-fe': [
+          { id: 'c1', body: '❌ **GaggleDispatch — worker failed**', author: { id: 'bot', name: 'GaggleBot' }, created_at: '2026-05-13T13:00:00Z' },
+        ],
+      },
+    });
+
+    o.getState().target_machine_states.set('p1__trialmatch-fe', 'failed');
+
+    await (o as unknown as { pollFailedTargets(): Promise<void> }).pollFailedTargets();
+
+    expect(calls.some((c) => c.op === 'removeLabel')).toBe(false);
+    expect(calls.some((c) => c.op === 'postComment')).toBe(false);
+  });
+});
+
 describe('hot path: drainPendingTargets phase 3', () => {
   test('ready target → dispatch_attempted via SM (target_machine_states transitions to dispatching/running)', async () => {
     const issue = makeIssue({ id: 'p1', identifier: 'SYM-330' });

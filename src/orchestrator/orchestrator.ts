@@ -258,6 +258,7 @@ export class Orchestrator {
     try {
       await this.reconcileRunningIssues();
       await this.pollSupervisedGates();
+      await this.pollFailedTargets();
       await this.pollMergedPRs();
       await this.processPendingTargets();
 
@@ -986,6 +987,137 @@ export class Orchestrator {
     // Note: session.cancel is preserved on the gate entry implicitly via key→running before delete
     // Worker process is still alive; it will exit on approve/reject or timeout.
     void session; // touch to silence lint
+  }
+
+  /**
+   * Poll gaggle:failed-labelled issues for operator retry/cancel comments.
+   * Mirrors `pollSupervisedGates` but for the no-auto-retry policy's
+   * human-driven retry path.
+   *
+   * For each failed target:
+   *   - Find the most recent "worker failed" bot comment (timestamp anchor)
+   *   - Look for a human reply after that
+   *   - Classify intent:
+   *       retry    → fire `retry_requested` SM event → respawn worker
+   *       cancel   → remove gaggle:failed + post acknowledgement (target SM
+   *                  stays `failed`; operator can move issue to Cancelled if
+   *                  they want to terminate the parent too)
+   *       ambiguous → post a clarification, do nothing else
+   */
+  private async pollFailedTargets(): Promise<void> {
+    let failedIssues: Issue[];
+    try {
+      failedIssues = await this.tracker.fetchIssuesByLabel(this.cfg.tracker.gaggle_labels.failed);
+    } catch (err) {
+      logger.debug('pollFailedTargets: fetch failed', { error: (err as Error).message });
+      return;
+    }
+
+    for (const issue of failedIssues) {
+      const parentId = issue.parent_id ?? issue.id;
+      // Resolve repo alias: title prefix [alias] for sub-issues, sibling map
+      // for mono-repo parents that are themselves the target.
+      let alias = this.parseAliasFromTitle(issue.title);
+      if (!alias) {
+        const sibMap = this.state.sibling_subissues.get(parentId);
+        if (sibMap) {
+          for (const [a, subId] of sibMap) {
+            if (subId === issue.id) { alias = a; break; }
+          }
+        }
+      }
+      if (!alias) continue;
+
+      let comments;
+      try {
+        comments = await this.tracker.fetchIssueComments(issue.id);
+      } catch (err) {
+        logger.debug('pollFailedTargets: comments fetch failed', { issue_id: issue.id, error: (err as Error).message });
+        continue;
+      }
+
+      // Most recent failure marker comment anchors the timeline. If we don't
+      // find one, the label was applied externally — skip until we can post
+      // our own marker on the next failure.
+      const failureMarker = comments
+        .filter((c) => isBotComment(c) && /worker failed/i.test(c.body))
+        .sort((a, b) => Date.parse(b.created_at) - Date.parse(a.created_at))[0];
+      if (!failureMarker) continue;
+      const since = Date.parse(failureMarker.created_at);
+
+      const reply = findHumanReplyAfter(comments, since);
+      if (!reply) continue;
+
+      const intent = classifyRetryIntent(reply.body);
+      if (intent === 'ambiguous') {
+        if (!hasBotCommentAfter(comments, Date.parse(reply.created_at))) {
+          try {
+            await this.tracker.postComment(
+              issue.id,
+              `🤖 I wasn't sure how to interpret that reply. Reply with **retry** to spawn a fresh worker, or **cancel** to abandon this target.`,
+            );
+          } catch (err) {
+            logger.warn('Failed to post retry-clarification comment', { error: (err as Error).message });
+          }
+        }
+        continue;
+      }
+
+      if (intent === 'cancel') {
+        // Operator gave up. Remove gaggle:failed so we stop watching; post
+        // an acknowledgement. Target SM stays at `failed` (terminal in this
+        // direction). If the operator also wants to terminate the parent,
+        // they move the parent's Linear state to Cancelled — that flows
+        // through reconcileRunningIssues' parent_externally_terminal path.
+        try { await this.tracker.removeLabel(issue.id, this.cfg.tracker.gaggle_labels.failed); } catch { /* ignore */ }
+        try {
+          await this.tracker.postComment(
+            issue.id,
+            `🛑 **GaggleDispatch — cancellation acknowledged**\n\nThis target is now abandoned. Move the parent issue to a terminal state if you want the whole task closed.`,
+          );
+        } catch (err) {
+          logger.warn('Failed to post cancellation acknowledgement', { error: (err as Error).message });
+        }
+        logger.info('Failed target — cancellation acknowledged', { issue_id: issue.id, repo_alias: alias });
+        continue;
+      }
+
+      // intent === 'retry'
+      let parentIssue = this.state.pending_issues.get(parentId);
+      if (!parentIssue) {
+        if (parentId === issue.id) {
+          parentIssue = issue;
+        } else {
+          try {
+            const fetched = await this.tracker.fetchIssueStatesByIds([parentId]);
+            parentIssue = fetched[0];
+          } catch { /* ignore */ }
+        }
+      }
+      if (!parentIssue) {
+        logger.warn('pollFailedTargets: cannot resolve parent for retry', { issue_id: issue.id, parent_id: parentId });
+        continue;
+      }
+      this.state.pending_issues.set(parentId, parentIssue);
+
+      const target = this.buildRepoTargetForAlias(alias, parentIssue);
+      const identity: TargetIdentity = {
+        parent_issue_id: parentId,
+        repo_alias: alias,
+        target_issue_id: issue.id,
+      };
+      await this.emitTargetEvent('failed', { kind: 'retry_requested', message: reply.body.trim() || null }, {
+        cfg: this.cfg,
+        identity,
+        parent_issue: parentIssue,
+        target,
+        siblings: new Map(),
+        attempt: 0,
+      });
+      logger.info('Failed target — retry triggered by operator', {
+        issue_id: issue.id, repo_alias: alias, reply_excerpt: reply.body.slice(0, 80),
+      });
+    }
   }
 
   private async pollMergedPRs(): Promise<void> {
@@ -2247,5 +2379,26 @@ export function classifyApprovalIntent(body: string): 'approve' | 'reject' | 'am
   const trimmed = body.trim();
   if (APPROVE_KEYWORDS.test(trimmed)) return 'approve';
   if (REJECT_KEYWORDS.test(trimmed)) return 'reject';
+  return 'ambiguous';
+}
+
+/**
+ * Classify a comment posted on a `gaggle:failed`-labelled issue.
+ *
+ *   retry    — operator wants a fresh worker spawn ("retry", "rerun",
+ *              "restart", "try again", "go", "run")
+ *   cancel   — operator gives up on this target ("cancel", "abandon",
+ *              "skip", "stop", "drop", "nevermind")
+ *   ambiguous — anything else; the orchestrator posts a clarification
+ *
+ * Keyword-only (no Claude call) — operator retry/cancel intent is
+ * unambiguous and we don't need the latency / cost.
+ */
+const RETRY_KEYWORDS = /^(retry|rerun|restart|try\s+again|go|run)\b/i;
+const CANCEL_KEYWORDS = /^(cancel(led)?|abandon|skip|stop|drop|nevermind|nvm|don'?t|no)\b/i;
+export function classifyRetryIntent(body: string): 'retry' | 'cancel' | 'ambiguous' {
+  const trimmed = body.trim();
+  if (RETRY_KEYWORDS.test(trimmed)) return 'retry';
+  if (CANCEL_KEYWORDS.test(trimmed)) return 'cancel';
   return 'ambiguous';
 }
