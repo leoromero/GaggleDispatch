@@ -7,6 +7,10 @@
 
 import { logger } from '../util/logger.ts';
 import type { BlockerRef, Issue, ServiceConfig } from '../domain/types.ts';
+import type { AuthProvider } from './linear-auth.ts';
+import { ApiKeyAuth } from './linear-auth.ts';
+import type { HttpClient } from './http-client.ts';
+import { FetchHttpClient } from './http-client.ts';
 
 interface GqlResponse<T> {
   data?: T;
@@ -49,22 +53,52 @@ export class LinearClient {
   private teamCache: LinearTeam | null = null;
   private labelIdCache = new Map<string, string>(); // name -> id (per team)
   private stateIdCache = new Map<string, string>(); // name -> id (per team)
+  private auth: AuthProvider;
+  private http: HttpClient;
 
-  constructor(private cfg: ServiceConfig) {
-    if (!cfg.tracker.api_key) {
-      throw new LinearError('LINEAR_API_KEY is missing or empty');
+  /**
+   * Construct a Linear client.
+   *
+   *   - `cfg` provides the endpoint, gaggle labels, etc.
+   *   - `auth` provides the Authorization header. Defaults to an
+   *     {@link ApiKeyAuth} built from `cfg.tracker.api_key` for backward
+   *     compatibility; OAuth implementations should pass an explicit provider.
+   *   - `http` is the HTTP transport. Defaults to {@link FetchHttpClient};
+   *     tests inject a `RecordingHttpClient`.
+   */
+  constructor(private cfg: ServiceConfig, auth?: AuthProvider, http?: HttpClient) {
+    if (!auth) {
+      if (!cfg.tracker.api_key) {
+        throw new LinearError('LINEAR_API_KEY is missing or empty');
+      }
+      auth = new ApiKeyAuth(cfg.tracker.api_key);
     }
+    this.auth = auth;
+    this.http = http ?? new FetchHttpClient();
   }
 
   async query<T>(query: string, variables: Record<string, unknown> = {}): Promise<T> {
-    const res = await fetch(this.cfg.tracker.endpoint, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: this.cfg.tracker.api_key,
-      },
-      body: JSON.stringify({ query, variables }),
-    });
+    const send = async () => {
+      const authorization = await this.auth.getAuthorizationHeader();
+      return this.http.fetch(this.cfg.tracker.endpoint, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: authorization,
+        },
+        body: JSON.stringify({ query, variables }),
+      });
+    };
+
+    let res = await send();
+    if (res.status === 401) {
+      // Auth provider may want to refresh and let us retry once (OAuth).
+      const refreshed = await this.auth.refreshOnUnauthorized();
+      if (refreshed) {
+        res = await send();
+      }
+    }
+
     if (!res.ok) {
       const text = await res.text().catch(() => '');
       throw new LinearError(`Linear HTTP ${res.status}: ${text.slice(0, 500)}`);
