@@ -229,10 +229,9 @@ const auth = program.command('auth').description('Authorize gaggle with external
 auth
   .command('linear')
   .description('Run the Linear OAuth authorization flow and store tokens')
-  .option('--cwd <path>', 'working directory containing WORKFLOW.md')
-  .action(async (opts: { cwd?: string }) => {
+  .action(async () => {
     const { runAuthLinear } = await import('./auth.ts');
-    await runAuthLinear({ cwd: opts.cwd });
+    await runAuthLinear({ cwd: program.opts().cwd });
   });
 
 program.parseAsync(process.argv).catch((err) => {
