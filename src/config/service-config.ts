@@ -253,6 +253,7 @@ export function buildServiceConfig(def: WorkflowDefinition): ServiceConfig {
     stall_timeout_ms: asInt(archonRaw.stall_timeout_ms, 'archon.stall_timeout_ms', 300_000),
     default_workflow: asString(archonRaw.default_workflow, 'archon.default_workflow', 'gaggle/gaggle-fix-issue'),
     gate_timeout_ms: asInt(archonRaw.gate_timeout_ms, 'archon.gate_timeout_ms', 0),
+    startup_cleanup_age_days: asInt(archonRaw.startup_cleanup_age_days, 'archon.startup_cleanup_age_days', 7),
   };
 
   // ── claude ───────────────────────────────────────────────────────────────

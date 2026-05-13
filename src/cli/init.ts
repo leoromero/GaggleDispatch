@@ -175,6 +175,10 @@ export async function runInit(opts: { cwd?: string }): Promise<void> {
     polling: { interval_ms: 30_000 },
     workspace: { root: '~/gaggle_workspaces' },
     hooks: {
+      // `--merged` removes worktrees whose branches have been merged (safe
+      // per-run cleanup). Startup separately sweeps idle worktrees via
+      // `archon.startup_cleanup_age_days`; the hook only needs the
+      // merged-branch case.
       after_run: 'archon isolation cleanup --merged --cwd . || true',
     },
     agent: {

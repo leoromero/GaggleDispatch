@@ -138,6 +138,7 @@ export function makeServiceConfig(overrides: Partial<ServiceConfig> = {}): Servi
       stall_timeout_ms: 30_000,
       default_workflow: 'gaggle/gaggle-fix-issue',
       gate_timeout_ms: 0,
+      startup_cleanup_age_days: 0,
     },
     claude: {
       api_key: '',

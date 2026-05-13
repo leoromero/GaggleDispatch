@@ -116,6 +116,15 @@ export interface ArchonConfig {
   stall_timeout_ms: number;
   default_workflow: string;
   gate_timeout_ms: number;
+  /**
+   * If > 0, run `archon isolation cleanup <days>` once at orchestrator
+   * startup, per registered repo. Removes Archon worktrees idle for more
+   * than N days — catches abandoned, cancelled, and orphaned ones in one
+   * sweep. The per-run `after_run` hook handles merged-branch cleanup
+   * continuously; this complements it for the long tail.
+   * Set to 0 to disable. Default: 7.
+   */
+  startup_cleanup_age_days: number;
 }
 
 export interface ClaudeConfig {

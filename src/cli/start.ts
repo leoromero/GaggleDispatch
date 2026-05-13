@@ -78,6 +78,19 @@ export async function runStart(opts: {
     fatal('Registry context has no repositories with sync_status=ok. Add a gaggle.md to at least one registered repo.');
   }
 
+  // Sweep stale Archon worktrees (abandoned/cancelled/orphaned) before
+  // polling kicks in. The per-run `after_run` hook handles merged branches
+  // continuously; this catches the long tail. Configured via
+  // archon.startup_cleanup_age_days (default 7; 0 to disable).
+  if (cfg.archon.startup_cleanup_age_days > 0) {
+    console.log(chalk.cyan(`Sweeping Archon worktrees idle > ${cfg.archon.startup_cleanup_age_days} days...`));
+    const { runStartupArchonCleanup } = await import('../executor/archon-cleanup.ts');
+    await runStartupArchonCleanup({
+      ageDays: cfg.archon.startup_cleanup_age_days,
+      repos: ctx.repositories.map((r) => ({ alias: r.name, cwd: r.local_path })),
+    });
+  }
+
   const tracker = await buildLinearClient(cfg);
   const analyzer = new IssueAnalyzer(cfg);
   const workspace = new WorkspaceManager(cfg);
