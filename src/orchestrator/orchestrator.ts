@@ -700,32 +700,39 @@ export class Orchestrator {
 
     // Phase 3: Dispatch or queue each target.
     //
-    // Targets with unsatisfied upstream dependencies or no available slot stay
-    // queued (gaggle:queued label applied; remaining list keeps them for the
-    // next drain). Ready targets transition queued → dispatching via the SM
-    // (apply gaggle:dispatching, spawn_worker hook → launchWorker which
-    // applies gaggle:running and wires the callbacks back into handleWorkerExit
-    // / handleGatePaused which are themselves SM-driven).
+    // Every target is FIRST placed in the queued state — gaggle:queued label
+    // applied + target_machine_states['key'] = 'queued'. This makes the full
+    // Linear label lifecycle visible (queued → dispatching → running) and
+    // means the SM's `queued → dispatching` transition always has a label to
+    // remove. It also makes a mid-dispatch crash safely recoverable: the
+    // target is observable as queued on disk.
+    //
+    // Ready targets (no upstream blockers, slot available) then immediately
+    // transition queued → dispatching via the SM and proceed to spawn. Targets
+    // that aren't ready stay queued and remain in the `remaining` list for the
+    // next drain.
     for (const target of targets) {
       const subIssueId = this.state.sibling_subissues.get(issue.id)?.get(target.repo_alias) ?? null;
       const targetId = subIssueId ?? issue.id;
+      const key = workerKey(issue.id, target.repo_alias);
 
-      if (target.depends_on?.length && !repoTargetReady(target, issue.id, this.state, this.cfg)) {
+      // Place in queued state up front. Idempotent: if Linear already has the
+      // label (re-drain), this is a no-op; if not, the label is applied.
+      // Hydrating target_machine_states also keeps the parent SM's
+      // target_terminal check accurate.
+      if (this.state.target_machine_states.get(key) !== 'queued') {
         try {
           await this.tracker.applyLabel(targetId, this.cfg.tracker.gaggle_labels.queued);
         } catch { /* non-fatal */ }
-        // Hydrate target_machine_states so the parent SM's target_terminal
-        // check sees this queued target and won't conclude "all terminal" prematurely.
-        this.state.target_machine_states.set(workerKey(issue.id, target.repo_alias), 'queued');
+        this.state.target_machine_states.set(key, 'queued');
+      }
+
+      if (target.depends_on?.length && !repoTargetReady(target, issue.id, this.state, this.cfg)) {
         remaining.push(target);
         continue;
       }
 
       if (availableSlots(this.state) === 0) {
-        try {
-          await this.tracker.applyLabel(targetId, this.cfg.tracker.gaggle_labels.queued);
-        } catch { /* non-fatal */ }
-        this.state.target_machine_states.set(workerKey(issue.id, target.repo_alias), 'queued');
         remaining.push(target);
         continue;
       }

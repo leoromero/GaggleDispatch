@@ -982,6 +982,61 @@ describe('hot path: drainPendingTargets phase 3', () => {
     expect(calls.some((c) => c.op === 'applyLabel' && c.args[1] === 'gaggle:dispatching')).toBe(true);
   });
 
+  test('ready target — applies gaggle:queued BEFORE gaggle:dispatching (full label cycle visible)', async () => {
+    const issue = makeIssue({ id: 'p1', identifier: 'SYM-332' });
+    const target = makeRepoTarget({ repo_alias: 'fe' });
+    const analysis: IssueAnalysis = { issue_id: 'p1', analysis_summary: '', repo_targets: [target] };
+    const cfg = makeServiceConfig();
+    const calls: TrackerCall[] = [];
+    const tracker = {
+      ensureGaggleLabels: async () => {},
+      resolveViewerId: async () => 'u1',
+      fetchCandidateIssues: async () => [],
+      fetchIssuesByLabel: async () => [],
+      fetchIssuesByStates: async () => [],
+      fetchIssueStatesByIds: async () => [],
+      fetchIssueComments: async () => [],
+      applyLabel: async (id: string, label: string) => { calls.push({ op: 'applyLabel', args: [id, label] }); },
+      removeLabel: async (id: string, label: string) => { calls.push({ op: 'removeLabel', args: [id, label] }); },
+      postComment: async () => ({ id: 'c1' }),
+      updateIssueState: async () => {},
+      createSubIssue: async () => ({ id: 'sub1', identifier: 'SYM-99' }),
+      createBlockerRelation: async () => {},
+    } as unknown as LinearClient;
+
+    const reg = makeFakeRegistry();
+    const o = new Orchestrator({
+      cfg, tracker,
+      analyzer: { analyze: async () => analysis } as unknown as IssueAnalyzer,
+      workspace: { ensureAuxRoot: () => {}, cleanAuxiliaryWorkspace: () => {} } as unknown as WorkspaceManager,
+      registry: reg.handle,
+      syncer: null,
+      archonClient: makeFakeArchonClient(),
+    });
+    orchestrators.push(o);
+
+    o.getState().pending_issues.set('p1', issue);
+    o.getState().pending_targets.set('p1', [target]);
+    o.getState().parent_machine_states.set('p1', 'claimed');
+
+    await (o as unknown as {
+      drainPendingTargets(i: typeof issue, a: IssueAnalysis): Promise<void>;
+    }).drainPendingTargets(issue, analysis);
+
+    // Verify the order: gaggle:queued was applied, then gaggle:queued removed,
+    // then gaggle:dispatching applied. This is the full label lifecycle.
+    const labelOps = calls
+      .filter((c) => c.op === 'applyLabel' || c.op === 'removeLabel')
+      .map((c) => `${c.op}(${c.args[1]})`);
+    const queuedApplyIdx = labelOps.indexOf('applyLabel(gaggle:queued)');
+    const queuedRemoveIdx = labelOps.indexOf('removeLabel(gaggle:queued)');
+    const dispatchingApplyIdx = labelOps.indexOf('applyLabel(gaggle:dispatching)');
+
+    expect(queuedApplyIdx).toBeGreaterThan(-1);
+    expect(queuedRemoveIdx).toBeGreaterThan(queuedApplyIdx); // remove after apply
+    expect(dispatchingApplyIdx).toBeGreaterThan(queuedRemoveIdx); // dispatching after queued removed
+  });
+
   test('target with unsatisfied depends_on → stays queued (no SM dispatch)', async () => {
     const issue = makeIssue({ id: 'p1', identifier: 'SYM-331' });
     const target = makeRepoTarget({ repo_alias: 'fe', depends_on: ['be'] });
