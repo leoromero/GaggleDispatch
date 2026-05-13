@@ -111,6 +111,7 @@ export function makeServiceConfig(overrides: Partial<ServiceConfig> = {}): Servi
         analyzing: 'gaggle:analyzing',
         dispatching: 'gaggle:dispatching',
         retrying: 'gaggle:retrying',
+        failed: 'gaggle:failed',
       },
     },
     polling: { interval_ms: 30_000 },

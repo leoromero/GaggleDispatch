@@ -389,17 +389,17 @@ describe('LinearClient.fetchIssuesByLabel', () => {
 });
 
 describe('LinearClient.ensureGaggleLabels', () => {
-  test('creates all seven labels when none exist', async () => {
+  test('creates all eight labels when none exist', async () => {
     const c = new LinearClient(makeServiceConfig());
     enqueue(...teamResolution()); // team
-    // 7 labels (claimed/queued/running/waiting-human + analyzing/dispatching/retrying)
-    // × (fetch + create) = 14 calls
-    for (let i = 0; i < 7; i++) {
+    // 8 labels (claimed/queued/running/waiting-human + analyzing/dispatching/retrying/failed)
+    // × (fetch + create) = 16 calls
+    for (let i = 0; i < 8; i++) {
       enqueue({ data: { issueLabels: { nodes: [] } } });
       enqueue({ data: { issueLabelCreate: { success: true, issueLabel: { id: `lbl${i}` } } } });
     }
     await c.ensureGaggleLabels();
-    expect(fetchCalls.length).toBe(15); // 1 team + 14 label
+    expect(fetchCalls.length).toBe(17); // 1 team + 16 label
   });
 });
 

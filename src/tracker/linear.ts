@@ -412,6 +412,7 @@ export class LinearClient {
       this.cfg.tracker.gaggle_labels.analyzing,
       this.cfg.tracker.gaggle_labels.dispatching,
       this.cfg.tracker.gaggle_labels.retrying,
+      this.cfg.tracker.gaggle_labels.failed,
     ]) {
       await this.ensureLabelExists(team.id, label);
     }

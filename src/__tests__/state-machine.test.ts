@@ -116,11 +116,27 @@ describe('parentTransition: valid', () => {
     expect(hasEffect(t.effects, 'release_parent_claim')).toBe(true);
   });
 
-  test('claimed + target_terminal (one failed) → cancelled', () => {
+  test('claimed + target_terminal (one failed) → STAYS claimed (no-auto-retry policy needs human review)', () => {
     const t = parentTransition('claimed', { kind: 'target_terminal', alias: 'b', outcome: 'failed' },
       pctx({ a: 'succeeded', b: 'failed' }));
-    expect(t.to).toBe('cancelled');
-    expect(hasEffect(t.effects, 'set_linear_state', (e) => e.kind === 'set_linear_state' && e.state === 'Cancelled')).toBe(true);
+    expect(t.to).toBe('claimed');
+    expect(t.effects).toEqual([]);
+  });
+
+  test('claimed + target_terminal (all failed) → STAYS claimed (operator must act)', () => {
+    const t = parentTransition('claimed', { kind: 'target_terminal', alias: 'b', outcome: 'failed' },
+      pctx({ a: 'failed', b: 'failed' }));
+    expect(t.to).toBe('claimed');
+    expect(t.effects).toEqual([]);
+  });
+
+  test('claimed + target_terminal (succeeded but one failed sibling) → STAYS claimed', () => {
+    // Even when the most recent transition was a success, if a prior sibling
+    // failed, the parent stays claimed until the operator resolves it.
+    const t = parentTransition('claimed', { kind: 'target_terminal', alias: 'c', outcome: 'succeeded' },
+      pctx({ a: 'succeeded', b: 'failed', c: 'succeeded' }));
+    expect(t.to).toBe('claimed');
+    expect(t.effects).toEqual([]);
   });
 
   test('claimed + parent_externally_terminal → cancelled', () => {
@@ -186,12 +202,16 @@ describe('targetTransition: valid', () => {
     expect(hasEffect(t.effects, 'apply_label', (e) => e.kind === 'apply_label' && e.label === 'running')).toBe(true);
   });
 
-  test('dispatching + worker_failed (under retry cap) → retrying', () => {
+  test('dispatching + worker_failed → failed (no-auto-retry policy: park for human review)', () => {
     const t = targetTransition('dispatching', { kind: 'worker_failed', reason: 'spawn_err' }, tctx({ attempt: 0 }));
-    expect(t.to).toBe('retrying');
-    expect(hasEffect(t.effects, 'apply_label', (e) => e.kind === 'apply_label' && e.label === 'retrying')).toBe(true);
-    expect(hasEffect(t.effects, 'persist_retry')).toBe(true);
-    expect(hasEffect(t.effects, 'schedule_retry_timer')).toBe(true);
+    expect(t.to).toBe('failed');
+    expect(hasEffect(t.effects, 'remove_label', (e) => e.kind === 'remove_label' && e.label === 'dispatching')).toBe(true);
+    expect(hasEffect(t.effects, 'apply_label', (e) => e.kind === 'apply_label' && e.label === 'failed')).toBe(true);
+    expect(hasEffect(t.effects, 'post_comment')).toBe(true);
+    expect(hasEffect(t.effects, 'delete_run')).toBe(true);
+    // No retry scheduled
+    expect(hasEffect(t.effects, 'schedule_retry_timer')).toBe(false);
+    expect(hasEffect(t.effects, 'persist_retry')).toBe(false);
   });
 
   test('running + worker_emitted_run_id → running (persists run id)', () => {
@@ -207,15 +227,18 @@ describe('targetTransition: valid', () => {
     expect(hasEffect(t.effects, 'delete_run')).toBe(true);
   });
 
-  test('running + worker_failed → retrying', () => {
+  test('running + worker_failed → failed (no-auto-retry policy)', () => {
     const t = targetTransition('running', { kind: 'worker_failed', reason: 'crash' }, tctx({ attempt: 1 }));
-    expect(t.to).toBe('retrying');
+    expect(t.to).toBe('failed');
+    expect(hasEffect(t.effects, 'apply_label', (e) => e.kind === 'apply_label' && e.label === 'failed')).toBe(true);
+    expect(hasEffect(t.effects, 'post_comment', (e) => e.kind === 'post_comment' && /worker failed/i.test(e.body))).toBe(true);
+    expect(hasEffect(t.effects, 'schedule_retry_timer')).toBe(false);
   });
 
-  test('running + worker_failed at max attempts → failed', () => {
+  test('running + worker_failed at attempt=10 → failed (still no retry, no special "max" path)', () => {
     const t = targetTransition('running', { kind: 'worker_failed', reason: 'crash' }, tctx({ attempt: 10 }));
     expect(t.to).toBe('failed');
-    expect(hasEffect(t.effects, 'set_linear_state', (e) => e.kind === 'set_linear_state' && e.state === 'Cancelled')).toBe(true);
+    expect(hasEffect(t.effects, 'apply_label', (e) => e.kind === 'apply_label' && e.label === 'failed')).toBe(true);
   });
 
   test('running + gate_paused → gate_waiting', () => {
@@ -239,20 +262,17 @@ describe('targetTransition: valid', () => {
     expect(hasEffect(t.effects, 'archon_approve_and_resume')).toBe(true);
   });
 
-  test('gate_waiting + gate_rejected → retrying', () => {
+  test('gate_waiting + gate_rejected → failed (no-auto-retry: park for review)', () => {
     const t = targetTransition('gate_waiting', { kind: 'gate_rejected', message: 'no' }, tctx({ attempt: 0 }));
-    expect(t.to).toBe('retrying');
-    expect(hasEffect(t.effects, 'archon_reject')).toBe(true);
-  });
-
-  test('gate_waiting + gate_rejected at max → failed', () => {
-    const t = targetTransition('gate_waiting', { kind: 'gate_rejected', message: 'no' }, tctx({ attempt: 10 }));
     expect(t.to).toBe('failed');
+    expect(hasEffect(t.effects, 'archon_reject')).toBe(true);
+    expect(hasEffect(t.effects, 'apply_label', (e) => e.kind === 'apply_label' && e.label === 'failed')).toBe(true);
+    expect(hasEffect(t.effects, 'schedule_retry_timer')).toBe(false);
   });
 
-  test('gate_waiting + gate_timed_out → retrying', () => {
+  test('gate_waiting + gate_timed_out → failed (no-auto-retry)', () => {
     const t = targetTransition('gate_waiting', { kind: 'gate_timed_out' }, tctx());
-    expect(t.to).toBe('retrying');
+    expect(t.to).toBe('failed');
     expect(hasEffect(t.effects, 'archon_reject', (e) => e.kind === 'archon_reject' && /timeout/i.test(e.reason))).toBe(true);
   });
 

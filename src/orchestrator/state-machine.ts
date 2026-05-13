@@ -60,7 +60,7 @@ export type WorkerKey = string;
  * orchestrator translates Linear label strings to kinds before classification.
  */
 export type ParentLabelKind = 'analyzing' | 'claimed';
-export type TargetLabelKind = 'queued' | 'dispatching' | 'running' | 'waiting_human' | 'retrying';
+export type TargetLabelKind = 'queued' | 'dispatching' | 'running' | 'waiting_human' | 'retrying' | 'failed';
 export type LabelKind = ParentLabelKind | TargetLabelKind;
 
 // ─── Parent state machine ──────────────────────────────────────────────────
@@ -421,20 +421,23 @@ export const parentTransition: ParentTransitionFn = (state, event, ctx) => {
 
   if (state === 'claimed') {
     if (event.kind === 'target_terminal') {
-      const allTerminal = [...ctx.targets.values()].every((s) => s === 'succeeded' || s === 'failed');
-      if (!allTerminal) {
+      // Under the no-auto-retry policy, any target in `failed` keeps the
+      // parent in `claimed` indefinitely — operator must resolve the failure
+      // (review, fix, retry, or manually cancel the parent) before the
+      // parent can transition. Only fully-successful fan-outs auto-resolve.
+      const anyFailed = [...ctx.targets.values()].some((s) => s === 'failed');
+      if (anyFailed) {
         return { from: 'claimed', to: 'claimed', effects: [] };
       }
-      const anyFailed = [...ctx.targets.values()].some((s) => s === 'failed');
-      const to: ParentState = anyFailed ? 'cancelled' : 'done';
-      const linearState = anyFailed
-        ? (ctx.cfg.tracker.terminal_states.find((s) => s.toLowerCase() === 'cancelled') ?? completedState(ctx.cfg))
-        : completedState(ctx.cfg);
+      const allSucceeded = [...ctx.targets.values()].every((s) => s === 'succeeded');
+      if (!allSucceeded) {
+        return { from: 'claimed', to: 'claimed', effects: [] };
+      }
       return {
-        from: 'claimed', to,
+        from: 'claimed', to: 'done',
         effects: [
           { kind: 'remove_label', issue_id: parentId, label: 'claimed' },
-          { kind: 'set_linear_state', issue_id: parentId, state: linearState },
+          { kind: 'set_linear_state', issue_id: parentId, state: completedState(ctx.cfg) },
           { kind: 'release_parent_claim', parent_id: parentId },
           { kind: 'invalidate_analysis_cache', issue_id: parentId },
         ],
@@ -459,8 +462,17 @@ export const parentTransition: ParentTransitionFn = (state, event, ctx) => {
 
 // ─── Target transition function ────────────────────────────────────────────
 
-/** Max retry attempts before giving up. Matches the existing orchestrator constant. */
-const MAX_RETRY_ATTEMPTS = 10;
+/**
+ * Project policy: workers do NOT auto-retry on failure. Worker runs are
+ * expensive (each spawns a long-running Claude session), and silent retry
+ * loops burn API credits without surfacing root causes. Instead, every
+ * failure parks the target in `failed` with a comment posted to the target
+ * issue. A human reviews and triggers a retry (manual mechanism TBD).
+ *
+ * The retrying state remains in the SM enum for backwards compatibility and
+ * to keep the `retry_due` transition available for a future operator-driven
+ * retry mechanism, but no transition produces it under current policy.
+ */
 
 function workerKeyOf(id: TargetIdentity): WorkerKey {
   return `${id.parent_issue_id}__${id.repo_alias}`;
@@ -487,6 +499,8 @@ export const targetTransition: TargetTransitionFn = (state, event, ctx) => {
     }
     const effects: Effect[] = [];
     // Remove whatever target-level label this state owns.
+    // parent_terminal is only valid from non-terminal target states; `failed`
+    // and `succeeded` are terminal so they don't appear here.
     const labelForState: Partial<Record<TargetState, TargetLabelKind>> = {
       queued: 'queued',
       dispatching: 'dispatching',
@@ -686,6 +700,10 @@ export const classifyTargetState: TargetClassifierFn = (inp) => {
   const runId = inp.archon_run?.id ?? null;
   const recoveredAttempt = inp.persisted_retry?.attempt ?? 0;
 
+  if (inp.target_labels.has('failed')) {
+    return { identity: inp.identity, state: 'failed', run_id: null, attempt: recoveredAttempt };
+  }
+
   if (inp.target_labels.has('waiting_human')) {
     return { identity: inp.identity, state: 'gate_waiting', run_id: runId, attempt: recoveredAttempt };
   }
@@ -719,43 +737,46 @@ export const classifyTargetState: TargetClassifierFn = (inp) => {
   return null;
 };
 
-/** Shared helper for `worker_failed` and `gate_rejected`/`gate_timed_out`:
- *  pick `retrying` or `failed` based on attempt count and emit the right
- *  effects. `extraEffects` are prepended (used by gate-reject/timeout to
- *  reject the Archon run before scheduling the retry). */
+/**
+ * Failure handler shared by `worker_failed`, `gate_rejected`, and
+ * `gate_timed_out`. Under the no-auto-retry policy this always parks the
+ * target in `failed` and posts a comment on the target issue so a human can
+ * review and decide. `extraEffects` are prepended (used by gate-reject /
+ * timeout to first reject the live Archon run).
+ *
+ * The target stays in `failed` until human action — there is no automatic
+ * recovery and no maximum-retries cap. The parent SM stays in `claimed`
+ * while any target is in `failed` (see parentTransition's target_terminal
+ * handler), so the issue remains visible in operator dashboards.
+ */
 function retryOrFail(
   from: TargetState,
-  ctx: TargetTransitionContext,
+  _ctx: TargetTransitionContext,
   key: WorkerKey,
   tid: string,
   currentLabel: TargetLabelKind,
   reason: string,
   extraEffects: Effect[] = [],
 ): TargetTransition {
-  const nextAttempt = ctx.attempt + 1;
-  if (nextAttempt > MAX_RETRY_ATTEMPTS) {
-    return {
-      from, to: 'failed',
-      effects: [
-        ...extraEffects,
-        { kind: 'remove_label', issue_id: tid, label: currentLabel },
-        { kind: 'set_linear_state', issue_id: tid, state: 'Cancelled' },
-        { kind: 'delete_run', key },
-        { kind: 'delete_retry', key },
-        { kind: 'log', level: 'error', message: 'Max retries exhausted', fields: { key, reason } },
-      ],
-    };
-  }
-  const delayMs = Math.min(10_000 * Math.pow(2, nextAttempt - 1), ctx.cfg.agent.max_retry_backoff_ms);
+  const body =
+    `❌ **GaggleDispatch — worker failed**\n\n` +
+    `Reason: \`${reason}\`\n\n` +
+    `The worker has been stopped and will NOT retry automatically (project policy: ` +
+    `worker runs are expensive, so failures need human review).\n\n` +
+    `Review the logs, fix any underlying issue, then trigger a retry by removing the ` +
+    `**gaggle:failed** label and the relevant gaggle workflow labels from this issue. ` +
+    `If you want to abandon this work, move the issue to a terminal state.`;
+
   return {
-    from, to: 'retrying',
+    from, to: 'failed',
     effects: [
       ...extraEffects,
       { kind: 'remove_label', issue_id: tid, label: currentLabel },
-      { kind: 'apply_label', issue_id: tid, label: 'retrying' },
+      { kind: 'apply_label', issue_id: tid, label: 'failed' },
+      { kind: 'post_comment', issue_id: tid, body },
       { kind: 'delete_run', key },
-      { kind: 'persist_retry', key, meta: { attempt: nextAttempt, due_at_ms: Date.now() + delayMs, reason } },
-      { kind: 'schedule_retry_timer', key, delay_ms: delayMs, attempt: nextAttempt },
+      { kind: 'delete_retry', key },
+      { kind: 'log', level: 'warn', message: 'Worker failed — parked for human review', fields: { key, reason } },
     ],
   };
 }

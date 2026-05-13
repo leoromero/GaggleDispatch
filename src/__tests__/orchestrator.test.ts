@@ -21,6 +21,7 @@ import type { WorkspaceManager } from '../workspace/workspace-manager.ts';
 import type { RegistryLoaderHandle } from '../registry/loader.ts';
 import type {
   Issue,
+  IssueAnalysis,
   RegistryContext,
   ServiceConfig,
 } from '../domain/types.ts';
@@ -811,8 +812,8 @@ describe('hot path: handleGatePaused', () => {
   });
 });
 
-describe('hot path: handleWorkerExit failure → retrying', () => {
-  test('worker_failed (under max retries) transitions target to retrying and schedules a retry timer', async () => {
+describe('hot path: handleWorkerExit failure → failed (no-auto-retry policy)', () => {
+  test('worker_failed parks target in failed, posts comment, does NOT schedule a retry', async () => {
     const issue = makeIssue({ id: 'p1', identifier: 'SYM-310' });
     const cfg = makeServiceConfig();
     const calls: TrackerCall[] = [];
@@ -855,21 +856,29 @@ describe('hot path: handleWorkerExit failure → retrying', () => {
       started_at: new Date().toISOString(), attempt: null,
     });
 
+    const postCommentCalls: Array<{ id: string; body: string }> = [];
+    (tracker as unknown as { postComment: (id: string, body: string) => Promise<{ id: string }> }).postComment =
+      async (id: string, body: string) => { postCommentCalls.push({ id, body }); return { id: 'c1' }; };
+
     await (o as unknown as {
       handleWorkerExit(i: typeof issue, t: ReturnType<typeof makeRepoTarget>, e: { type: string }, a: number | null): Promise<void>;
     }).handleWorkerExit(issue, makeRepoTarget({ repo_alias: 'fe' }), { type: 'archon_failed' }, 0);
 
-    expect(o.getState().target_machine_states.get('p1__fe')).toBe('retrying');
-    expect(calls.some((c) => c.op === 'applyLabel' && c.args[1] === 'gaggle:retrying')).toBe(true);
-    // Retry timer should be scheduled via the hook → retry_attempts populated
-    expect(o.getState().retry_attempts.has('p1__fe')).toBe(true);
-    // Parent should NOT transition to done (target isn't terminal)
+    // Target parked in failed
+    expect(o.getState().target_machine_states.get('p1__fe')).toBe('failed');
+    expect(calls.some((c) => c.op === 'applyLabel' && c.args[1] === 'gaggle:failed')).toBe(true);
+    // No retry timer scheduled, no retry_attempts entry
+    expect(o.getState().retry_attempts.has('p1__fe')).toBe(false);
+    // Human-facing comment posted on the target issue
+    expect(postCommentCalls.length).toBeGreaterThan(0);
+    expect(postCommentCalls[0]?.body).toMatch(/worker failed/i);
+    // Parent STAYS claimed — operator must resolve
     expect(o.getState().parent_machine_states.get('p1')).toBe('claimed');
   });
 });
 
 describe('hot path: pollSupervisedGates timeout', () => {
-  test('gate that exceeds gate_timeout_ms → gate_timed_out fires; archon.rejectRun + retry scheduled', async () => {
+  test('gate that exceeds gate_timeout_ms → gate_timed_out fires; archon.rejectRun + target parked in failed', async () => {
     const issue = makeIssue({ id: 'p1', identifier: 'SYM-320' });
     const cfg = makeServiceConfig();
     cfg.archon.gate_timeout_ms = 1000; // tiny timeout
@@ -920,11 +929,13 @@ describe('hot path: pollSupervisedGates timeout', () => {
 
     // Archon reject was called via the SM's archon_reject effect
     expect(archonCalls.some((c) => c.startsWith('rejectRun(run-xyz,'))).toBe(true);
-    // Target moves to retrying; gate entry deleted
-    expect(o.getState().target_machine_states.get('p1__fe')).toBe('retrying');
+    // Target moves to failed (no-auto-retry policy); gate entry deleted
+    expect(o.getState().target_machine_states.get('p1__fe')).toBe('failed');
     expect(o.getState().supervised_gates.has('p1__fe')).toBe(false);
-    // Retry timer scheduled
-    expect(o.getState().retry_attempts.has('p1__fe')).toBe(true);
+    // No retry timer scheduled
+    expect(o.getState().retry_attempts.has('p1__fe')).toBe(false);
+    // gaggle:failed label applied
+    expect(calls.some((c) => c.op === 'applyLabel' && c.args[1] === 'gaggle:failed')).toBe(true);
   });
 });
 
@@ -972,12 +983,11 @@ describe('hot path: drainPendingTargets phase 3', () => {
     }).drainPendingTargets(issue, analysis);
 
     // emitTargetEvent transitioned 'queued' → 'dispatching'. launchWorker then
-    // tried to apply the running label (idempotent gaggle:dispatching remove
-    // is harmless; running apply may or may not succeed since spawnWorker is
-    // not a real subprocess). Either way, target_machine_states should now
-    // be 'dispatching' (or possibly 'retrying' if launchWorker failed cleanly).
-    const finalState = o.getState().target_machine_states.get('p1__fe');
-    expect(['dispatching', 'running', 'retrying']).toContain(finalState);
+    // tried to apply the running label. Under no-auto-retry policy a real
+    // spawn failure goes to 'failed' (not 'retrying'). Any non-queued
+    // non-undefined state confirms the SM dispatch fired.
+    const finalState = o.getState().target_machine_states.get('p1__fe') ?? '';
+    expect(['dispatching', 'running', 'failed']).toContain(finalState);
     // The SM-driven dispatch should have emitted the dispatching label.
     expect(calls.some((c) => c.op === 'applyLabel' && c.args[1] === 'gaggle:dispatching')).toBe(true);
   });

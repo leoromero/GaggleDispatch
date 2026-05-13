@@ -1386,6 +1386,15 @@ export class Orchestrator {
   }
 
   private async maybeReleaseClaim(issue_id: string): Promise<void> {
+    // No-auto-retry policy: if any target for this parent is in `failed`
+    // state, the operator must resolve before the parent can be released.
+    // Do NOT force-release.
+    for (const [key, state] of this.state.target_machine_states) {
+      if (key.startsWith(issue_id + '__') && state === 'failed') {
+        return;
+      }
+    }
+
     const pending = this.state.pending_targets.get(issue_id) ?? [];
     if (
       noRunningWorkersFor(this.state, issue_id) &&

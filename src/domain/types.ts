@@ -44,8 +44,13 @@ export interface GaggleLabels {
   analyzing: string;
   /** Applied to a target between SM dispatch_attempted and worker_started. */
   dispatching: string;
-  /** Applied to a target between failed attempts (worker_failed → retry_due). */
+  /** Applied to a target between failed attempts (worker_failed → retry_due).
+   *  Deprecated under the no-auto-retry policy — kept for backwards compat. */
   retrying: string;
+  /** Applied to a target that the worker failed on. The target parks here
+   *  awaiting human review; no automatic retry. Operator removes the label
+   *  (or fixes the underlying issue first) to trigger a retry. */
+  failed: string;
 }
 
 export interface TrackerConfig {
