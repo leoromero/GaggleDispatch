@@ -1,19 +1,206 @@
 # GaggleDispatch
 
-A federated, multi-repository AI coding orchestrator. Implements the **Symphony** specification (`SPEC_SYMPHONY.md`, Draft v2) in TypeScript on Bun.
+*Like a paragliding gaggle — each pilot flies their own line, but the formation stays coherent.*
 
-GaggleDispatch reads work from Linear, analyzes each issue against a federated registry of repository self-descriptions (per-repo `symphony.md` documents), routes the work to the right repositories, and runs Archon-powered Claude workflow sessions in per-issue isolated workspaces.
+**Multi-repo AI coding orchestrator.** GaggleDispatch reads issues from a project tracker, figures
+out which of your repositories are affected, and dispatches AI workflow sessions to work on each
+one in parallel. It handles cross-repo dependency ordering, supervised human-approval gates, and
+crash recovery. It never writes code itself.
 
-## What it does
+> Built on the [Symphony specification](SPEC_SYMPHONY.md) · Extended for multi-repo federation  
+> Default stack: **Linear** (tracker) · **Claude** (analyzer) · **Archon** (executor) — each is
+> swappable behind a clean interface.
 
-1. **Polls Linear** for active issues assigned to you (or your team).
-2. **Analyzes** each issue with Claude against the federated registry to decide which repos and which Archon workflows are relevant.
-3. **Fans out** to multiple repos in parallel when an issue spans services (with declared `depends_on` ordering between sub-issues).
-4. **Dispatches** `archon workflow run <workflow> --cwd <repo-checkout> "<issue message>"` for each repo target.
-5. **Bridges supervised gates**: when an Archon workflow pauses for a human (e.g. clarifying question, approval gate), GaggleDispatch posts a Linear comment, frees the concurrency slot, and waits for the human to reply with `approve` / `reject`.
-6. **Reconciles** state every poll: stops workers when issue states change, retries on failure with exponential backoff, refreshes sibling sub-issue readiness, and recovers from crashes via durable Linear labels.
+### What you get
 
-GaggleDispatch is the **scheduler / analyzer / runner**. Linear writes (state changes, comments, labels) belong to GaggleDispatch. Code, git, and PR creation belong to Archon/Claude.
+- **Automatic routing** — an AI analyzer reads each repo's `gaggle.md` self-description and
+  decides which repos and which workflows an issue requires. No manual triage.
+- **Multi-repo fan-out** — one issue spawns sub-issues per repo, dispatched in dependency order,
+  with blockers auto-created when an agent detects a cross-repo constraint.
+- **Deterministic AI execution** — the executor runs YAML-declared DAG workflows, not open-ended
+  agent loops. You know exactly which phases run, in what order, with human-approval gates at
+  defined checkpoints.
+- **Pluggable adapters** — tracker, AI model, and workflow executor are each defined by a narrow
+  interface. Swap Linear for Jira, Claude for another model, or Archon for your own runner without
+  touching the orchestration core.
+
+## How it works
+
+### The federated registry — `gaggle.md`
+
+Every registered repository owns a `gaggle.md` at its root: a structured self-description of what
+the repo does, its components, and its external dependencies. GaggleDispatch uses this file to
+route issues without any central architecture document.
+
+You don't write `gaggle.md` by hand. Run:
+
+```bash
+gaggle repo scaffold https://github.com/myorg/my-service
+```
+
+Archon launches a Claude agent that reads the repo's source code, maps its components and
+integrations, and opens a draft PR with the generated `gaggle.md`. Once merged, GaggleDispatch
+syncs it automatically. Every subsequent issue is routed using that living document.
+
+### Orchestration flow
+
+```
+                        ┌─────────────────────────────────────────────────────┐
+                        │                  GaggleDispatch                     │
+                        │                                                     │
+  Linear ───issues──▶  │  Analyzer (Claude)                                  │
+  (or any tracker)      │    reads gaggle.md ──▶ IssueAnalysis                │
+                        │    from every repo         │                        │
+                        │                      repo_targets                   │
+                        │                      depends_on                     │
+                        │                      ready_when                     │
+                        │                            │                        │
+                        │              ┌─────────────┼─────────────┐          │
+                        │              ▼             ▼             ▼          │
+                        │          [repo-a]      [repo-b]      [repo-c]       │
+                        │         sub-issue     sub-issue     sub-issue       │
+                        │              │             │             │          │
+                        └──────────────┼─────────────┼─────────────┼──────────┘
+                                       │             │             │
+                          archon workflow run         │             │
+                                       │        (blocked until     │
+                                       │         repo-a merged)    │
+                                       ▼                           ▼
+                               ┌──────────────┐           ┌──────────────┐
+                               │   Archon     │           │   Archon     │
+                               │  DAG workflow│           │  DAG workflow│
+                               │  (YAML-dec.) │           │  (YAML-dec.) │
+                               │  classify    │           │              │
+                               │  research    │           │              │
+                               │  implement ◀─┼── gate ───┼── Linear    │
+                               │  validate    │  (human   │   comment   │
+                               │  PR + review │   reply)  │             │
+                               └──────┬───────┘           └──────┬──────┘
+                                      │                          │
+                                      ▼                          ▼
+                                  GitHub PR                  GitHub PR
+                                      │
+                               CI/CD pipeline
+                               posts deploy label
+                               ──▶ unblocks repo-b
+```
+
+GaggleDispatch is the **scheduler, analyzer, and runner**. It owns tracker writes (state changes,
+comments, labels) and orchestration policy (routing, concurrency, retries, crash recovery). Code,
+git, and PR creation belong entirely to the workflow executor.
+
+A core principle from the Symphony specification: **the tracker is the state machine.** No local
+database. GaggleDispatch persists no scheduler state to disk — Linear labels (`gaggle:claimed`,
+`gaggle:running`, `gaggle:waiting-human`) are the durable record. On crash or restart,
+GaggleDispatch reads those labels and reconstructs exactly where it left off.
+
+## The Archon connection
+
+[Archon](https://github.com/coleam00/Archon) is the workflow executor GaggleDispatch dispatches
+to. Rather than giving Claude an open-ended chat loop and hoping for the best, Archon runs
+**YAML-declared DAG workflows** — directed acyclic graphs where each node is an explicit phase
+with defined inputs, outputs, tools, and conditions.
+
+This is what "deterministic AI execution" means in practice:
+
+| Free-form agent loop | Archon DAG workflow |
+|---|---|
+| LLM decides what to do next | Control flow declared in YAML |
+| Any tool at any time | Per-node `allowed_tools` restrictions |
+| One growing context window | `context: fresh` per node — no hallucination cascade |
+| Untyped natural language between steps | `output_format` JSON schema — downstream nodes get typed data |
+| Unbounded retries | `loop` nodes with `max_iterations` cap |
+| No defined handoff points | `approval` gate nodes — explicit human checkpoints |
+
+A minimal example from GaggleDispatch's default workflow:
+
+```yaml
+- id: classify
+  model: haiku
+  allowed_tools: []
+  output_format:
+    type: object
+    properties:
+      issue_type: { type: string, enum: [bug, feature, enhancement, refactor] }
+    required: [issue_type]
+
+- id: investigate
+  depends_on: [classify]
+  when: "$classify.output.issue_type == 'bug'"
+  context: fresh
+  prompt: |
+    Investigate the root cause. Save findings to ${ARTIFACTS_DIR}/investigation.md.
+
+- id: implement
+  depends_on: [investigate]
+  model: opus
+  loop:
+    until: COMPLETE
+    max_iterations: 20
+    fresh_context: true
+```
+
+GaggleDispatch bridges Archon with the tracker on two critical events:
+
+- **Approval gates** — when a workflow hits an `approval` node, GaggleDispatch frees the
+  concurrency slot, posts the gate message as a tracker comment, and polls for a human reply.
+  `approve` or `reject` resumes the workflow via the Archon API.
+- **Cross-repo blockers** — if an agent discovers mid-implementation that it needs a change in
+  another repository, it writes a structured `blocker-request.md` and exits. GaggleDispatch
+  detects the file, creates the upstream issue in the tracker, marks the current issue as blocked,
+  and restarts implementation automatically once the blocker is resolved. The agent never needs to
+  know about cross-repo orchestration — it just signals the constraint.
+
+## Built on the Symphony specification
+
+GaggleDispatch implements [**Symphony**](SPEC_SYMPHONY.md), a language-agnostic specification by
+Anthropic for orchestrating AI coding agents across a distributed system. The spec defines the
+contracts for issue tracking, federated registry, workspace isolation, workflow dispatch, gate
+handling, and crash recovery.
+
+GaggleDispatch is a **conforming implementation** — every REQUIRED item in the Symphony spec is
+covered — and extends it in four meaningful ways:
+
+### Multi-repo fan-out with self-discovered dependencies
+
+The original Symphony spec targets a single repository per issue. GaggleDispatch removes that
+limit. The Issue Analyzer reads every registered repo's `gaggle.md` and returns multiple
+`repo_targets` — one Archon session per repo, dispatched in parallel.
+
+Dependency ordering is declared by the analyzer, not hardcoded:
+
+```yaml
+repo_targets:
+  - repo: shared-auth-lib
+    workflow: gaggle/gaggle-fix-issue
+  - repo: patient-ingestion-service
+    workflow: gaggle/gaggle-fix-issue
+    depends_on: [shared-auth-lib]
+    ready_when: merged
+```
+
+`shared-auth-lib` runs first. `patient-ingestion-service` waits until it reaches the `merged`
+state. Your CI/CD pipeline posts the deploy labels; GaggleDispatch watches them.
+
+### Automatic sub-issue creation
+
+When an issue fans out to multiple repos, GaggleDispatch creates a tracker sub-issue per repo —
+each titled `[repo-alias] <parent title>`. Sub-issues carry their own labels, state transitions,
+and comments, giving the team full per-repo visibility without manual triage.
+
+### Agent-driven blocker creation
+
+If an Archon agent discovers mid-implementation that it needs a change in another repository, it
+writes a `blocker-request.md` with a title and description, then exits. GaggleDispatch detects
+the file, creates the upstream issue in the tracker, marks the current issue as blocked, and
+restarts implementation automatically once the blocker is resolved. The agent never needs to know
+about cross-repo orchestration — it just signals the constraint.
+
+### Startup crash recovery via tracker labels
+
+On any restart, GaggleDispatch reads tracker labels to reconstruct full in-flight state — no
+local state file, no manual recovery. A crash between label-write and process-launch is safe:
+the orphaned label is detected and the work is re-queued on the next tick.
 
 ## Requirements
 
@@ -48,10 +235,10 @@ gaggle init
 gaggle repo add https://github.com/myorg/patient-ingestion-service
 gaggle repo add https://github.com/myorg/shared-auth-lib
 
-# 4. Sync — clones repos, parses each repo's symphony.md, builds the synced registry.
+# 4. Sync — clones repos, parses each repo's gaggle.md, builds the synced registry.
 gaggle sync
 
-# 5. For repos missing a symphony.md, scaffold one via Archon (opens a draft PR).
+# 5. For repos missing a gaggle.md, scaffold one via Archon (opens a draft PR).
 gaggle repo scaffold https://github.com/myorg/shared-auth-lib
 
 # 6. Inspect what GaggleDispatch sees.
@@ -60,39 +247,6 @@ gaggle status
 # 7. Start the orchestrator.
 gaggle start
 ```
-
-## How the federation works
-
-Every registered repository owns a `symphony.md` at its root that declares:
-
-```yaml
----
-name: patient-ingestion-service
-description: >
-  Receives HL7 FHIR messages over HTTPS, validates them, and publishes
-  inbound events to downstream queues.
-default_workflow: symphony/symphony-fix-issue
-available_workflows:
-  - symphony/symphony-fix-issue
-  - symphony/symphony-supervised
-components:
-  - name: patient-ingestion-api
-    component_type: ecs_service
-    description: REST API surface that accepts FHIR payloads.
-    communicates_with:
-      - component: ingestion-queue
-        method: sqs
-        direction: produces
----
-
-# Patient Ingestion Service
-
-(Free-form Markdown narrative consumed verbatim by the Issue Analyzer.)
-```
-
-GaggleDispatch's **Repo Syncer** clones each registered repo into `<base_folder>/repos/<slug>/`, polls the remote SHA via `gh api repos/{owner}/{repo}/commits/{branch}`, parses `symphony.md` on changes, and writes the merged result to `<base_folder>/registry.synced.yaml` atomically. Name collisions (repo or component) are detected and surfaced with actionable messages.
-
-The **Issue Analyzer** then sends Claude the full registry context (front matter + narrative for every successfully synced repo) plus the normalized Linear issue, and asks Claude to return a strict JSON `IssueAnalysis` with `repo_targets`, `depends_on`, and `ready_when`.
 
 ## CLI reference
 
@@ -104,7 +258,7 @@ The **Issue Analyzer** then sends Claude the full registry context (front matter
 | `gaggle repo add <url>` | Register a repository in the Source Registry |
 | `gaggle repo remove <url\|slug>` | Deregister a repository (preserves local checkout) |
 | `gaggle repo list [--json]` | List registered repos with sync status |
-| `gaggle repo scaffold <url> [--async]` | Generate a draft `symphony.md` PR via Archon |
+| `gaggle repo scaffold <url> [--async]` | Generate a draft `gaggle.md` PR via Archon |
 | `gaggle scaffold status [--json] [--refresh-pr]` | Refresh and list scaffold jobs |
 | `gaggle scaffold cancel <slug>` | Abandon a scaffold job |
 | `gaggle sync [--repo <slug>] [--quiet]` | Run a single Repo Syncer pass |
@@ -206,7 +360,7 @@ archon:
   command: archon workflow run
   turn_timeout_ms: 7200000
   stall_timeout_ms: 600000
-  default_workflow: symphony/symphony-fix-issue
+  default_workflow: gaggle/gaggle-fix-issue
   gate_timeout_ms: 86400000               # 24h auto-reject for stale gates
 
 claude:
@@ -215,7 +369,7 @@ claude:
 
 workflow_templates:
   path: workflow_templates/               # local, version-controlled with WORKFLOW.md
-  target_subdir: symphony                 # synced into <repo>/.archon/workflows/symphony/
+  target_subdir: gaggle                   # synced into <repo>/.archon/workflows/gaggle/
 
 registry:
   base_folder: $GAGGLE_BASE_FOLDER        # MUST be outside this project directory
@@ -233,59 +387,36 @@ See `SPEC_SYMPHONY.md` Section 6.4 for the full cheatsheet.
 
 ## Workflow templates
 
-GaggleDispatch is the **single source of truth** for Symphony-managed Archon workflow YAML files. Edit a file once in `workflow_templates/` and it propagates to every registered repo's `.archon/workflows/symphony/` on the next dispatch.
+GaggleDispatch is the **single source of truth** for Archon workflow YAML files. Edit a file once in `workflow_templates/` and it propagates to every registered repo's `.archon/workflows/gaggle/` on the next dispatch.
 
 Default templates created by `gaggle init`:
 
-- `symphony-fix-issue.yaml` — autonomous, with one optional clarifying-question gate
-- `symphony-supervised.yaml` — explicit plan-approval gate before any code changes
-- `symphony-scaffold.yaml` — drafts a `symphony.md` and opens a PR (used by `gaggle repo scaffold`)
+- `gaggle-fix-issue.yaml` — autonomous, with one optional clarifying-question gate
+- `gaggle-supervised.yaml` — explicit plan-approval gate before any code changes
+- `gaggle-scaffold.yaml` — drafts a `gaggle.md` and opens a PR (used by `gaggle repo scaffold`)
 
-Add your own by dropping new YAML files into `workflow_templates/` and referencing them from a repo's `symphony.md`:
+Add your own by dropping new YAML files into `workflow_templates/` and referencing them from a repo's `gaggle.md`:
 
 ```yaml
-default_workflow: symphony/my-custom-workflow
+default_workflow: gaggle/my-custom-workflow
 available_workflows:
-  - symphony/symphony-fix-issue
-  - symphony/my-custom-workflow
+  - gaggle/gaggle-fix-issue
+  - gaggle/my-custom-workflow
 ```
 
-## Multi-repo fan-out and dependency ordering
+## Supervised gates
 
-When an issue affects multiple repos, the Issue Analyzer returns multiple `RepoTarget` entries. Each becomes its own worker and (by default) its own Linear sub-issue titled `[<repo_alias>] <parent title>`.
-
-Workers can declare `depends_on` and `ready_when`:
-
-- `ready_when: deployed` (default) — wait until the upstream sub-issue carries the `deployed:dev` label (or whichever `tracker.default_ready_env` is configured)
-- `ready_when: merged` — wait until the upstream sub-issue reaches a terminal state
-- `ready_when: deployed:prod` — wait for production deployment
-
-GaggleDispatch never writes deploy labels — your CI/CD pipeline does. See `SPEC_SYMPHONY.md` Section 7.5 for a GitHub Action sketch.
-
-## Supervised gates (loop.interactive / approval)
-
-When a Symphony workflow pauses at a `loop.interactive` or `approval` node:
+When a workflow pauses at an `approval` node:
 
 1. GaggleDispatch detects the pause from Archon stderr (capturing the run-id UUID).
 2. Worker moves from `running` → `supervised_gates`. **The concurrency slot is freed** — a paused process consumes no slot.
-3. The gate message is posted as a Linear comment on the (sub-)issue.
-4. The `symphony:waiting-human` label is applied; if `tracker.gate_waiting_state` is configured, the issue is moved to that parked lane.
+3. The gate message is posted as a tracker comment on the (sub-)issue.
+4. The `gaggle:waiting-human` label is applied; if `tracker.gate_waiting_state` is configured, the issue is moved to that parked lane.
 5. GaggleDispatch polls `fetch_issue_comments` every tick. When a human replies with `approve|approved|yes|y|lgtm` or `reject|rejected|no|n|cancel`, GaggleDispatch:
-   - Removes `symphony:waiting-human` and restores the active state.
+   - Removes `gaggle:waiting-human` and restores the active state.
    - Calls `archon workflow approve <run-id> --comment "<reply>"` (or `reject ... --reason ...`).
-   - Worker resumes; loop runs the next iteration with `$LOOP_USER_INPUT` set.
+   - Worker resumes with the human reply injected into the next loop iteration.
 6. If `archon.gate_timeout_ms > 0`, gates auto-reject after the timeout.
-
-## Crash safety / startup recovery
-
-GaggleDispatch persists no scheduler state to disk — **Linear labels are the durable record**. On startup it reads:
-
-- `symphony:claimed` issues → reconstructs `state.claimed`
-- `symphony:running` (sub-)issues → re-queues each as a crashed worker (the Archon process is gone, so we retry)
-- `symphony:queued` (sub-)issues → re-analyzes the parent on the next tick to recover full `RepoTarget` records
-- `symphony:waiting-human` (sub-)issues → reconstructs `supervised_gates` (the run-id is lost, so resolution is human-cleanup-only after restart)
-
-**Write-before-launch ordering** is enforced: labels are applied before Archon is launched. If GaggleDispatch crashes between label-write and process-launch, recovery sees the orphaned label and re-queues.
 
 ## Project layout
 
@@ -297,11 +428,13 @@ GaggleDispatch/
 │   ├── config/            # WORKFLOW.md loader, service-config builder, file watcher
 │   ├── domain/            # Types, errors
 │   ├── executor/          # Archon subprocess executor (gate detection, stall, timeout)
+│   ├── hub/               # Multi-workspace hub server, dashboard, SQLite history
 │   ├── orchestrator/      # Tick loop, state machine, fan-out, retry, reconciliation
-│   ├── registry/          # Synced registry I/O, Repo Syncer, symphony.md parser, scaffold-jobs
+│   ├── registry/          # Synced registry I/O, Repo Syncer, gaggle.md parser, scaffold-jobs
 │   ├── tracker/           # Linear adapter (10 ops from Section 12.1)
 │   ├── util/              # Logger, lock, paths, fs, subprocess helpers
 │   └── workspace/         # Workspace manager, message construction, template sync
+├── dashboard/             # Hub dashboard SPA (HTML/CSS/JS)
 ├── SPEC_SYMPHONY.md       # The specification this codebase implements
 ├── package.json
 ├── tsconfig.json
@@ -321,15 +454,15 @@ bun run cli -- --help
 
 | Suite                              | What it covers                                                                  |
 | ---------------------------------- | ------------------------------------------------------------------------------- |
-| `smoke.test.ts`                    | Config loader, `symphony.md` parser, name-collision detection, util helpers, readiness predicate, issue-message construction, orchestrator state init |
-| `linear.test.ts`                   | `LinearClient` with `globalThis.fetch` stubbed: viewer/team/state/label resolution, all 10 mutations, GraphQL error propagation, label caching, `ensureSymphonyLabels` |
+| `smoke.test.ts`                    | Config loader, `gaggle.md` parser, name-collision detection, util helpers, readiness predicate, issue-message construction, orchestrator state init |
+| `linear.test.ts`                   | `LinearClient` with `globalThis.fetch` stubbed: viewer/team/state/label resolution, all 10 mutations, GraphQL error propagation, label caching, `ensureGaggleLabels` |
 | `analyzer.test.ts`                 | `IssueAnalyzer` with an injected fake `AnalyzerClient`: clean JSON, ```-fenced JSON, prose-surrounded JSON, alias-only reconciliation, `depends_on` + `ready_when` preservation, alias mismatch dropping, zero-targets failure, malformed-JSON failure, model/max_tokens propagation, SDK-error wrapping, fallback workflow, alias sanitization |
 | `executor.test.ts`                 | `RUN_ID_REGEX`, `PAUSE_REGEX`, `detectGatePause`, `tokenizeArchonCommand` (quoting), `buildArchonRunArgv` |
 | `orchestrator-helpers.test.ts`     | `classifyApprovalIntent` approve/reject/ambiguous, `findHumanReplyAfter` bot/anonymous filtering and timestamp ordering |
-| `orchestrator.test.ts`             | Full-cycle with fakes: `ensureSymphonyLabels` on start, `resolveViewerId` opt-in, label-driven recovery (claimed parents + `[alias]`-prefixed running sub-issues), analysis-cache invalidation on registry change, `stop()` cancels every `LiveSession` |
+| `orchestrator.test.ts`             | Full-cycle with fakes: `ensureGaggleLabels` on start, `resolveViewerId` opt-in, label-driven recovery (claimed parents + `[alias]`-prefixed running sub-issues), analysis-cache invalidation on registry change, `stop()` cancels every `LiveSession` |
 | `registry-roundtrip.test.ts`       | `registry.synced.yaml` write→load round-trip with all `SyncStatus` values, banner emission, malformed/empty YAML errors; `scaffold_jobs.yaml` round-trip, `upsertJob`/`removeJobBySlug` purity, `loadScaffoldJobs` graceful malformed handling |
 | `lock.test.ts`                     | `withLock` returns body value, serializes contention, releases on throw, writes the holder JSON sidecar, `LockTimeout` carries the lock target path |
-| `repo-syncer.test.ts`              | End-to-end sync against a local bare git repo with a `node`-based `gh` shim: success, missing `symphony.md`, partial failure, duplicate slug rejection; `applyNameCollisions` edge cases (empty input, mixed status, repo+component name collisions, order preservation) |
+| `repo-syncer.test.ts`              | End-to-end sync against a local bare git repo with a `node`-based `gh` shim: success, missing `gaggle.md`, partial failure, duplicate slug rejection; `applyNameCollisions` edge cases (empty input, mixed status, repo+component name collisions, order preservation) |
 
 ## Conformance
 
