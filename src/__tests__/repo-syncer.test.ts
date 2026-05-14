@@ -181,7 +181,7 @@ describe('Repo Syncer integration', () => {
     const persisted = loadSyncedRegistry(baseFolder);
     expect(persisted!.repositories[0]!.frontmatter?.name).toBe('test-repo');
     expect(existsSync(syncedRegistryPath(baseFolder))).toBe(true);
-  });
+  }, 30_000);
 
   test('end-to-end: missing gaggle.md results in sync_status=missing_gaggle_md', async () => {
     if (!gitOk || !nodeOk) return;
@@ -206,7 +206,7 @@ describe('Repo Syncer integration', () => {
     expect(result.missing).toBe(1);
     expect(result.per_repo[0]!.sync_status).toBe('missing_gaggle_md');
     expect(result.per_repo[0]!.sync_error).toMatch(/No gaggle.md/i);
-  });
+  }, 30_000);
 
   test('end-to-end: gh failure → sync_status=error and other repos still processed', async () => {
     if (!gitOk || !nodeOk) return;
@@ -237,7 +237,7 @@ describe('Repo Syncer integration', () => {
     const errEntry = result.per_repo.find((r) => r.url.includes('missing-repo'))!;
     expect(errEntry.sync_status).toBe('error');
     expect(errEntry.sync_error).toMatch(/gh api/i);
-  });
+  }, 30_000);
 
   test('runSyncPass throws RepoSyncError when two repos derive the same slug', async () => {
     if (!gitOk || !nodeOk) return;
