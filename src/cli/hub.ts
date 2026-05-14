@@ -1,5 +1,5 @@
 /**
- * `gaggle hub` — multi-gaggle hub commands.
+ * `gaggle nest` — multi-gaggle nest commands.
  */
 
 import chalk from 'chalk';
@@ -19,18 +19,18 @@ import { ArchonSupervisor } from '../hub/archon-supervisor.ts';
 import { logger } from '../util/logger.ts';
 import { readSidecar, isPidAlive } from '../hub/sidecar.ts';
 
-export async function runHubInit(): Promise<void> {
+export async function runNestInit(): Promise<void> {
   const path = defaultHubConfigPath();
   if (existsSync(path)) {
-    console.log(chalk.cyan(`Hub config already exists at ${path}`));
+    console.log(chalk.cyan(`Nest config already exists at ${path}`));
     return;
   }
   ensureHubConfig(path);
   console.log(chalk.green(`✓ Created ${path}`));
-  console.log(chalk.dim(`  Add workspaces with: gaggle hub add <path>`));
+  console.log(chalk.dim(`  Add workspaces with: gaggle nest add <path>`));
 }
 
-export async function runHubAdd(opts: { path: string; name?: string; color?: string }): Promise<void> {
+export async function runNestAdd(opts: { path: string; name?: string; color?: string }): Promise<void> {
   const absPath = isAbsolute(opts.path) ? opts.path : resolve(process.cwd(), opts.path);
   if (!existsSync(absPath)) {
     console.error(chalk.red(`✗ Path does not exist: ${absPath}`));
@@ -52,7 +52,7 @@ export async function runHubAdd(opts: { path: string; name?: string; color?: str
   console.log(chalk.green(`✓ Added workspace '${name}' → ${absPath}`));
 }
 
-export async function runHubRemove(opts: { name: string }): Promise<void> {
+export async function runNestRemove(opts: { name: string }): Promise<void> {
   const cfg = loadHubConfig();
   const { cfg: next, removed } = removeWorkspace(cfg, opts.name);
   if (!removed) {
@@ -63,14 +63,14 @@ export async function runHubRemove(opts: { name: string }): Promise<void> {
   console.log(chalk.green(`✓ Removed workspace '${opts.name}'`));
 }
 
-export async function runHubList(opts: { json?: boolean }): Promise<void> {
+export async function runNestList(opts: { json?: boolean }): Promise<void> {
   const cfg = loadHubConfig();
   if (opts.json) {
     console.log(JSON.stringify(cfg, null, 2));
     return;
   }
   if (cfg.workspaces.length === 0) {
-    console.log(chalk.dim('No workspaces registered. Use: gaggle hub add <path>'));
+    console.log(chalk.dim('No workspaces registered. Use: gaggle nest add <path>'));
     return;
   }
   console.log(chalk.bold('Registered workspaces:'));
@@ -86,7 +86,7 @@ export async function runHubList(opts: { json?: boolean }): Promise<void> {
   console.log(chalk.dim(`UI: http://${cfg.ui.host ?? '127.0.0.1'}:${cfg.ui.port}`));
 }
 
-export async function runHubStatus(opts: { json?: boolean }): Promise<void> {
+export async function runNestStatus(opts: { json?: boolean }): Promise<void> {
   // Lightweight status — uses sidecars only, no need for hub to be running.
   const cfg = loadHubConfig();
   const entries = cfg.workspaces.map((w) => {
@@ -112,10 +112,10 @@ export async function runHubStatus(opts: { json?: boolean }): Promise<void> {
   }
 }
 
-export async function runHubStart(opts: { only?: string[] }): Promise<void> {
+export async function runNestStart(opts: { only?: string[] }): Promise<void> {
   const cfg = loadHubConfig();
   if (cfg.workspaces.length === 0) {
-    console.error(chalk.red(`✗ No workspaces registered. Run: gaggle hub add <path>`));
+    console.error(chalk.red(`✗ No workspaces registered. Run: gaggle nest add <path>`));
     process.exit(1);
   }
   const targets = opts.only?.length
@@ -129,7 +129,7 @@ export async function runHubStart(opts: { only?: string[] }): Promise<void> {
 
   const manager = new HubProcessManager({ cliEntry: resolveCliEntry() });
 
-  console.log(chalk.cyan(`Starting hub with ${targets.length} workspace(s)…`));
+  console.log(chalk.cyan(`Starting nest with ${targets.length} workspace(s)…`));
   for (const w of targets) {
     await manager.startWorkspace(w);
   }
@@ -153,13 +153,13 @@ export async function runHubStart(opts: { only?: string[] }): Promise<void> {
   // Start hub server.
   const dashboardDir = resolveDashboardDir();
   const hub = startHubServer({ cfg, manager, archon, dashboardDir });
-  console.log(chalk.green(`✓ Hub dashboard at ${hub.url}`));
+  console.log(chalk.green(`✓ Nest dashboard at ${hub.url}`));
 
   let shuttingDown = false;
   const shutdown = async (signal: string) => {
     if (shuttingDown) return;
     shuttingDown = true;
-    console.log(chalk.yellow(`\nReceived ${signal}, shutting down hub…`));
+    console.log(chalk.yellow(`\nReceived ${signal}, shutting down nest…`));
     try {
       await hub.stop();
     } catch (e) {

@@ -17,12 +17,12 @@ import { runStatus, runPs } from './status.ts';
 import { runStart } from './start.ts';
 import { runTemplatesUpdate } from './templates-update.ts';
 import {
-  runHubAdd,
-  runHubInit,
-  runHubList,
-  runHubRemove,
-  runHubStart,
-  runHubStatus,
+  runNestAdd,
+  runNestInit,
+  runNestList,
+  runNestRemove,
+  runNestStart,
+  runNestStatus,
 } from './hub.ts';
 import { GaggleError } from '../domain/errors.ts';
 
@@ -173,54 +173,54 @@ program
     await runStart({ cwd: program.opts().cwd, apiPort, workspaceName: opts.workspaceName });
   });
 
-// ── hub ─────────────────────────────────────────────────────────────────────
-const hub = program.command('hub').description('Manage multiple gaggles and the dashboard UI');
+// ── nest ─────────────────────────────────────────────────────────────────────
+const nest = program.command('nest').description('Manage multiple gaggles and the dashboard UI');
 
-hub
+nest
   .command('init')
-  .description('Create the hub config file at ~/.config/gaggle/hub.yaml')
+  .description('Create the nest config file at ~/.config/gaggle/hub.yaml')
   .action(async () => {
-    await runHubInit();
+    await runNestInit();
   });
 
-hub
+nest
   .command('add <path>')
   .description('Register a gaggle workspace (a directory containing WORKFLOW.md)')
   .option('--name <name>', 'override the workspace name (defaults to directory name)')
   .option('--color <hex>', 'override the assigned color (e.g. #4f9cf9)')
   .action(async (path: string, opts: { name?: string; color?: string }) => {
-    await runHubAdd({ path, name: opts.name, color: opts.color });
+    await runNestAdd({ path, name: opts.name, color: opts.color });
   });
 
-hub
+nest
   .command('remove <name>')
   .description('Unregister a gaggle workspace')
   .action(async (name: string) => {
-    await runHubRemove({ name });
+    await runNestRemove({ name });
   });
 
-hub
+nest
   .command('list')
   .description('List registered workspaces and their live status')
   .option('--json', 'machine-readable output')
   .action(async (opts: { json?: boolean }) => {
-    await runHubList({ json: opts.json });
+    await runNestList({ json: opts.json });
   });
 
-hub
+nest
   .command('status')
-  .description('Show status of each workspace (via sidecar files; hub need not be running)')
+  .description('Show status of each workspace (via sidecar files; nest need not be running)')
   .option('--json', 'machine-readable output')
   .action(async (opts: { json?: boolean }) => {
-    await runHubStatus({ json: opts.json });
+    await runNestStatus({ json: opts.json });
   });
 
-hub
+nest
   .command('start')
   .description('Start every registered workspace + the dashboard UI')
   .option('--only <names...>', 'only start the named workspaces')
   .action(async (opts: { only?: string[] }) => {
-    await runHubStart({ only: opts.only });
+    await runNestStart({ only: opts.only });
   });
 
 // ── auth ────────────────────────────────────────────────────────────────────
