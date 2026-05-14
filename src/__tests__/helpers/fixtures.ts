@@ -95,6 +95,7 @@ export function makeServiceConfig(overrides: Partial<ServiceConfig> = {}): Servi
       active_states: ['Todo', 'In Progress'],
       terminal_states: ['Done', 'Cancelled'],
       assigned_to_me: true,
+      assigned_to_user_email: null,
       create_sub_issues: true,
       default_ready_env: 'dev',
       deploy_env_labels: { dev: 'deployed:dev', staging: 'deployed:staging', prod: 'deployed:prod' },

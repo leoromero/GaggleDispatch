@@ -267,7 +267,7 @@ describe('readiness predicate', () => {
       endpoint: '', api_key: 'x', project_slug: 'X',
       active_states: ['Todo', 'In Progress'],
       terminal_states: ['Done'],
-      assigned_to_me: true, create_sub_issues: true,
+      assigned_to_me: true, assigned_to_user_email: null, create_sub_issues: true,
       default_ready_env: 'dev',
       deploy_env_labels: { dev: 'deployed:dev', staging: 'deployed:staging', prod: 'deployed:prod' },
       blocker_satisfied_states: [],
