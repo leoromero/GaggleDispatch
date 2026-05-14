@@ -71,7 +71,7 @@ nodes:
       3. Find all call sites affected by the bug.
       4. Propose a concrete fix approach — do NOT implement yet.
 
-      Save your findings to \${ARTIFACTS_DIR}/investigation.md:
+      Save your findings to \$ARTIFACTS_DIR/investigation.md:
       - Root cause (1–2 sentences)
       - Affected files and line numbers
       - Proposed fix approach (numbered steps)
@@ -96,7 +96,7 @@ nodes:
       3. Note any API contracts, interfaces, or external dependencies this change touches.
       4. Flag decisions, trade-offs, and risks the implementer must know about.
 
-      Save your plan to \${ARTIFACTS_DIR}/investigation.md:
+      Save your plan to \$ARTIFACTS_DIR/investigation.md:
       - Goal (1–2 sentences)
       - Files to create/modify (with purpose)
       - Implementation steps (numbered)
@@ -104,9 +104,9 @@ nodes:
 
   - id: bridge-artifacts
     bash: |
-      mkdir -p "\${ARTIFACTS_DIR}"
-      if [ ! -f "\${ARTIFACTS_DIR}/investigation.md" ]; then
-        echo "WARNING: no investigation.md produced" > "\${ARTIFACTS_DIR}/investigation.md"
+      mkdir -p "\$ARTIFACTS_DIR"
+      if [ ! -f "\$ARTIFACTS_DIR/investigation.md" ]; then
+        echo "WARNING: no investigation.md produced" > "\$ARTIFACTS_DIR/investigation.md"
       fi
       echo "Artifact check complete"
     depends_on: [investigate, plan]
@@ -130,7 +130,7 @@ nodes:
 
         ## Research / Plan
 
-        Read \${ARTIFACTS_DIR}/investigation.md in full before writing a single line of code.
+        Read \$ARTIFACTS_DIR/investigation.md in full before writing a single line of code.
 
         ## Rules
 
@@ -141,7 +141,7 @@ nodes:
         - If you discover that this change requires work in ANOTHER repository or library that
           does not yet exist (e.g. a shared package needs a new API, a library version must be
           bumped upstream), DO NOT guess or work around it. Instead:
-          1. Write \${ARTIFACTS_DIR}/blocker-request.md with exactly this format:
+          1. Write \$ARTIFACTS_DIR/blocker-request.md with exactly this format:
                title: <one-line description of what the other repo must do>
                description: <why this issue depends on it and what specifically is needed>
           2. Output exactly: COMPLETE
@@ -155,7 +155,7 @@ nodes:
   - id: check-blocker
     bash: |
       set -euo pipefail
-      if [ -f "\${ARTIFACTS_DIR}/blocker-request.md" ]; then
+      if [ -f "\$ARTIFACTS_DIR/blocker-request.md" ]; then
         echo "BLOCKER"
       else
         echo "CONTINUE"
@@ -166,8 +166,8 @@ nodes:
     approval:
       message: |
         CREATE_BLOCKER
-        $(grep "^title:" "\${ARTIFACTS_DIR}/blocker-request.md" | sed 's/^title: *//')
-        $(grep -A 1000 "^description:" "\${ARTIFACTS_DIR}/blocker-request.md" | tail -n +2)
+        $(grep "^title:" "\$ARTIFACTS_DIR/blocker-request.md" | sed 's/^title: *//')
+        $(grep -A 1000 "^description:" "\$ARTIFACTS_DIR/blocker-request.md" | tail -n +2)
       capture_response: false
     depends_on: [check-blocker]
     when: "$check-blocker.output == 'BLOCKER'"
@@ -177,15 +177,18 @@ nodes:
   # ═══════════════════════════════════════════════════════════════
 
   - id: validate-script
+    # 30 min — Archon's default 120s isn't enough for real test suites
+    # (TS build + unit tests + E2E commonly exceed it). Tune per repo.
+    timeout: 1800000
     bash: |
       set -euo pipefail
-      mkdir -p "\${ARTIFACTS_DIR}"
+      mkdir -p "\$ARTIFACTS_DIR"
       if [ -f ".gaggle/validate.sh" ]; then
         echo "[validate] running .gaggle/validate.sh"
-        bash .gaggle/validate.sh 2>&1 | tee "\${ARTIFACTS_DIR}/validation.txt"
-        echo "SCRIPT_OK" > "\${ARTIFACTS_DIR}/.validate-mode"
+        bash .gaggle/validate.sh 2>&1 | tee "\$ARTIFACTS_DIR/validation.txt"
+        echo "SCRIPT_OK" > "\$ARTIFACTS_DIR/.validate-mode"
       else
-        echo "FALLBACK" > "\${ARTIFACTS_DIR}/.validate-mode"
+        echo "FALLBACK" > "\$ARTIFACTS_DIR/.validate-mode"
       fi
     depends_on: [check-blocker]
     when: "$check-blocker.output == 'CONTINUE'"
@@ -198,24 +201,24 @@ nodes:
 
       First, check how validation ran:
       \`\`\`bash
-      cat "\${ARTIFACTS_DIR}/.validate-mode"
+      cat "\$ARTIFACTS_DIR/.validate-mode"
       \`\`\`
 
       If the mode is SCRIPT_OK:
-      - Read \`\${ARTIFACTS_DIR}/validation.txt\` — these are the real test results.
+      - Read \`\$ARTIFACTS_DIR/validation.txt\` — these are the real test results.
       - If any failures are shown, fix them and re-run \`bash .gaggle/validate.sh\`, repeating until green.
-      - Write a summary to \`\${ARTIFACTS_DIR}/validation.md\`.
+      - Write a summary to \`\$ARTIFACTS_DIR/validation.md\`.
 
       If the mode is FALLBACK (no .gaggle/validate.sh found):
       - Discover the test runner: check for bun.lockb, pnpm-lock.yaml, yarn.lock, package-lock.json,
         pyproject.toml, Cargo.toml, go.mod.
       - Run the full test suite, type checks, and linting appropriate for this stack.
       - Fix any failures.
-      - Write a summary to \`\${ARTIFACTS_DIR}/validation.md\`.
+      - Write a summary to \`\$ARTIFACTS_DIR/validation.md\`.
       - Suggest creating a \`.gaggle/validate.sh\` file with the commands you used so future
         runs are deterministic. Add it to a commit if the human approves.
 
-      The summary in \`\${ARTIFACTS_DIR}/validation.md\` must include:
+      The summary in \`\$ARTIFACTS_DIR/validation.md\` must include:
       - Test results (pass/fail counts)
       - Type check / lint status
       - Build status
@@ -240,7 +243,7 @@ nodes:
 
       1. Check git status. Stage and commit any remaining source changes:
          - Use \`git add <specific files>\` — never \`git add -A\` or \`git add .\`
-         - Never commit scratch files, review artifacts, or anything under \${ARTIFACTS_DIR}
+         - Never commit scratch files, review artifacts, or anything under \$ARTIFACTS_DIR
       2. Push the branch: \`git push -u origin HEAD\`
       3. Check if a PR already exists: \`gh pr list --head $(git branch --show-current)\`
          - If one exists, capture its number and skip creation.
@@ -248,16 +251,16 @@ nodes:
          \`.github/PULL_REQUEST_TEMPLATE.md\`, or \`docs/PULL_REQUEST_TEMPLATE.md\`.
       5. Create a DRAFT PR: \`gh pr create --draft --base $BASE_BRANCH\`
          - Title: concise, imperative mood, under 70 chars
-         - Fill every PR template section using \${ARTIFACTS_DIR}/investigation.md,
-           \${ARTIFACTS_DIR}/implementation.md, and \${ARTIFACTS_DIR}/validation.md.
+         - Fill every PR template section using \$ARTIFACTS_DIR/investigation.md,
+           \$ARTIFACTS_DIR/implementation.md, and \$ARTIFACTS_DIR/validation.md.
            If no template, write: summary, changes made, validation evidence, and a
            Fixes/Closes line referencing the issue URL from $USER_MESSAGE.
-         - Write the body to \${ARTIFACTS_DIR}/pr-body.md and use \`--body-file\`.
+         - Write the body to \$ARTIFACTS_DIR/pr-body.md and use \`--body-file\`.
            Never write body files inside the worktree.
       6. Save PR identifiers:
          \`\`\`bash
-         gh pr view --json number -q '.number' > "\${ARTIFACTS_DIR}/.pr-number"
-         gh pr view --json url -q '.url' > "\${ARTIFACTS_DIR}/.pr-url"
+         gh pr view --json number -q '.number' > "\$ARTIFACTS_DIR/.pr-number"
+         gh pr view --json url -q '.url' > "\$ARTIFACTS_DIR/.pr-url"
          \`\`\`
 
   # ═══════════════════════════════════════════════════════════════
@@ -429,11 +432,163 @@ nodes:
       required: [issue_type, reasoning]
 
   # ═══════════════════════════════════════════════════════════════
+  # PHASE 2.5: CLARIFICATION
+  # Agent-driven Q&A. Human only answers — the agent decides
+  # whether another round is needed. Maximum 2 rounds.
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: clarify
+    depends_on: [classify]
+    model: haiku
+    allowed_tools: []
+    context: fresh
+    prompt: |
+      You are preparing to plan the implementation of the issue below.
+      Before planning begins, identify any ambiguous or underspecified requirements
+      that would materially change the implementation approach.
+
+      ## Issue context
+
+      \$USER_MESSAGE
+
+      ## Instructions
+
+      If genuine open questions exist (not answerable by reading the codebase):
+      - Write them as a numbered list to \$ARTIFACTS_DIR/questions.md
+      - Be specific and concrete — do not ask open-ended "tell me more" questions
+
+      If the issue is fully specified and nothing is unclear:
+      - Write exactly the word NONE to \$ARTIFACTS_DIR/questions.md
+
+      Do NOT ask about things that can be inferred by reading the source files.
+      Do NOT ask about implementation details — only about requirements and intent.
+
+  - id: clarify-needed
+    bash: |
+      set -euo pipefail
+      mkdir -p "\$ARTIFACTS_DIR"
+      if [ ! -f "\$ARTIFACTS_DIR/questions.md" ]; then
+        echo "NO"
+        exit 0
+      fi
+      TRIMMED=$(tr -d '[:space:]' < "\$ARTIFACTS_DIR/questions.md")
+      if [ "\$TRIMMED" = "NONE" ]; then echo "NO"; else echo "YES"; fi
+    depends_on: [clarify]
+
+  - id: clarify-post-round-1
+    bash: |
+      set -euo pipefail
+      BODY=$(cat "\$ARTIFACTS_DIR/questions.md")
+      ESCAPED=$(printf '%s' "\$BODY" | python3 -c "import sys,json; print(json.dumps(sys.stdin.read()))")
+      curl -sf -X POST https://api.linear.app/graphql \\
+        -H "Authorization: \$LINEAR_API_KEY" \\
+        -H "Content-Type: application/json" \\
+        --data "{\\"query\\": \\"mutation { commentCreate(input: { issueId: \\\\\\"\\$GAGGLE_ISSUE_ID\\\\\\", body: \\$ESCAPED }) { success } }\\"}" \\
+        || echo "WARNING: failed to post clarifying questions to Linear" >&2
+      printf '## Round 1 Questions\\n\\n' > "\$ARTIFACTS_DIR/answers.md"
+      cat "\$ARTIFACTS_DIR/questions.md" >> "\$ARTIFACTS_DIR/answers.md"
+      printf '\\n## Round 1 Answers\\n\\n' >> "\$ARTIFACTS_DIR/answers.md"
+    depends_on: [clarify-needed]
+    when: "$clarify-needed.output == 'YES'"
+
+  - id: clarify-gate-round-1
+    depends_on: [clarify-post-round-1]
+    when: "$clarify-needed.output == 'YES'"
+    approval:
+      message: |
+        ## Clarifying Questions
+
+        $(cat "\$ARTIFACTS_DIR/questions.md")
+
+        Please answer these questions. Your responses will shape the implementation plan.
+      capture_response: true
+
+  - id: clarify-evaluate-round-1
+    depends_on: [clarify-gate-round-1]
+    when: "$clarify-needed.output == 'YES'"
+    model: haiku
+    allowed_tools: []
+    context: fresh
+    prompt: |
+      Review whether the human's answers are sufficient to proceed to planning.
+
+      ## Original questions
+
+      Read \$ARTIFACTS_DIR/questions.md
+
+      ## Human's answers
+
+      \$clarify-gate-round-1.output
+
+      ## Instructions
+
+      1. Append the human's answers to \$ARTIFACTS_DIR/answers.md after the
+         "## Round 1 Answers" header already in the file.
+      2. Determine if all critical questions are answered.
+      3. If sufficient: output {"complete": "true", "followup_questions": ""}
+      4. If critical gaps remain: write ONLY the new follow-up questions (numbered list)
+         to \$ARTIFACTS_DIR/questions.md (overwrite), then populate followup_questions.
+    output_format:
+      type: object
+      properties:
+        complete:
+          type: string
+          enum: ["true", "false"]
+        followup_questions:
+          type: string
+      required: [complete, followup_questions]
+
+  - id: clarify-post-round-2
+    bash: |
+      set -euo pipefail
+      BODY=$(cat "\$ARTIFACTS_DIR/questions.md")
+      ESCAPED=$(printf '%s' "\$BODY" | python3 -c "import sys,json; print(json.dumps(sys.stdin.read()))")
+      curl -sf -X POST https://api.linear.app/graphql \\
+        -H "Authorization: \$LINEAR_API_KEY" \\
+        -H "Content-Type: application/json" \\
+        --data "{\\"query\\": \\"mutation { commentCreate(input: { issueId: \\\\\\"\\$GAGGLE_ISSUE_ID\\\\\\", body: \\$ESCAPED }) { success } }\\"}" \\
+        || echo "WARNING: failed to post round-2 questions to Linear" >&2
+      printf '\\n## Round 2 Questions\\n\\n' >> "\$ARTIFACTS_DIR/answers.md"
+      cat "\$ARTIFACTS_DIR/questions.md" >> "\$ARTIFACTS_DIR/answers.md"
+      printf '\\n## Round 2 Answers\\n\\n' >> "\$ARTIFACTS_DIR/answers.md"
+    depends_on: [clarify-evaluate-round-1]
+    when: "$clarify-evaluate-round-1.output.complete == 'false'"
+
+  - id: clarify-gate-round-2
+    depends_on: [clarify-post-round-2]
+    when: "$clarify-evaluate-round-1.output.complete == 'false'"
+    approval:
+      message: |
+        ## Follow-up Questions
+
+        $(cat "\$ARTIFACTS_DIR/questions.md")
+
+        Please answer these follow-up questions.
+      capture_response: true
+
+  - id: clarify-append-round-2
+    bash: |
+      set -euo pipefail
+      printf '%s\\n' "\$clarify-gate-round-2.output" >> "\$ARTIFACTS_DIR/answers.md"
+    depends_on: [clarify-gate-round-2]
+    when: "$clarify-evaluate-round-1.output.complete == 'false'"
+
+  - id: clarify-merge
+    bash: |
+      if [ -f "\$ARTIFACTS_DIR/answers.md" ]; then
+        echo "Clarification complete — answers gathered"
+      else
+        echo "Clarification complete — no questions needed"
+      fi
+    depends_on: [clarify-needed, clarify-evaluate-round-1, clarify-append-round-2]
+    trigger_rule: one_success
+
+  # ═══════════════════════════════════════════════════════════════
   # PHASE 2: RESEARCH
   # ═══════════════════════════════════════════════════════════════
 
   - id: investigate
-    depends_on: [classify]
+    depends_on: [clarify-merge]
     when: "$classify.output.issue_type == 'bug'"
     context: fresh
     prompt: |
@@ -442,6 +597,11 @@ nodes:
       ## Issue context
 
       $USER_MESSAGE
+
+      ## Clarification answers (if any)
+
+      If \$ARTIFACTS_DIR/answers.md exists, read it before investigating — it contains
+      human-provided context that may affect the scope of the fix.
 
       ## Instructions
 
@@ -452,14 +612,14 @@ nodes:
       3. Find all call sites affected by the bug.
       4. Propose a concrete fix approach — do NOT implement yet.
 
-      Save your findings to \${ARTIFACTS_DIR}/investigation.md:
+      Save your findings to \$ARTIFACTS_DIR/investigation.md:
       - Root cause (1–2 sentences)
       - Affected files and line numbers
       - Proposed fix approach (numbered steps)
       - Edge cases and risks to watch for
 
   - id: plan
-    depends_on: [classify]
+    depends_on: [clarify-merge]
     when: "$classify.output.issue_type != 'bug'"
     context: fresh
     prompt: |
@@ -470,6 +630,11 @@ nodes:
 
       $USER_MESSAGE
 
+      ## Clarification answers (if any)
+
+      If \$ARTIFACTS_DIR/answers.md exists, read it before planning — it contains
+      human-provided context that must shape the implementation plan.
+
       ## Instructions
 
       1. Read relevant source files to understand the current architecture and conventions.
@@ -477,7 +642,7 @@ nodes:
       3. Note any API contracts, interfaces, or external dependencies this change touches.
       4. Flag decisions, trade-offs, and risks the implementer must know about.
 
-      Save your plan to \${ARTIFACTS_DIR}/investigation.md:
+      Save your plan to \$ARTIFACTS_DIR/investigation.md:
       - Goal (1–2 sentences)
       - Files to create/modify (with purpose)
       - Implementation steps (numbered)
@@ -485,9 +650,9 @@ nodes:
 
   - id: bridge-artifacts
     bash: |
-      mkdir -p "\${ARTIFACTS_DIR}"
-      if [ ! -f "\${ARTIFACTS_DIR}/investigation.md" ]; then
-        echo "WARNING: no investigation.md produced" > "\${ARTIFACTS_DIR}/investigation.md"
+      mkdir -p "\$ARTIFACTS_DIR"
+      if [ ! -f "\$ARTIFACTS_DIR/investigation.md" ]; then
+        echo "WARNING: no investigation.md produced" > "\$ARTIFACTS_DIR/investigation.md"
       fi
       echo "Artifact check complete"
     depends_on: [investigate, plan]
@@ -524,11 +689,11 @@ nodes:
 
           ## Your task
 
-          1. Read the current plan from \${ARTIFACTS_DIR}/investigation.md.
+          1. Read the current plan from \$ARTIFACTS_DIR/investigation.md.
           2. Revise it to address every concern in the feedback above.
              - Keep steps that were not criticised.
              - Be specific and actionable in your changes.
-          3. Save the revised plan back to \${ARTIFACTS_DIR}/investigation.md (overwrite).
+          3. Save the revised plan back to \$ARTIFACTS_DIR/investigation.md (overwrite).
           4. Present the full revised plan clearly so the human can review it again.
         max_attempts: 3
 
@@ -550,7 +715,7 @@ nodes:
 
         ## Approved plan
 
-        Read \${ARTIFACTS_DIR}/investigation.md in full before writing a single line of code.
+        Read \$ARTIFACTS_DIR/investigation.md in full before writing a single line of code.
 
         ## Human approval notes (if any)
 
@@ -572,15 +737,18 @@ nodes:
   # ═══════════════════════════════════════════════════════════════
 
   - id: validate-script
+    # 30 min — Archon's default 120s isn't enough for real test suites
+    # (TS build + unit tests + E2E commonly exceed it). Tune per repo.
+    timeout: 1800000
     bash: |
       set -euo pipefail
-      mkdir -p "\${ARTIFACTS_DIR}"
+      mkdir -p "\$ARTIFACTS_DIR"
       if [ -f ".gaggle/validate.sh" ]; then
         echo "[validate] running .gaggle/validate.sh"
-        bash .gaggle/validate.sh 2>&1 | tee "\${ARTIFACTS_DIR}/validation.txt"
-        echo "SCRIPT_OK" > "\${ARTIFACTS_DIR}/.validate-mode"
+        bash .gaggle/validate.sh 2>&1 | tee "\$ARTIFACTS_DIR/validation.txt"
+        echo "SCRIPT_OK" > "\$ARTIFACTS_DIR/.validate-mode"
       else
-        echo "FALLBACK" > "\${ARTIFACTS_DIR}/.validate-mode"
+        echo "FALLBACK" > "\$ARTIFACTS_DIR/.validate-mode"
       fi
     depends_on: [implement]
 
@@ -592,24 +760,24 @@ nodes:
 
       First, check how validation ran:
       \`\`\`bash
-      cat "\${ARTIFACTS_DIR}/.validate-mode"
+      cat "\$ARTIFACTS_DIR/.validate-mode"
       \`\`\`
 
       If the mode is SCRIPT_OK:
-      - Read \`\${ARTIFACTS_DIR}/validation.txt\` — these are the real test results.
+      - Read \`\$ARTIFACTS_DIR/validation.txt\` — these are the real test results.
       - If any failures are shown, fix them and re-run \`bash .gaggle/validate.sh\`, repeating until green.
-      - Write a summary to \`\${ARTIFACTS_DIR}/validation.md\`.
+      - Write a summary to \`\$ARTIFACTS_DIR/validation.md\`.
 
       If the mode is FALLBACK (no .gaggle/validate.sh found):
       - Discover the test runner: check for bun.lockb, pnpm-lock.yaml, yarn.lock, package-lock.json,
         pyproject.toml, Cargo.toml, go.mod.
       - Run the full test suite, type checks, and linting appropriate for this stack.
       - Fix any failures.
-      - Write a summary to \`\${ARTIFACTS_DIR}/validation.md\`.
+      - Write a summary to \`\$ARTIFACTS_DIR/validation.md\`.
       - Suggest creating a \`.gaggle/validate.sh\` file with the commands you used so future
         runs are deterministic. Add it to a commit if the human approves.
 
-      The summary in \`\${ARTIFACTS_DIR}/validation.md\` must include:
+      The summary in \`\$ARTIFACTS_DIR/validation.md\` must include:
       - Test results (pass/fail counts)
       - Type check / lint status
       - Build status
@@ -633,7 +801,7 @@ nodes:
 
       1. Check git status. Stage and commit any remaining source changes:
          - Use \`git add <specific files>\` — never \`git add -A\` or \`git add .\`
-         - Never commit scratch files, review artifacts, or anything under \${ARTIFACTS_DIR}
+         - Never commit scratch files, review artifacts, or anything under \$ARTIFACTS_DIR
       2. Push the branch: \`git push -u origin HEAD\`
       3. Check if a PR already exists: \`gh pr list --head $(git branch --show-current)\`
          - If one exists, capture its number and skip creation.
@@ -641,16 +809,16 @@ nodes:
          \`.github/PULL_REQUEST_TEMPLATE.md\`, or \`docs/PULL_REQUEST_TEMPLATE.md\`.
       5. Create a DRAFT PR: \`gh pr create --draft --base $BASE_BRANCH\`
          - Title: concise, imperative mood, under 70 chars
-         - Fill every PR template section using \${ARTIFACTS_DIR}/investigation.md,
-           \${ARTIFACTS_DIR}/implementation.md, and \${ARTIFACTS_DIR}/validation.md.
+         - Fill every PR template section using \$ARTIFACTS_DIR/investigation.md,
+           \$ARTIFACTS_DIR/implementation.md, and \$ARTIFACTS_DIR/validation.md.
            If no template, write: summary, changes made, validation evidence, and a
            Fixes/Closes line referencing the issue URL from $USER_MESSAGE.
-         - Write the body to \${ARTIFACTS_DIR}/pr-body.md and use \`--body-file\`.
+         - Write the body to \$ARTIFACTS_DIR/pr-body.md and use \`--body-file\`.
            Never write body files inside the worktree.
       6. Save PR identifiers:
          \`\`\`bash
-         gh pr view --json number -q '.number' > "\${ARTIFACTS_DIR}/.pr-number"
-         gh pr view --json url -q '.url' > "\${ARTIFACTS_DIR}/.pr-url"
+         gh pr view --json number -q '.number' > "\$ARTIFACTS_DIR/.pr-number"
+         gh pr view --json url -q '.url' > "\$ARTIFACTS_DIR/.pr-url"
          \`\`\`
 
   # ═══════════════════════════════════════════════════════════════
@@ -855,3 +1023,4 @@ export function writeDefaultTemplates(dir: string, force = false): { written: st
   }
   return { written, skipped };
 }
+
