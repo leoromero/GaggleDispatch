@@ -14,7 +14,7 @@
  */
 
 import type { Server, ServerWebSocket } from 'bun';
-import type { OrchestratorState, LiveSession, SupervisedGateEntry } from '../domain/types.ts';
+import type { OrchestratorState, LiveSession, SupervisedGateEntry, FailedTargetSummary } from '../domain/types.ts';
 import { subscribeLogs, type LogEvent } from '../util/logger.ts';
 
 export interface GaggleApiOptions {
@@ -22,6 +22,7 @@ export interface GaggleApiOptions {
   host?: string;
   workspaceName: string;
   getState: () => OrchestratorState;
+  onRedispatch?: (issue_id: string, repo_alias: string) => Promise<void>;
   /** How many log events to retain in memory (ring buffer). Default 1000. */
   logBufferSize?: number;
 }
@@ -128,6 +129,14 @@ function stateToJson(workspaceName: string, state: OrchestratorState): unknown {
       repo_alias: d.repo_alias,
       recovered_at: d.recovered_at,
     })),
+    failed: Array.from(state.failed_targets.values()).map((info): FailedTargetSummary => ({
+      issue_id: info.issue.id,
+      issue_identifier: info.issue.identifier,
+      issue_title: info.issue.title,
+      repo_alias: info.repo_target.repo_alias,
+      reason: info.reason,
+      failed_at: info.failed_at,
+    })),
   };
 }
 
@@ -154,7 +163,7 @@ export function startGaggleApi(opts: GaggleApiOptions): GaggleApiHandle {
   const server: Server<ApiWsData> = Bun.serve<ApiWsData>({
     port: opts.port,
     hostname: host,
-    fetch(req, srv) {
+    async fetch(req, srv) {
       const url = new URL(req.url);
       if (url.pathname === '/api/stream') {
         const ok = srv.upgrade(req, { data: { kind: 'stream' } });
@@ -172,6 +181,27 @@ export function startGaggleApi(opts: GaggleApiOptions): GaggleApiHandle {
         const since = url.searchParams.get('since');
         const events = since ? logBuffer.filter((e) => e.ts > since) : logBuffer.slice();
         return Response.json({ workspace: opts.workspaceName, events });
+      }
+      if (url.pathname === '/redispatch' && req.method === 'POST') {
+        if (!opts.onRedispatch) {
+          return Response.json({ error: 'redispatch not configured' }, { status: 503 });
+        }
+        let body: { issue_id?: string; repo_alias?: string };
+        try {
+          body = await req.json() as { issue_id?: string; repo_alias?: string };
+        } catch {
+          return Response.json({ error: 'invalid JSON body' }, { status: 400 });
+        }
+        const { issue_id, repo_alias } = body;
+        if (!issue_id || !repo_alias) {
+          return Response.json({ error: 'issue_id and repo_alias required' }, { status: 400 });
+        }
+        try {
+          await opts.onRedispatch(issue_id, repo_alias);
+          return Response.json({ ok: true });
+        } catch (err) {
+          return Response.json({ error: (err as Error).message }, { status: 400 });
+        }
       }
       return new Response('not found', { status: 404 });
     },

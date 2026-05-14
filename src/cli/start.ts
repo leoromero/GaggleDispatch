@@ -115,6 +115,7 @@ export async function runStart(opts: {
         port: opts.apiPort ?? 0,
         workspaceName: opts.workspaceName ?? basename(cfg.project_dir),
         getState: () => orchestrator.getState(),
+        onRedispatch: (issue_id, repo_alias) => orchestrator.redispatch(issue_id, repo_alias),
       })
     : null;
 
