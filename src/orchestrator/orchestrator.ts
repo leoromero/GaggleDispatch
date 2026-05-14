@@ -44,6 +44,7 @@ import { defaultGateResumeState, completedState } from '../config/service-config
 import type { RegistryLoaderHandle } from '../registry/loader.ts';
 import type { SyncerHandle } from '../registry/repo-syncer.ts';
 import { writeRunEntry, deleteRunEntry, allRunEntries, allRetryEntries, deleteRetryEntry } from '../registry/run-registry.ts';
+import { saveAnalysis, getAnalysis, deleteAnalysis } from '../registry/analysis-registry.ts';
 import { classifyGateReply, type GateClassification } from './gate-classifier.ts';
 import {
   classifyTargetState,
@@ -274,10 +275,12 @@ export class Orchestrator {
         if (issue.parent_id) {
           // Sub-issue path: dispatched without analysis (description IS the task).
           if (!this.shouldDispatchSubIssue(issue)) continue;
+          if (await this.hasLinkedGitHubPR(issue)) continue;
           await this.dispatchSubIssueFromPoll(issue);
         } else {
           // Parent issue path: analyze then fan out.
           if (!this.shouldDispatch(issue)) continue;
+          if (await this.hasLinkedGitHubPR(issue)) continue;
           let analysis: IssueAnalysis | null;
           try {
             analysis = await this.getOrAnalyze(issue);
@@ -376,6 +379,43 @@ export class Orchestrator {
     return m ? m[1]! : null;
   }
 
+  /**
+   * PR-aware re-dispatch guard.
+   *
+   * Linear's GitHub integration can move issues backward from a terminal
+   * state (e.g. `In Review`) into an active state (`In Progress`) when the
+   * underlying PR's GitHub status changes — for instance when a PR is taken
+   * out of draft. Without intervention this looks like a fresh candidate to
+   * the gaggle and triggers a duplicate run.
+   *
+   * Guard: if the candidate (or its parent, when it's a sub-issue) has any
+   * GitHub PR attached in Linear, skip re-dispatch. The retry-via-comment
+   * path remains the explicit channel for "redo this issue".
+   *
+   * Best-effort: a failed lookup falls through to dispatch (we'd rather
+   * occasionally re-run than indefinitely stall on a Linear hiccup).
+   */
+  private async hasLinkedGitHubPR(issue: Issue): Promise<boolean> {
+    const lookupId = issue.parent_id ?? issue.id;
+    try {
+      const prLinks = await this.tracker.fetchIssuePRLinks(lookupId);
+      if (prLinks.length === 0) return false;
+      logger.info('Skipping candidate — Linear issue already has a linked GitHub PR (post-merge re-activation?)', {
+        issue_id: issue.id,
+        issue_identifier: issue.identifier,
+        pr_count: prLinks.length,
+        first_pr: prLinks[0],
+      });
+      return true;
+    } catch (err) {
+      logger.warn('PR-link lookup failed; falling through to dispatch', {
+        issue_id: issue.id,
+        error: (err as Error).message,
+      });
+      return false;
+    }
+  }
+
   private buildRepoTargetFromSubIssue(subIssue: Issue): import('../domain/types.ts').RepoTarget | null {
     const alias = this.parseAliasFromTitle(subIssue.title);
     if (!alias) return null;
@@ -439,7 +479,10 @@ export class Orchestrator {
       workspace: this.workspace,
       issue: parentIssue,
       repo_target: target,
-      analysis: analysisOverride ?? { issue_id: parentIssue.id, analysis_summary: '', repo_targets: [target] },
+      analysis: analysisOverride
+        ?? this.state.analysis_cache.get(parentIssue.id)?.analysis
+        ?? getAnalysis(this.cfg.registry.base_folder, parentIssue.id)
+        ?? { issue_id: parentIssue.id, analysis_summary: '', repo_targets: [target] },
       attempt,
       source_branch: branch,
       message_override: messageOverride,
@@ -448,7 +491,16 @@ export class Orchestrator {
     try {
       const handle = await spawnWorker(workerArgs, {
         onStarted: (pid) => { const s = this.state.running.get(key); if (s) { s.archon_pid = pid; s.last_archon_timestamp = new Date().toISOString(); } },
-        onOutput: (line) => { const s = this.state.running.get(key); if (s) { s.last_archon_message = line; s.last_archon_timestamp = new Date().toISOString(); s.turn_count += 1; } },
+        onOutput: (line) => {
+          const s = this.state.running.get(key);
+          if (s) {
+            s.last_archon_message = line;
+            s.last_archon_timestamp = new Date().toISOString();
+            s.turn_count += 1;
+            s.recent_archon_output.push(line);
+            if (s.recent_archon_output.length > 50) s.recent_archon_output.shift();
+          }
+        },
         onRunId: (db_run_id) => {
           const s = this.state.running.get(key);
           if (s) {
@@ -513,12 +565,25 @@ export class Orchestrator {
             if (s) { s.archon_pid = e.pid; s.last_archon_timestamp = new Date().toISOString(); }
             break;
           case 'archon_output':
-            if (s) { s.last_archon_message = e.line; s.last_archon_timestamp = new Date().toISOString(); s.turn_count += 1; }
+            if (s) {
+              s.last_archon_message = e.line;
+              s.last_archon_timestamp = new Date().toISOString();
+              s.turn_count += 1;
+              s.recent_archon_output.push(e.line);
+              if (s.recent_archon_output.length > 50) s.recent_archon_output.shift();
+            }
             break;
           case 'archon_run_id':
             if (s) {
               s.archon_db_run_id = e.db_run_id;
-              this.attachPoller(key, e.db_run_id, parentIssue, target, subIssueId, attempt);
+              // Post-approve grace window: Archon briefly reports the paused
+              // run as `failed`/`cancelled` while the resumed run takes over.
+              // Skipping the first poll by ~pollIntervalMs avoids a spurious
+              // "Poller: run reached failed/cancelled status" log.
+              this.attachPoller(
+                key, e.db_run_id, parentIssue, target, subIssueId, attempt,
+                this.cfg.archon.poll_interval_ms,
+              );
             }
             writeRunEntry(this.cfg.registry.base_folder, key, {
               archon_run_id: e.db_run_id,
@@ -611,6 +676,7 @@ export class Orchestrator {
       }
       const analysis = await this.analyzer.analyze(issue, ctx);
       this.state.analysis_cache.set(issue.id, { analysis, cached_at: Date.now() });
+      saveAnalysis(this.cfg.registry.base_folder, issue.id, analysis);
       logger.info('Issue analyzed', {
         issue_id: issue.id,
         issue_identifier: issue.identifier,
@@ -774,7 +840,7 @@ export class Orchestrator {
     if (existing) return existing;
 
     try {
-      const viewerId = this.cfg.tracker.assigned_to_me ? await this.tracker.resolveViewerId() : null;
+      const viewerId = await this.tracker.resolveAssigneeFilterUserId().catch(() => null);
       // Sub-issues start in Todo so the orchestrator (or poll loop) controls when work begins.
       const description = buildIssueMessage({ issue, repo_target: target, analysis, attempt: null });
       const sub = await this.tracker.createSubIssue({
@@ -815,6 +881,7 @@ export class Orchestrator {
     target: import('../domain/types.ts').RepoTarget,
     subIssueId: string | null,
     attempt: number | null,
+    initialDelayMs?: number,
   ): void {
     const poller = new ArchonRunPoller(
       this.archon,
@@ -852,12 +919,19 @@ export class Orchestrator {
             break;
 
           case 'poller_stalled':
-            if (session) {
-              logger.warn('Poller: stall detected — cancelling worker', {
-                issue_id: issue.id, repo_alias: target.repo_alias, run_id: runId,
-              });
-              session.cancel?.();
-            }
+            // Stall = `last_activity_at` frozen while status === 'running'.
+            // We used to cancel here, but that turned out to be destructive:
+            //   - Killing the local watcher subprocess does NOT stop Archon's
+            //     daemon-side run, so the work continues while we post a
+            //     spurious "worker failed" comment to Linear.
+            //   - Long Claude tool calls (e.g. Opus implementer steps) can
+            //     legitimately exceed any reasonable stall threshold.
+            // Now informational only — keep polling, let Archon's actual
+            // terminal status (failed / cancelled / completed) drive cleanup.
+            logger.warn('Poller: stall detected (informational; not cancelling)', {
+              issue_id: issue.id, repo_alias: target.repo_alias, run_id: runId,
+              last_activity_at: event.last_activity_at,
+            });
             break;
 
           case 'poller_run_not_found':
@@ -870,6 +944,7 @@ export class Orchestrator {
       {
         pollIntervalMs: this.cfg.archon.poll_interval_ms,
         stallTimeoutMs: this.cfg.archon.stall_timeout_ms,
+        ...(initialDelayMs !== undefined ? { initialDelayMs } : {}),
       },
     );
 
@@ -1201,6 +1276,14 @@ export class Orchestrator {
     const transition = parentTransition(fromState, event, ctx);
     await this.effectApplier.applyAll(transition.effects);
     this.state.parent_machine_states.set(ctx.parent_issue.id, transition.to);
+    if (transition.to === 'done' || transition.to === 'cancelled') {
+      deleteAnalysis(this.cfg.registry.base_folder, ctx.parent_issue.id);
+      for (const key of this.state.failed_targets.keys()) {
+        if (key.startsWith(ctx.parent_issue.id + '__')) {
+          this.state.failed_targets.delete(key);
+        }
+      }
+    }
     return transition;
   }
 
@@ -1351,6 +1434,9 @@ export class Orchestrator {
     const subIssueId = session?.sub_issue_id ?? this.state.sibling_subissues.get(issue.id)?.get(target.repo_alias) ?? null;
     const targetId = subIssueId ?? issue.id;
     const dbRunId = session?.archon_db_run_id ?? null;
+    // Capture before the session is deleted below — used in the failure log
+    // so the operator can see what the Archon CLI was doing right before exit.
+    const recentOutput = session?.recent_archon_output.slice() ?? [];
 
     // Pre-SM: detect the gate-pause-disguised-as-success case and defer to the
     // gate handler. The Archon CLI exits 0 when the workflow pauses at an
@@ -1416,11 +1502,18 @@ export class Orchestrator {
       });
       await this.promoteQueuedSiblings(issue);
     } else {
+      // Include the tail of Archon CLI output so the failure cause is
+      // visible without leaving the gaggle log (recent_archon_output ring
+      // buffer is fed by every archon_output event).
+      const lastLines = recentOutput.slice(-15);
       logger.warn('Worker exited abnormally', {
         issue_id: issue.id,
         repo_alias: target.repo_alias,
         type: event.type,
+        exit_code: event.exit_code,
+        archon_run_id: dbRunId,
         next_attempt: (attempt ?? 0) + 1,
+        last_archon_output: lastLines.length > 0 ? lastLines.join('\n') : '(no output captured)',
       });
     }
 
@@ -1725,7 +1818,18 @@ export class Orchestrator {
       }
 
       for (const issue of refreshed) {
-        if (this.cfg.tracker.terminal_states.includes(issue.state)) {
+        // Skip `pr_ready_state` even when it appears in `terminal_states`.
+        // The Linear↔GitHub integration moves issues to this state when a
+        // PR is opened, but the workflow itself usually has post-PR phases
+        // (multi-agent review, self-fix, validation) that are still running
+        // in Archon. Cancelling here would tear down the local watcher and
+        // post a misleading "worker failed" comment while the actual run
+        // continues server-side.
+        const prReady = this.cfg.tracker.pr_ready_state;
+        const isTerminal =
+          this.cfg.tracker.terminal_states.includes(issue.state) &&
+          (prReady === null || issue.state !== prReady);
+        if (isTerminal) {
           for (const [key, session] of this.state.running) {
             if (session.issue.id !== issue.id) continue;
             try {
@@ -1753,7 +1857,13 @@ export class Orchestrator {
             this.state.analysis_cache.delete(issue.id);
           }
           await this.maybeReleaseClaim(issue.id);
-        } else if (this.cfg.tracker.active_states.includes(issue.state)) {
+        } else if (
+          this.cfg.tracker.active_states.includes(issue.state) ||
+          (prReady !== null && issue.state === prReady)
+        ) {
+          // Active OR pr_ready_state: refresh the cached issue snapshot but
+          // keep the worker alive. pr_ready_state is treated as "PR is open,
+          // post-PR phases (review/self-fix) may still be running in Archon".
           for (const [, session] of this.state.running) {
             if (session.issue.id === issue.id) session.issue = issue;
           }
