@@ -45,44 +45,44 @@ syncs it automatically. Every subsequent issue is routed using that living docum
 ### Orchestration flow
 
 ```
-                        ┌─────────────────────────────────────────────────────┐
-                        │                  GaggleDispatch                     │
-                        │                                                     │
-  Linear ───issues──▶  │  Analyzer (Claude)                                  │
-  (or any tracker)      │    reads gaggle.md ──▶ IssueAnalysis                │
-                        │    from every repo         │                        │
-                        │                      repo_targets                   │
-                        │                      depends_on                     │
-                        │                      ready_when                     │
-                        │                            │                        │
-                        │              ┌─────────────┼─────────────┐          │
-                        │              ▼             ▼             ▼          │
-                        │          [repo-a]      [repo-b]      [repo-c]       │
-                        │         sub-issue     sub-issue     sub-issue       │
-                        │              │             │             │          │
-                        └──────────────┼─────────────┼─────────────┼──────────┘
-                                       │             │             │
-                          archon workflow run         │             │
-                                       │        (blocked until     │
-                                       │         repo-a merged)    │
-                                       ▼                           ▼
-                               ┌──────────────┐           ┌──────────────┐
-                               │   Archon     │           │   Archon     │
-                               │  DAG workflow│           │  DAG workflow│
-                               │  (YAML-dec.) │           │  (YAML-dec.) │
-                               │  classify    │           │              │
-                               │  research    │           │              │
-                               │  implement ◀─┼── gate ───┼── Linear    │
-                               │  validate    │  (human   │   comment   │
-                               │  PR + review │   reply)  │             │
-                               └──────┬───────┘           └──────┬──────┘
-                                      │                          │
-                                      ▼                          ▼
-                                  GitHub PR                  GitHub PR
-                                      │
-                               CI/CD pipeline
-                               posts deploy label
-                               ──▶ unblocks repo-b
+  Linear                  ┌─────────────────────────────────────────────────┐
+  (or any tracker)        │               GaggleDispatch                    │
+        │                 │                                                  │
+        └──────issues──▶  │  Analyzer (Claude)                              │
+                          │    reads gaggle.md ──▶ IssueAnalysis             │
+                          │    from every repo         │                     │
+                          │                      repo_targets                │
+                          │                      depends_on                  │
+                          │                      ready_when                  │
+                          │                            │                     │
+                          │              ┌─────────────┼─────────────┐       │
+                          │              ▼             ▼             ▼       │
+                          │          [repo-a]      [repo-b]      [repo-c]    │
+                          │         sub-issue     sub-issue     sub-issue    │
+                          │              │             │             │       │
+                          └──────────────┼─────────────┼─────────────┼───────┘
+                                         │             │             │
+                            archon workflow run         │             │
+                                         │        (blocked until     │
+                                         │         repo-a merged)    │
+                                         ▼                           ▼
+                                 ┌──────────────┐           ┌──────────────┐
+                                 │   Archon     │           │   Archon     │
+                                 │  DAG workflow│           │  DAG workflow│
+                                 │  (YAML-decl) │           │  (YAML-decl) │
+                                 │  classify    │           │  classify    │
+                                 │  research    │           │  research    │
+                                 │  implement ◀─┼── gate ───┼── tracker   │
+                                 │  validate    │  (human   │   comment   │
+                                 │  PR + review │   reply)  │             │
+                                 └──────┬───────┘           └──────┬──────┘
+                                        │                          │
+                                        ▼                          ▼
+                                    GitHub PR                  GitHub PR
+                                        │
+                                 CI/CD pipeline
+                                 posts deploy label
+                                 ──▶ unblocks repo-b
 ```
 
 GaggleDispatch is the **scheduler, analyzer, and runner**. It owns tracker writes (state changes,
@@ -131,6 +131,13 @@ A minimal example from GaggleDispatch's default workflow:
   prompt: |
     Investigate the root cause. Save findings to ${ARTIFACTS_DIR}/investigation.md.
 
+- id: plan-gate
+  depends_on: [investigate]
+  approval:
+    message: |
+      Implementation plan ready. Reply `approve` to proceed or `reject: <feedback>` to revise.
+    capture_response: true
+
 - id: implement
   depends_on: [investigate]
   model: opus
@@ -140,16 +147,16 @@ A minimal example from GaggleDispatch's default workflow:
     fresh_context: true
 ```
 
+# partial example — see workflow_templates/ for full workflows
+
 GaggleDispatch bridges Archon with the tracker on two critical events:
 
 - **Approval gates** — when a workflow hits an `approval` node, GaggleDispatch frees the
   concurrency slot, posts the gate message as a tracker comment, and polls for a human reply.
   `approve` or `reject` resumes the workflow via the Archon API.
-- **Cross-repo blockers** — if an agent discovers mid-implementation that it needs a change in
-  another repository, it writes a structured `blocker-request.md` and exits. GaggleDispatch
-  detects the file, creates the upstream issue in the tracker, marks the current issue as blocked,
-  and restarts implementation automatically once the blocker is resolved. The agent never needs to
-  know about cross-repo orchestration — it just signals the constraint.
+- **Cross-repo blockers** — if an agent cannot complete work without a change in another
+  repository, it writes a `blocker-request.md` and exits; GaggleDispatch handles the rest
+  (see [Agent-driven blocker creation](#agent-driven-blocker-creation) below).
 
 ## Built on the Symphony specification
 
@@ -167,7 +174,9 @@ The original Symphony spec targets a single repository per issue. GaggleDispatch
 limit. The Issue Analyzer reads every registered repo's `gaggle.md` and returns multiple
 `repo_targets` — one Archon session per repo, dispatched in parallel.
 
-Dependency ordering is declared by the analyzer, not hardcoded:
+Dependency ordering is declared by the analyzer, not hardcoded. `ready_when` values
+(`merged`, `deployed`, `deployed:prod`) refer to Linear labels posted by your CI/CD
+pipeline — GaggleDispatch watches for them to unblock downstream targets:
 
 ```yaml
 repo_targets:
@@ -180,7 +189,7 @@ repo_targets:
 ```
 
 `shared-auth-lib` runs first. `patient-ingestion-service` waits until it reaches the `merged`
-state. Your CI/CD pipeline posts the deploy labels; GaggleDispatch watches them.
+state.
 
 ### Automatic sub-issue creation
 
@@ -301,7 +310,8 @@ Acts as a dedicated OAuth application instead of impersonating a personal user. 
    ```yaml
    tracker:
      kind: linear
-     # api_key still required for backward-compat (validation), but ignored when mode is oauth
+     # api_key is required by the config schema in both auth modes.
+     # In oauth mode the value is not used for API calls — any valid key satisfies the validator.
      api_key: $LINEAR_API_KEY
      auth:
        mode: oauth
@@ -334,7 +344,9 @@ Acts as a dedicated OAuth application instead of impersonating a personal user. 
 ```yaml
 tracker:
   kind: linear
-  api_key: $LINEAR_API_KEY                # used when auth.mode = api_key (default)
+  # api_key is required by the config schema in both auth modes.
+  # In oauth mode the value is not used for API calls — any valid key satisfies the validator.
+  api_key: $LINEAR_API_KEY
   project_slug: SYM                       # Linear team key
   active_states: [Todo, In Progress]
   terminal_states: [Done, Cancelled, Closed]
@@ -383,7 +395,7 @@ repositories:                             # managed by `gaggle repo add/remove`
     default_branch: main
 ```
 
-See `SPEC_SYMPHONY.md` Section 6.4 for the full cheatsheet.
+See `SPEC_SYMPHONY.md` Section 6.4 for additional fields and defaults not shown here.
 
 ## Workflow templates
 
@@ -446,7 +458,7 @@ GaggleDispatch/
 ```bash
 bun install
 bun run typecheck    # tsc --noEmit
-bun test             # full suite (124 tests across 9 files)
+bun test             # full suite
 bun run cli -- --help
 ```
 
