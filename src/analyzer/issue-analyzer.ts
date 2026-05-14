@@ -76,15 +76,23 @@ export class IssueAnalyzer {
       );
     }
 
-    let parsed: { analysis_summary?: unknown; repo_targets?: unknown };
+    let parsed: { analysis_summary?: unknown; repo_targets?: unknown; complexity?: unknown };
     try {
       parsed = JSON.parse(json);
     } catch (err) {
       throw new IssueAnalysisError(`Claude JSON failed to parse: ${(err as Error).message}`, err);
     }
 
+    const rawComplexity = parsed.complexity;
+    const complexity: 'simple' | 'complex' =
+      rawComplexity === 'simple' ? 'simple' : 'complex';
+
+    const complexityWorkflow =
+      complexity === 'simple' ? 'gaggle/gaggle-fix-issue' : 'gaggle/gaggle-supervised';
+
     const analysis_summary =
-      typeof parsed.analysis_summary === 'string' ? parsed.analysis_summary : '';
+      `[complexity: ${complexity}] ` +
+      (typeof parsed.analysis_summary === 'string' ? parsed.analysis_summary : '');
 
     const reposByName = new Map<string, RegistryRepo>(ctx.repositories.map((r) => [r.name, r]));
     const reposByUrl = new Map<string, RegistryRepo>(ctx.repositories.map((r) => [r.url, r]));
@@ -111,10 +119,18 @@ export class IssueAnalyzer {
         continue;
       }
 
-      const archonWf =
-        typeof obj.archon_workflow === 'string' && obj.archon_workflow
-          ? obj.archon_workflow
-          : matched.default_workflow || this.cfg.archon.default_workflow;
+      let archonWf: string;
+      if (matched.available_workflows.includes(complexityWorkflow)) {
+        archonWf = complexityWorkflow;
+      } else {
+        logger.warn('Complexity-derived workflow not in available_workflows — falling back to repo default', {
+          issue_id: issue.id,
+          repo: matched.name,
+          desired: complexityWorkflow,
+          fallback: matched.default_workflow || this.cfg.archon.default_workflow,
+        });
+        archonWf = matched.default_workflow || this.cfg.archon.default_workflow;
+      }
 
       const target: RepoTarget = {
         repo_url: matched.url,
@@ -142,7 +158,7 @@ export class IssueAnalyzer {
       throw new IssueAnalysisNoTargets(issue.id);
     }
 
-    return { issue_id: issue.id, analysis_summary, repo_targets };
+    return { issue_id: issue.id, analysis_summary, repo_targets, complexity };
   }
 }
 
@@ -248,7 +264,7 @@ function buildPrompt(issue: Issue, ctx: RegistryContext): string {
       ? issue.blocked_by.map((b) => `- ${b.identifier ?? b.id} [${b.state ?? '?'}]`).join('\n')
       : '(none)';
 
-  return `You are GaggleDispatch's Issue Analyzer. Your job is to decide which repositories need changes to resolve the issue below, and produce a JSON routing decision.
+  return `You are GaggleDispatch's Issue Analyzer. Your job is to decide which repositories need changes to resolve the issue below, assess complexity, and produce a JSON routing decision.
 
 ## Registered repositories
 
@@ -274,15 +290,16 @@ ${issue.description ?? '(no description)'}
 
 1. Read the \`gaggle.md\` of each relevant repo (and any other files that help).
 2. Decide which repos need changes. Err on the side of FEWER, higher-confidence targets.
-3. Output ONLY the following JSON — no prose, no markdown fences:
+3. Assess complexity using the rubric below.
+4. Output ONLY the following JSON — no prose, no markdown fences:
 
 {
   "analysis_summary": "Short paragraph (2-4 sentences) explaining which services/components are affected and why.",
+  "complexity": "<simple|complex — see rubric below>",
   "repo_targets": [
     {
       "repo_url": "<exact url from the repo list above>",
       "repo_alias": "<name field from that repo's gaggle.md>",
-      "archon_workflow": "<workflow from gaggle.md available_workflows, or its default_workflow>",
       "rationale": "One sentence on why this repo is included.",
       "components": ["component-name-from-gaggle-md"],
       "depends_on": ["alias-of-upstream-repo-if-this-one-depends-on-it"],
@@ -291,10 +308,37 @@ ${issue.description ?? '(no description)'}
   ]
 }
 
+## Complexity rubric
+
+**simple** — ALL of the following must be true:
+- Touches a single component in a single repo
+- No new UX flows, screens, or interaction patterns
+- No architectural decisions (state shape, API contracts, auth, shared infrastructure)
+- Clear, fully-specified scope with no ambiguous requirements
+- No cross-repo dependencies introduced
+Examples: fix a typo, update a config value, add a null check, adjust a label or style.
+
+**complex** — ANY of the following is true:
+- Spans multiple components or repos
+- Introduces new UX flows, screens, or interaction patterns
+- Requires architectural decisions (state shape, API contracts, auth, shared infrastructure)
+- Has ambiguous or underspecified requirements a human should validate before implementation
+- Introduces new cross-repo dependencies
+Examples: new feature page, API shape change, auth flow update, multi-service change.
+
+## Workflow assignment
+
+The \`archon_workflow\` field in EACH repo_target MUST be determined by complexity, not by the repo's default:
+- complexity == "simple"  → archon_workflow = "gaggle/gaggle-fix-issue"
+- complexity == "complex" → archon_workflow = "gaggle/gaggle-supervised"
+
+Then verify that workflow is listed in that repo's \`available_workflows\` in gaggle.md.
+If it is NOT listed, use the repo's \`default_workflow\` instead and note it in the rationale.
+
 Rules:
 - repo_alias must match the \`name\` field in that repo's gaggle.md front matter exactly.
 - components must be names from that repo's gaggle.md \`components\` list.
-- For depends_on + ready_when: use "merged" when this repo's changes depend on another repo's PR being merged first (e.g. FE consuming a new BE endpoint, shared library consumer waiting for the library PR). Omit depends_on entirely when repos can be worked on in parallel — when unsure, omit it.
+- For depends_on + ready_when: use "merged" when this repo's changes depend on another repo's PR being merged first. Omit depends_on when repos can be worked on in parallel.
 - Output JSON only.`;
 }
 

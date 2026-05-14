@@ -39,7 +39,7 @@ describe('IssueAnalyzer.analyze', () => {
     expect(result.repo_targets.length).toBe(1);
     expect(result.repo_targets[0]!.local_path).toBe('/abs/repo-a');
     expect(result.repo_targets[0]!.archon_workflow).toBe('gaggle/gaggle-supervised');
-    expect(result.analysis_summary).toBe('fix it');
+    expect(result.analysis_summary).toBe('[complexity: complex] fix it');
   });
 
   test('extracts JSON inside ```json fences', async () => {
@@ -62,8 +62,8 @@ describe('IssueAnalyzer.analyze', () => {
     const a = new IssueAnalyzer(makeServiceConfig(), fakeRunner(messy));
     const r = await a.analyze(makeIssue(), ctx);
     expect(r.repo_targets[0]!.repo_alias).toBe('repo-a');
-    // Falls back to default_workflow from the registry repo
-    expect(r.repo_targets[0]!.archon_workflow).toBe('gaggle/gaggle-fix-issue');
+    // No complexity field → defaults to 'complex' → gaggle/gaggle-supervised
+    expect(r.repo_targets[0]!.archon_workflow).toBe('gaggle/gaggle-supervised');
   });
 
   test('reconciles alias-only response (no repo_url) against registry name', async () => {
