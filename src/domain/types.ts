@@ -73,6 +73,13 @@ export interface TrackerConfig {
   active_states: string[];
   terminal_states: string[];
   assigned_to_me: boolean;
+  /**
+   * When set, candidate issues are filtered by `assignee.email == this`.
+   * Takes precedence over `assigned_to_me`. Required under OAuth `actor=app`
+   * because the OAuth viewer is the app itself, not a human user with
+   * assigned issues.
+   */
+  assigned_to_user_email: string | null;
   create_sub_issues: boolean;
   default_ready_env: string;
   deploy_env_labels: Record<string, string>;
@@ -264,6 +271,7 @@ export interface IssueAnalysis {
   issue_id: string;
   analysis_summary: string;
   repo_targets: RepoTarget[];
+  complexity?: 'simple' | 'complex';
 }
 
 export interface CachedAnalysis {
@@ -312,6 +320,12 @@ export interface LiveSession {
   last_archon_event: string | null;
   last_archon_timestamp: string | null;
   last_archon_message: string | null;
+  /**
+   * Ring buffer of the most recent stdout/stderr lines from the Archon CLI
+   * subprocess (capped). Surfaced in the worker-exit log when a worker fails
+   * so the operator doesn't have to dig into Archon's own logs to see why.
+   */
+  recent_archon_output: string[];
   claude_input_tokens: number;
   claude_output_tokens: number;
   claude_total_tokens: number;
