@@ -186,6 +186,7 @@ export function buildServiceConfig(def: WorkflowDefinition): ServiceConfig {
       'Done',
     ]),
     assigned_to_me: asBool(trackerRaw.assigned_to_me, 'tracker.assigned_to_me', true),
+    assigned_to_user_email: asOptionalString(trackerRaw.assigned_to_user_email, 'tracker.assigned_to_user_email'),
     create_sub_issues: asBool(trackerRaw.create_sub_issues, 'tracker.create_sub_issues', true),
     default_ready_env: asString(trackerRaw.default_ready_env, 'tracker.default_ready_env', 'dev'),
     deploy_env_labels,

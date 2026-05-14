@@ -145,6 +145,7 @@ export function buildLiveSession(args: {
     last_archon_event: null,
     last_archon_timestamp: null,
     last_archon_message: null,
+    recent_archon_output: [],
     claude_input_tokens: 0,
     claude_output_tokens: 0,
     claude_total_tokens: 0,

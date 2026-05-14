@@ -24,6 +24,8 @@ export interface ManagedWorkspace {
   last_exit_at: string | null;
   restart_count: number;
   status: 'starting' | 'running' | 'crashed' | 'stopped';
+  /** True when the workspace was explicitly stopped via stopWorkspace(); suppresses auto-restart. */
+  manualStopped: boolean;
 }
 
 export interface SpawnOptions {
@@ -57,6 +59,8 @@ export class HubProcessManager {
     if (this.workspaces.has(entry.name)) {
       const existing = this.workspaces.get(entry.name)!;
       if (existing.status === 'running' || existing.status === 'starting') return;
+      // Allow re-start of a manually stopped workspace.
+      existing.manualStopped = false;
     }
 
     // Detect already-running gaggle (sidecar present + pid alive).
@@ -97,6 +101,7 @@ export class HubProcessManager {
       last_exit_at: null,
       restart_count: 0,
       status: 'starting',
+      manualStopped: false,
     };
     this.workspaces.set(entry.name, managed);
 
@@ -137,9 +142,10 @@ export class HubProcessManager {
     void child.exited.then((code) => {
       managed.last_exit_code = code ?? null;
       managed.last_exit_at = new Date().toISOString();
-      managed.status = this.stopped ? 'stopped' : 'crashed';
+      const intentional = this.stopped || managed.manualStopped;
+      managed.status = intentional ? 'stopped' : 'crashed';
       removeSidecar(entry.path);
-      if (!this.stopped) {
+      if (!intentional) {
         managed.restart_count += 1;
         const backoff = Math.min(30_000, 1000 * Math.pow(2, managed.restart_count));
         logger.warn('Gaggle workspace exited; restarting', {
@@ -148,7 +154,7 @@ export class HubProcessManager {
           restart_in_ms: backoff,
         });
         setTimeout(() => {
-          if (this.stopped) return;
+          if (this.stopped || managed.manualStopped) return;
           void this.startWorkspace(entry);
         }, backoff);
       }
@@ -230,6 +236,33 @@ export class HubProcessManager {
       w.status = 'stopped';
     }
     await Promise.all(tasks);
+  }
+
+  /** Stop a single workspace without affecting others or preventing future restarts via startWorkspace(). */
+  async stopWorkspace(name: string): Promise<void> {
+    const w = this.workspaces.get(name);
+    if (!w || w.status === 'stopped') return;
+    w.manualStopped = true;
+    w.status = 'stopped';
+    if (w.process) {
+      try {
+        w.process.kill('SIGTERM');
+        await Promise.race([w.process.exited, Bun.sleep(8000)]);
+        try { w.process.kill('SIGKILL'); } catch { /* ignore */ }
+      } catch {
+        /* ignore */
+      }
+    } else if (w.pid) {
+      // Adopted workspace — signal by PID.
+      try { process.kill(w.pid, 'SIGTERM'); } catch { /* ignore */ }
+    }
+    w.api_url = null;
+    w.api_port = null;
+  }
+
+  /** Stop all workspaces without shutting down the nest (gaggles can be restarted individually). */
+  async stopAllWorkspaces(): Promise<void> {
+    await Promise.all(Array.from(this.workspaces.keys()).map((n) => this.stopWorkspace(n)));
   }
 
   /** Fetch the live state snapshot from one workspace. */

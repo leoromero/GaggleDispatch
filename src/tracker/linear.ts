@@ -51,6 +51,7 @@ export interface LinearTeam {
 export class LinearClient {
   private viewerId: string | null = null;
   private teamCache: LinearTeam | null = null;
+  private assigneeUserIdCache: string | null = null;
   private labelIdCache = new Map<string, string>(); // name -> id (per team)
   private stateIdCache = new Map<string, string>(); // name -> id (per team)
   private auth: AuthProvider;
@@ -121,6 +122,42 @@ export class LinearClient {
     return this.viewerId;
   }
 
+  /**
+   * Returns the Linear user id to filter candidate issues by, or null
+   * to disable the assignee filter. Precedence:
+   *   1. `tracker.assigned_to_user_email` → resolved via `users(filter:email)`
+   *   2. `tracker.assigned_to_me` → viewer id (which under OAuth is the app)
+   *   3. neither → null (no assignee filter)
+   */
+  async resolveAssigneeFilterUserId(): Promise<string | null> {
+    if (this.assigneeUserIdCache) return this.assigneeUserIdCache;
+    const email = this.cfg.tracker.assigned_to_user_email;
+    if (email) {
+      const data = await this.query<{ users: { nodes: Array<{ id: string; name: string; email: string }> } }>(
+        `query($filter: UserFilter) { users(filter: $filter, first: 2) { nodes { id name email } } }`,
+        { filter: { email: { eqIgnoreCase: email } } },
+      );
+      const match = data.users.nodes[0];
+      if (!match) {
+        throw new LinearError(
+          `tracker.assigned_to_user_email='${email}' did not match any Linear user`,
+        );
+      }
+      this.assigneeUserIdCache = match.id;
+      logger.info('Resolved Linear assignee filter user', {
+        email: match.email,
+        name: match.name,
+        user_id: match.id,
+      });
+      return this.assigneeUserIdCache;
+    }
+    if (this.cfg.tracker.assigned_to_me) {
+      this.assigneeUserIdCache = await this.resolveViewerId();
+      return this.assigneeUserIdCache;
+    }
+    return null;
+  }
+
   async resolveTeam(): Promise<LinearTeam> {
     if (this.teamCache) return this.teamCache;
     const slug = this.cfg.tracker.project_slug;
@@ -154,9 +191,9 @@ export class LinearClient {
       team: { id: { eq: team.id } },
       state: { name: { in: this.cfg.tracker.active_states } },
     };
-    if (this.cfg.tracker.assigned_to_me) {
-      const viewerId = await this.resolveViewerId();
-      filter.assignee = { id: { eq: viewerId } };
+    const assigneeId = await this.resolveAssigneeFilterUserId();
+    if (assigneeId) {
+      filter.assignee = { id: { eq: assigneeId } };
     }
     const data = await this.query<{ issues: { nodes: RawLinearIssue[] } }>(
       ISSUES_QUERY,

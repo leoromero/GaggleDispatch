@@ -44,6 +44,14 @@ export interface ArchonRunPollerOptions {
   stallTimeoutMs?: number;
   /** How many consecutive 404s before emitting poller_run_not_found. Default 3. */
   maxMissingPolls?: number;
+  /**
+   * Delay before the first poll fires. Default 0 (poll immediately on start).
+   * Used by the post-approve flow: when we re-attach after `archon workflow
+   * approve`, Archon's run record briefly shows a terminal status mid-handoff
+   * (the paused-run gets marked failed before the resumed-run takes over).
+   * A short initial delay skips that transient state.
+   */
+  initialDelayMs?: number;
 }
 
 export class ArchonRunPoller {
@@ -52,6 +60,7 @@ export class ArchonRunPoller {
   private readonly pollIntervalMs: number;
   private readonly stallTimeoutMs: number;
   private readonly maxMissingPolls: number;
+  private readonly initialDelayMs: number;
   private readonly onEvent: (e: ArchonPollEvent) => void;
 
   private timer: ReturnType<typeof setTimeout> | null = null;
@@ -73,11 +82,12 @@ export class ArchonRunPoller {
     this.pollIntervalMs = opts.pollIntervalMs ?? 5_000;
     this.stallTimeoutMs = opts.stallTimeoutMs ?? 0;
     this.maxMissingPolls = opts.maxMissingPolls ?? 3;
+    this.initialDelayMs = opts.initialDelayMs ?? 0;
   }
 
   start(): void {
     if (this.stopped) return;
-    this.scheduleNext(0);
+    this.scheduleNext(this.initialDelayMs);
   }
 
   stop(): void {
@@ -117,6 +127,15 @@ export class ArchonRunPoller {
     const record = detail.run;
 
     // Track activity for stall detection.
+    //
+    // Stall = `last_activity_at` is frozen AND the daemon thinks the run is
+    // actively executing (status === 'running'). Other statuses are legitimate
+    // idle states:
+    //   - 'paused'  → at an approval gate, waiting for human input
+    //   - 'pending' → run queued in the daemon but not yet started
+    // Counting those as stalls produced false positives that killed our local
+    // watcher subprocess while real Archon work was either parked at a gate
+    // or doing a long Claude tool call.
     const newActivity = record.last_activity_at;
     const now = Date.now();
     if (newActivity !== this.lastActivityAt) {
@@ -125,6 +144,7 @@ export class ArchonRunPoller {
     } else if (
       this.stallTimeoutMs > 0 &&
       this.lastActivitySeenAt !== null &&
+      record.status === 'running' &&
       now - this.lastActivitySeenAt > this.stallTimeoutMs
     ) {
       logger.warn('Archon run stalled (no API activity)', {
@@ -133,8 +153,10 @@ export class ArchonRunPoller {
         stall_ms: now - this.lastActivitySeenAt,
       });
       this.onEvent({ type: 'poller_stalled', last_activity_at: this.lastActivityAt });
-      this.stop();
-      return;
+      // Re-arm the stall timer so we don't spam the event every poll tick — the
+      // orchestrator now treats stall as informational and we still want to
+      // continue polling to catch the real terminal status when it lands.
+      this.lastActivitySeenAt = now;
     }
 
     // Emit heartbeat so the orchestrator can update its session timestamp.
