@@ -95,6 +95,22 @@ export function startHubServer(opts: HubServerOptions): HubServerHandle {
     }
   }
 
+  function broadcastGaggles(): void {
+    const list = opts.manager.list().map((w) => ({
+      name: w.entry.name,
+      path: w.entry.path,
+      color: w.entry.color ?? null,
+      status: w.status,
+      api_url: w.api_url,
+      pid: w.pid,
+      started_at: w.started_at,
+      restart_count: w.restart_count,
+      last_exit_code: w.last_exit_code,
+      last_exit_at: w.last_exit_at,
+    }));
+    broadcast({ type: 'gaggles', gaggles: list });
+  }
+
   function recordLog(workspaceName: string, ev: { ts: string; level: string; message: string; context: Record<string, unknown> }): void {
     const wsId = wsRowByName.get(workspaceName);
     if (!wsId) return;
@@ -162,6 +178,7 @@ export function startHubServer(opts: HubServerOptions): HubServerHandle {
     while (Date.now() - start < 60_000) {
       const m = opts.manager.get(name);
       if (m?.api_url) {
+        broadcastGaggles();
         opts.manager.attachStream(name, (workspaceName, ev) => {
           const e = ev as { type: string; event?: { ts: string; level: string; message: string; context: Record<string, unknown> }; state?: unknown };
           if (e.type === 'log' && e.event) {
@@ -220,7 +237,7 @@ export function startHubServer(opts: HubServerOptions): HubServerHandle {
       if (url.pathname === '/api/archon') {
         return Response.json(opts.archon.getState());
       }
-      if (url.pathname === '/api/workspaces') {
+      if (url.pathname === '/api/gaggles') {
         const list = opts.manager.list().map((w) => ({
           name: w.entry.name,
           path: w.entry.path,
@@ -233,7 +250,66 @@ export function startHubServer(opts: HubServerOptions): HubServerHandle {
           last_exit_code: w.last_exit_code,
           last_exit_at: w.last_exit_at,
         }));
-        return Response.json({ workspaces: list });
+        return Response.json({ gaggles: list });
+      }
+      // ── Gaggle control endpoints ─────────────────────────────────────────────
+      if (req.method === 'POST' && url.pathname === '/api/gaggles/stop-all') {
+        void opts.manager.stopAllWorkspaces().then(() => {
+          setTimeout(broadcastGaggles, 200);
+        });
+        return Response.json({ ok: true });
+      }
+      if (req.method === 'POST' && url.pathname === '/api/gaggles/start-all') {
+        for (const entry of opts.cfg.workspaces) {
+          void opts.manager.startWorkspace(entry).then(() => {
+            setTimeout(broadcastGaggles, 200);
+          });
+        }
+        return Response.json({ ok: true });
+      }
+      const stopMatch = req.method === 'POST' && url.pathname.match(/^\/api\/gaggles\/([^/]+)\/stop$/);
+      if (stopMatch) {
+        const name = decodeURIComponent(stopMatch[1]);
+        void opts.manager.stopWorkspace(name).then(() => {
+          setTimeout(broadcastGaggles, 200);
+        });
+        return Response.json({ ok: true });
+      }
+      const startMatch = req.method === 'POST' && url.pathname.match(/^\/api\/gaggles\/([^/]+)\/start$/);
+      if (startMatch) {
+        const name = decodeURIComponent(startMatch[1]);
+        const entry = opts.cfg.workspaces.find((w) => w.name === name);
+        if (!entry) return Response.json({ error: 'gaggle not found' }, { status: 404 });
+        void opts.manager.startWorkspace(entry).then(() => {
+          setTimeout(broadcastGaggles, 200);
+          void waitAndAttach(name);
+        });
+        return Response.json({ ok: true });
+      }
+      const redispatchMatch = req.method === 'POST' && url.pathname.match(/^\/api\/gaggles\/([^/]+)\/targets\/redispatch$/);
+      if (redispatchMatch) {
+        const name = decodeURIComponent(redispatchMatch[1]!);
+        const workspace = opts.manager.get(name);
+        if (!workspace || !workspace.api_url) {
+          return Response.json({ error: 'gaggle not found or not running' }, { status: 404 });
+        }
+        let body: unknown;
+        try {
+          body = await req.json();
+        } catch {
+          return Response.json({ error: 'invalid JSON body' }, { status: 400 });
+        }
+        try {
+          const res = await fetch(`${workspace.api_url}/redispatch`, {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify(body),
+          });
+          const data = await res.json();
+          return Response.json(data, { status: res.status });
+        } catch (err) {
+          return Response.json({ error: (err as Error).message }, { status: 502 });
+        }
       }
       if (url.pathname === '/api/state') {
         const states = await opts.manager.fetchAllStates();
