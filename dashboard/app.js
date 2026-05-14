@@ -361,7 +361,7 @@ function renderWorkers() {
           el('div', { class: 'actions' }, [el('a', linkAttrs, linkText)]),
         ]),
       );
-    } else {
+    } else if (kind === 'gate') {
       const directUrl = archonRunUrl(w.run_id);
       const indexUrl = archonRunsIndexUrl();
       const linkText = directUrl ? 'View in Archon ↗' : 'Open Archon runs ↗';
@@ -618,6 +618,10 @@ $('#log-search').addEventListener('input', (e) => {
 });
 $('#autoscroll').addEventListener('change', (e) => {
   state.autoscroll = e.target.checked;
+});
+$('#btn-clear-logs').addEventListener('click', () => {
+  state.logs = [];
+  renderLogs();
 });
 
 // Refresh "ago" labels on a steady tick.
