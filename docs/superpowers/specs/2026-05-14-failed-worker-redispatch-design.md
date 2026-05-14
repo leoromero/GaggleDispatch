@@ -61,7 +61,7 @@ interface FailedTargetInfo {
 }
 
 // Added to OrchestratorState:
-failed_targets: Map<string, FailedTargetInfo> // key: `${issue_id}:${repo_alias}`
+failed_targets: Map<string, FailedTargetInfo> // key: workerKey(issue_id, repo_alias) → `${issue_id}__${repo_alias}`
 ```
 
 **Written:** by the effect applier when it processes the `apply_label(failed)` effect, reading the reason from the `worker_failed` / `gate_rejected` / `gate_timed_out` event payload.
@@ -86,7 +86,7 @@ Body: { issue_id: string, repo_alias: string }
 2. Validate the target is currently in `failed` state; return 400 if not
 3. Call `linear.removeLabel(issue_id, 'failed')`
 4. Fire `retry_requested` event directly into the orchestrator state machine (no poll wait)
-5. The existing `failed → dispatching` transition takes over: posts acknowledgment comment, reads analysis from cache or `AnalysisRegistry`, spawns worker
+5. The existing `failed → dispatching` transition takes over: posts acknowledgment comment, reads analysis from cache or `AnalysisRegistry` (if both miss — e.g. file deleted — falls back to re-analyzing, same as a fresh dispatch), spawns worker
 
 **State serialization (`gaggle-api.ts`):**  
 New `failed[]` section added alongside `running[]` and `supervised_gates[]`:
