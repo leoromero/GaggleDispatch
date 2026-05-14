@@ -1,0 +1,243 @@
+name: generate-gaggle-md
+description: |
+  Use when: You need to create or regenerate the gaggle.md routing document for any repository.
+  Triggers: "generate gaggle", "create gaggle.md", "analyze repository and generate gaggle",
+            "build repository gaggle documentation", "create repo gaggle", "update gaggle.md".
+  Does: Takes a language-agnostic snapshot of the repo, then runs a Claude agent that reads key
+        source files to understand the repo's architecture and external integrations — and produces
+        a spec-compliant gaggle.md focused on routing context: what does this repo do, what are
+        its meaningful functional components, and what external systems does it talk to. Internal
+        modules and implementation details are intentionally excluded.
+  NOT for: Creating GitHub pull requests, pushing to remote repositories, or any GitHub-dependent workflows.
+
+nodes:
+  - id: snapshot-root
+    bash: |
+      #!/bin/bash
+      # Language-agnostic repo snapshot — gives Claude a starting map to explore from.
+
+      echo "=== WORKING DIRECTORY ==="
+      pwd
+
+      echo ""
+      echo "=== ROOT FILES AND DIRECTORIES ==="
+      ls -1A
+
+      echo ""
+      echo "=== ALL FILES (max depth 4, excluding build artifacts and dependencies) ==="
+      find . \
+        -not -path './.git/*' \
+        -not -path './node_modules/*' \
+        -not -path './.archon/artifacts/*' \
+        -not -path './.archon/logs/*' \
+        -not -path './target/*' \
+        -not -path './dist/*' \
+        -not -path './build/*' \
+        -not -path './__pycache__/*' \
+        -not -path './.venv/*' \
+        -not -path './vendor/*' \
+        -not -path './.gradle/*' \
+        -not -path './bin/*' \
+        -maxdepth 4 \
+        -type f \
+        | sort
+
+  - id: analyze-and-generate
+    depends_on: [snapshot-root]
+    model: sonnet
+    allowed_tools: [Read, Write, Glob]
+    prompt: |
+      You are generating a `gaggle.md` self-description file for this repository.
+
+      ## PURPOSE — READ THIS FIRST
+
+      `gaggle.md` is NOT a developer handbook. It is a routing document consumed by an
+      automated Issue Analyzer (Claude) that decides: *"does this issue belong in this repo?"*
+
+      The Issue Analyzer reads every registered repo's `gaggle.md` and picks which repos
+      should receive a given Linear issue. It needs to know:
+      - What problem does this repo solve?
+      - What are its major functional areas (components)?
+      - What external systems does it integrate with?
+
+      **What to include:** the repo's responsibility, its functional components at an
+      architectural level, and its external integrations.
+
+      **What to exclude:** build commands, test strategy, internal implementation details,
+      configuration file formats, lock file mechanics, internal helper modules. Internal
+      modules that are not meaningful routing targets should be grouped into their parent
+      component, not listed separately.
+
+      A good rule of thumb: if a Linear issue would never specifically target a component
+      in isolation, don't list it as a separate component.
+
+      ---
+
+      ## REPOSITORY SNAPSHOT
+
+      $snapshot-root.output
+
+      ---
+
+      ## GAGGLE.MD SPECIFICATION
+
+      The file has two parts:
+
+      ### PART 1 — YAML FRONT MATTER (machine-parsed by the Repo Syncer)
+
+      Delimited by `---` at the top of the file.
+
+      **Required fields:**
+
+      - `name` (string)
+        Globally unique kebab-case alias. Derived from the project name in the manifest
+        (package.json `name`, go.mod module path leaf, Cargo.toml `[package] name`,
+        pyproject.toml `[project] name`, etc.) or the directory name if no manifest.
+        Pattern: `[a-z0-9][a-z0-9-]*[a-z0-9]`
+
+      - `description` (string)
+        1–3 dense sentences. What does this repo do and what is its role in the broader
+        system? This is the primary signal the Issue Analyzer uses. Make it specific.
+
+      - `default_workflow` (string)
+        Use `gaggle/gaggle-fix-issue` unless you have evidence of a different name.
+
+      - `components` (list, at least one required)
+        The repo's meaningful functional units — services, workers, CLIs, APIs, databases,
+        queues. Each has:
+
+        - `name` (string, REQUIRED)
+          Globally unique kebab-case. Other repos reference this name in their own
+          `communicates_with` entries. Use a name that identifies the component's role
+          in the broader system.
+
+        - `description` (string, REQUIRED)
+          What this component does and why it exists. Write for the Issue Analyzer:
+          enough context to understand which issues affect this component.
+
+        - `component_type` (string, RECOMMENDED)
+          `ecs_service` | `lambda` | `sqs_queue` | `eventbridge_bus` | `redshift` |
+          `healthlake` | `rds` | `shared_lib` | `api_gateway` | `cli` | `worker` |
+          `frontend` | `backend` | `other`
+
+        - `communicates_with` (list, RECOMMENDED)
+          External systems and other registered repos' components this component talks to.
+          Do NOT list internal library dependencies between modules in the same repo.
+          Each entry requires:
+          - `component`: kebab-case target name (use descriptive names for external systems:
+            `linear-graphql-api`, `anthropic-claude-api`, `sqs-patient-queue`, etc.)
+          - `method`: `sqs` | `http` | `grpc` | `eventbridge` | `kinesis` | `graphql` |
+            `database` | `s3` | `subprocess` | `library` | etc.
+          - `direction`: `produces` | `consumes` | `reads` | `writes` | `depends_on` | `bidirectional`
+
+      **Optional fields:**
+
+      - `available_workflows` (list of strings)
+        All Archon workflows available. Include `gaggle/gaggle-fix-issue` plus any others.
+
+      **Example:**
+
+      ```yaml
+      ---
+      name: patient-ingestion-service
+      description: >
+        Receives HL7 FHIR messages over HTTPS, validates them against schema rules, and
+        publishes inbound events to downstream processing queues. Entry point for all
+        patient data entering the system.
+      default_workflow: gaggle/gaggle-fix-issue
+      available_workflows:
+        - gaggle/gaggle-fix-issue
+        - gaggle/gaggle-supervised
+      components:
+        - name: patient-ingestion-api
+          component_type: ecs_service
+          description: >
+            REST API that accepts FHIR payloads, handles auth and rate limiting,
+            and validates schema before forwarding to the ingestion queue.
+          communicates_with:
+            - component: ingestion-queue
+              method: sqs
+              direction: produces
+            - component: shared-auth-lib
+              method: library
+              direction: depends_on
+        - name: ingestion-queue
+          component_type: sqs_queue
+          description: >
+            Buffers validated inbound FHIR messages between the ingestion API
+            and downstream processing workers.
+          communicates_with:
+            - component: fhir-processor-worker
+              method: sqs
+              direction: produces
+      ---
+      ```
+
+      ### PART 2 — MARKDOWN BODY (read verbatim by the Issue Analyzer)
+
+      After the closing `---`, write a focused architecture narrative:
+
+      - The repo's role in the broader system and why it exists
+      - How its major components relate to each other
+      - What external systems it integrates with and why
+      - Any architectural constraints or boundaries that affect issue routing
+        (e.g. "this repo never writes to the database directly — all writes go through X")
+
+      Keep it concise. 3–6 paragraphs. This is context for routing decisions, not
+      onboarding documentation.
+
+      ---
+
+      ## INSTRUCTIONS
+
+      1. Read the most informative files to understand the repo's architecture:
+         - Manifest files (package.json, go.mod, Cargo.toml, pyproject.toml, etc.)
+           for the project name and a sense of dependencies
+         - README at the root (if present)
+         - Entry-point files and top-level module structure
+
+      2. Read enough source to identify the repo's functional components and external
+         integrations. You do not need to read every file — stop when you have a clear
+         picture of what the repo does, what it owns, and what it talks to externally.
+
+      3. Apply the routing-document principle throughout:
+         - Group internal helpers/utilities/config under the component they serve
+         - Only surface components that are meaningful dispatch targets
+         - Only list `communicates_with` entries for external systems or other registered
+           repos — not for imports between modules within this repo
+
+      4. Write `gaggle.md` to the working directory root using the Write tool.
+
+  - id: validate-yaml-frontmatter
+    depends_on: [analyze-and-generate]
+    script: |
+      import { readFileSync } from 'fs';
+
+      const content = readFileSync('gaggle.md', 'utf-8');
+      const match = content.match(/^---\n([\s\S]*?)\n---/);
+      if (!match) throw new Error('No YAML front matter block found in gaggle.md');
+
+      const fm = match[1];
+      const required = ['name', 'description', 'default_workflow', 'components'];
+      const missing = required.filter(f => !new RegExp(`^${f}[:\\s]`, 'm').test(fm));
+      if (missing.length > 0) throw new Error(`Missing required front matter fields: ${missing.join(', ')}`);
+
+      const nameMatch = fm.match(/^name:\s*(.+)/m);
+      const name = nameMatch?.[1]?.trim() ?? '';
+      if (!/^[a-z0-9][a-z0-9-]*[a-z0-9]$/.test(name)) {
+        throw new Error(`name "${name}" does not match required pattern [a-z0-9][a-z0-9-]*[a-z0-9]`);
+      }
+
+      const componentsCount = (fm.match(/^\s{2}-\s+name:/gm) || []).length;
+      if (componentsCount === 0) throw new Error('components list is empty — at least one component is required');
+
+      const workflowsCount = (fm.match(/^\s*-\s+gaggle\//gm) || []).length;
+      const hasBody = content.split(/\n---\n/)[1]?.trim().length > 0;
+      if (!hasBody) throw new Error('Markdown body after front matter is empty');
+
+      console.log('gaggle.md validated successfully');
+      console.log(`  name:                ${name}`);
+      console.log(`  components:          ${componentsCount}`);
+      console.log(`  available_workflows: ${workflowsCount}`);
+      console.log(`  body:                present`);
+    runtime: bun
