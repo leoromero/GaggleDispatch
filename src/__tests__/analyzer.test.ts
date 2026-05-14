@@ -184,3 +184,111 @@ describe('IssueAnalyzer.analyze', () => {
     expect(r.repo_targets[0]!.repo_alias).not.toContain('!');
   });
 });
+
+describe('IssueAnalyzer complexity routing', () => {
+  test('simple complexity routes to gaggle-fix-issue, overriding repo default_workflow', async () => {
+    const ctx = makeRegistryContext([
+      makeRegistryRepo({
+        name: 'repo-a',
+        url: 'https://github.com/o/repo-a',
+        available_workflows: ['gaggle/gaggle-fix-issue', 'gaggle/gaggle-supervised'],
+        default_workflow: 'gaggle/gaggle-supervised',
+      }),
+    ]);
+    const json = JSON.stringify({
+      analysis_summary: 'trivial one-liner fix',
+      complexity: 'simple',
+      repo_targets: [{ repo_alias: 'repo-a', rationale: '', components: [] }],
+    });
+    const r = await new IssueAnalyzer(makeServiceConfig(), fakeRunner(json)).analyze(makeIssue(), ctx);
+    expect(r.complexity).toBe('simple');
+    expect(r.repo_targets[0]!.archon_workflow).toBe('gaggle/gaggle-fix-issue');
+    expect(r.analysis_summary).toContain('[complexity: simple]');
+  });
+
+  test('complex complexity routes to gaggle-supervised, overriding repo default_workflow', async () => {
+    const ctx = makeRegistryContext([
+      makeRegistryRepo({
+        name: 'repo-a',
+        url: 'https://github.com/o/repo-a',
+        available_workflows: ['gaggle/gaggle-fix-issue', 'gaggle/gaggle-supervised'],
+        default_workflow: 'gaggle/gaggle-fix-issue',
+      }),
+    ]);
+    const json = JSON.stringify({
+      analysis_summary: 'new feature spanning multiple components',
+      complexity: 'complex',
+      repo_targets: [{ repo_alias: 'repo-a', rationale: '', components: [] }],
+    });
+    const r = await new IssueAnalyzer(makeServiceConfig(), fakeRunner(json)).analyze(makeIssue(), ctx);
+    expect(r.complexity).toBe('complex');
+    expect(r.repo_targets[0]!.archon_workflow).toBe('gaggle/gaggle-supervised');
+    expect(r.analysis_summary).toContain('[complexity: complex]');
+  });
+
+  test('missing complexity field defaults to complex', async () => {
+    const ctx = makeRegistryContext([
+      makeRegistryRepo({
+        name: 'repo-a',
+        url: 'https://github.com/o/repo-a',
+        available_workflows: ['gaggle/gaggle-fix-issue', 'gaggle/gaggle-supervised'],
+        default_workflow: 'gaggle/gaggle-fix-issue',
+      }),
+    ]);
+    const json = JSON.stringify({
+      analysis_summary: 'something',
+      // no complexity field
+      repo_targets: [{ repo_alias: 'repo-a', rationale: '', components: [] }],
+    });
+    const r = await new IssueAnalyzer(makeServiceConfig(), fakeRunner(json)).analyze(makeIssue(), ctx);
+    expect(r.complexity).toBe('complex');
+    expect(r.repo_targets[0]!.archon_workflow).toBe('gaggle/gaggle-supervised');
+  });
+
+  test('falls back to repo default_workflow when complexity-derived workflow not in available_workflows', async () => {
+    const ctx = makeRegistryContext([
+      makeRegistryRepo({
+        name: 'repo-a',
+        url: 'https://github.com/o/repo-a',
+        available_workflows: ['gaggle/gaggle-supervised'],   // fix-issue NOT available
+        default_workflow: 'gaggle/gaggle-supervised',
+      }),
+    ]);
+    const json = JSON.stringify({
+      analysis_summary: 'simple fix',
+      complexity: 'simple',
+      repo_targets: [{ repo_alias: 'repo-a', rationale: '', components: [] }],
+    });
+    const r = await new IssueAnalyzer(makeServiceConfig(), fakeRunner(json)).analyze(makeIssue(), ctx);
+    // gaggle-fix-issue not available → fallback to default_workflow
+    expect(r.repo_targets[0]!.archon_workflow).toBe('gaggle/gaggle-supervised');
+  });
+
+  test('complexity routing applied consistently across all repo_targets in a multi-repo result', async () => {
+    const ctx = makeRegistryContext([
+      makeRegistryRepo({
+        name: 'frontend',
+        url: 'https://github.com/o/frontend',
+        available_workflows: ['gaggle/gaggle-fix-issue', 'gaggle/gaggle-supervised'],
+        default_workflow: 'gaggle/gaggle-supervised',
+      }),
+      makeRegistryRepo({
+        name: 'backend',
+        url: 'https://github.com/o/backend',
+        available_workflows: ['gaggle/gaggle-fix-issue', 'gaggle/gaggle-supervised'],
+        default_workflow: 'gaggle/gaggle-supervised',
+      }),
+    ]);
+    const json = JSON.stringify({
+      analysis_summary: 'multi-repo feature',
+      complexity: 'complex',
+      repo_targets: [
+        { repo_alias: 'frontend', rationale: '', components: [] },
+        { repo_alias: 'backend', rationale: '', components: [] },
+      ],
+    });
+    const r = await new IssueAnalyzer(makeServiceConfig(), fakeRunner(json)).analyze(makeIssue(), ctx);
+    expect(r.repo_targets[0]!.archon_workflow).toBe('gaggle/gaggle-supervised');
+    expect(r.repo_targets[1]!.archon_workflow).toBe('gaggle/gaggle-supervised');
+  });
+});
