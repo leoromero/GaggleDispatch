@@ -216,6 +216,50 @@ export class Orchestrator {
     return this.state;
   }
 
+  /**
+   * Re-dispatch a failed target without re-analyzing. Called by the gaggle API
+   * when the operator clicks Re-dispatch in the dashboard. Fires retry_requested
+   * directly into the state machine — the SM handles label removal and worker spawn.
+   */
+  async redispatch(issue_id: string, repo_alias: string): Promise<void> {
+    const key = workerKey(issue_id, repo_alias);
+    if (this.state.target_machine_states.get(key) !== 'failed') {
+      throw new Error(`Target ${key} is not in failed state`);
+    }
+
+    let parentIssue = this.state.pending_issues.get(issue_id);
+    if (!parentIssue) {
+      try {
+        const fetched = await this.tracker.fetchIssueStatesByIds([issue_id]);
+        parentIssue = fetched[0];
+      } catch {
+        /* ignore */
+      }
+    }
+    if (!parentIssue) throw new Error(`Cannot resolve issue ${issue_id}`);
+
+    this.state.pending_issues.set(issue_id, parentIssue);
+    const target = this.buildRepoTargetForAlias(repo_alias, parentIssue);
+    const targetIssueId = this.state.sibling_subissues.get(issue_id)?.get(repo_alias) ?? issue_id;
+
+    const identity: TargetIdentity = {
+      parent_issue_id: issue_id,
+      repo_alias,
+      target_issue_id: targetIssueId,
+    };
+
+    await this.emitTargetEvent('failed', { kind: 'retry_requested', message: null }, {
+      cfg: this.cfg,
+      identity,
+      parent_issue: parentIssue,
+      target,
+      siblings: new Map(),
+      attempt: 0,
+    });
+
+    logger.info('Failed target — dashboard re-dispatch', { issue_id, repo_alias });
+  }
+
   async start(): Promise<void> {
     logger.info('Orchestrator starting', {
       poll_interval_ms: this.cfg.polling.interval_ms,
@@ -1263,6 +1307,23 @@ export class Orchestrator {
     await this.effectApplier.applyAll(transition.effects);
     const key = workerKey(ctx.identity.parent_issue_id, ctx.identity.repo_alias);
     this.state.target_machine_states.set(key, transition.to);
+
+    if (transition.to === 'failed') {
+      const reason =
+        event.kind === 'worker_failed' ? event.reason
+        : event.kind === 'gate_rejected' ? `gate rejected: ${event.message}`
+        : event.kind === 'gate_timed_out' ? 'gate timed out'
+        : null;
+      this.state.failed_targets.set(key, {
+        issue: ctx.parent_issue,
+        repo_target: ctx.target,
+        reason,
+        failed_at: Date.now(),
+      });
+    } else if (fromState === 'failed') {
+      this.state.failed_targets.delete(key);
+    }
+
     return transition;
   }
 
