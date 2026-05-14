@@ -659,6 +659,65 @@ nodes:
     trigger_rule: one_success
 
   # ═══════════════════════════════════════════════════════════════
+  # PHASE 3.5: ARCHITECTURAL SUMMARY
+  # Generates a design-level analysis for human review.
+  # Posted to the Linear issue AND embedded in the plan-gate message.
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: summarize
+    depends_on: [bridge-artifacts]
+    model: haiku
+    context: fresh
+    prompt: |
+      Produce an architectural analysis of the implementation plan for a human reviewer.
+      This is a design brief — NOT a task list or implementation checklist.
+
+      Read \$ARTIFACTS_DIR/investigation.md in full, then write \$ARTIFACTS_DIR/plan-summary.md.
+
+      ## What to include (omit entire sections that do not apply)
+
+      ### Approach Rationale
+      Why this approach over alternatives. 1–2 sentences.
+
+      ### Architecture & Component Design
+      Which systems and layers are touched and how they interact. No file names or line numbers.
+
+      ### UX / Interaction Patterns
+      New flows, screens, state transitions, or user-facing behaviour changes.
+
+      ### Key Design Decisions
+      Trade-offs made, conventions followed, patterns chosen.
+
+      ### Risks at a Design Level
+      What could go wrong architecturally — not implementation bugs, but design concerns.
+
+      ### Questions & Clarifications
+      *(Optional — omit this section entirely if nothing is unclear)*
+      Anything still ambiguous that the reviewer should be aware of before approving.
+
+      ## Strict prohibitions
+      - No file names, paths, or line numbers
+      - No numbered implementation steps
+      - No "we will call function X" or "modify class Y"
+
+  - id: post-summary
+    bash: |
+      set -euo pipefail
+      if [ ! -f "\$ARTIFACTS_DIR/plan-summary.md" ]; then
+        echo "WARNING: plan-summary.md not found, skipping Linear post" >&2
+        exit 0
+      fi
+      BODY=$(cat "\$ARTIFACTS_DIR/plan-summary.md")
+      ESCAPED=$(printf '%s' "\$BODY" | python3 -c "import sys,json; print(json.dumps(sys.stdin.read()))")
+      curl -sf -X POST https://api.linear.app/graphql \\
+        -H "Authorization: \$LINEAR_API_KEY" \\
+        -H "Content-Type: application/json" \\
+        --data "{\\"query\\": \\"mutation { commentCreate(input: { issueId: \\\\\\"\\$GAGGLE_ISSUE_ID\\\\\\", body: \\$ESCAPED }) { success comment { id } } }\\"}" \\
+        -o "\$ARTIFACTS_DIR/post-summary-result.txt" \\
+        || echo "WARNING: failed to post summary to Linear" >&2
+    depends_on: [summarize]
+
+  # ═══════════════════════════════════════════════════════════════
   # PHASE 3: PLAN APPROVAL GATE
   # Human sees the plan summary in the gate comment and in Archon output.
   # Reply "approve" (or any positive response) to start implementation.
@@ -666,13 +725,18 @@ nodes:
   # ═══════════════════════════════════════════════════════════════
 
   - id: plan-gate
-    depends_on: [bridge-artifacts]
+    depends_on: [post-summary]
     approval:
       message: |
-        Implementation plan is ready for your review.
+        ## Architectural Summary
 
-        Read the full plan in the Archon run output above, then reply here:
-        - **approve** (optionally with notes) — starts implementation immediately
+        $(cat "\$ARTIFACTS_DIR/plan-summary.md")
+
+        ---
+
+        The full implementation plan is in the Archon run output above.
+
+        - **approve** (optionally with answers to any questions above) — starts implementation immediately
         - **reject: <your feedback>** — triggers a revised plan addressing your concerns
 
         You have up to 3 revision cycles before the workflow proceeds automatically.
