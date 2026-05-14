@@ -29,14 +29,31 @@
       </section>
 
       <section id="workers-panel" class="panel wide">
-        <h2>Active workers</h2>
+        <h2>Workers</h2>
         <div id="workers-list" class="workers-list"></div>
       </section>
 
       <section id="repos-panel" class="panel">
-        <h2>Workspaces</h2>
-        <div id="workspaces-list" class="workspaces-list"></div>
+        <div class="panel-header">
+          <h2>Gaggles</h2>
+          <div class="nest-controls">
+            <button id="btn-start-all" class="nest-btn start" title="Start all gaggles">▶ All</button>
+            <button id="btn-stop-all" class="nest-btn stop" title="Stop all gaggles">■ All</button>
+          </div>
+        </div>
+        <div id="gaggles-list" class="gaggles-list"></div>
       </section>
+
+      <div id="stop-modal" class="modal-overlay hidden">
+        <div class="modal">
+          <h3 id="modal-title"></h3>
+          <p id="modal-body"></p>
+          <div class="modal-actions">
+            <button id="modal-cancel" class="nest-btn">Cancel</button>
+            <button id="modal-stop" class="nest-btn stop">Stop gaggle</button>
+          </div>
+        </div>
+      </div>
 
       <section id="logs-panel" class="panel full">
         <div class="logs-header">

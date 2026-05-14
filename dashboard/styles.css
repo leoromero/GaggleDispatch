@@ -300,6 +300,11 @@ main {
   background: linear-gradient(180deg, rgba(245, 158, 11, 0.05), var(--panel-2));
 }
 
+.worker-card.failed {
+  border-color: rgba(239, 68, 68, 0.4);
+  background: linear-gradient(180deg, rgba(239, 68, 68, 0.05), var(--panel-2));
+}
+
 .worker-card .head {
   display: flex;
   justify-content: space-between;
@@ -342,6 +347,11 @@ main {
   color: var(--purple);
 }
 
+.badge.failed {
+  background: rgba(239, 68, 68, 0.15);
+  color: var(--red);
+}
+
 .worker-card .meta {
   color: var(--text-dim);
   font-size: 11px;
@@ -357,6 +367,42 @@ main {
   margin-top: 4px;
 }
 
+.worker-card .fail-reason {
+  font-style: italic;
+  color: var(--red);
+  background: rgba(239, 68, 68, 0.06);
+  padding: 6px 8px;
+  border-radius: 4px;
+  font-size: 11px;
+  margin-top: 4px;
+}
+
+.worker-card .actions button.redispatch-btn {
+  font-size: 11px;
+  color: var(--accent);
+  background: none;
+  border: 1px solid var(--accent);
+  border-radius: 4px;
+  padding: 2px 8px;
+  cursor: pointer;
+}
+
+.worker-card .actions button.redispatch-btn:hover {
+  background: rgba(79, 156, 249, 0.1);
+}
+
+.worker-card .actions button.redispatch-btn:disabled {
+  color: var(--text-faint);
+  border-color: var(--text-faint);
+  cursor: not-allowed;
+}
+
+.worker-card .actions .redispatch-error {
+  font-size: 10px;
+  color: var(--red);
+  margin-left: 6px;
+}
+
 .token-bar {
   height: 4px;
   background: var(--border);
@@ -370,8 +416,129 @@ main {
   background: var(--accent);
 }
 
+/* Nest controls */
+.panel-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  border-bottom: 1px solid var(--border);
+}
+
+.panel-header h2 {
+  border: none;
+  flex: 1;
+}
+
+.nest-controls {
+  display: flex;
+  gap: 4px;
+  padding-right: 10px;
+}
+
+.nest-btn {
+  font-size: 11px;
+  padding: 3px 8px;
+  border-radius: 4px;
+  border: 1px solid var(--border);
+  background: var(--panel-2);
+  color: var(--text-dim);
+  cursor: pointer;
+  line-height: 1;
+  transition: background 0.1s, color 0.1s, border-color 0.1s;
+}
+
+.nest-btn:hover {
+  background: var(--border);
+  color: var(--text);
+}
+
+.nest-btn.stop:hover {
+  background: rgba(239, 68, 68, 0.15);
+  color: var(--red);
+  border-color: rgba(239, 68, 68, 0.4);
+}
+
+.nest-btn.start:hover {
+  background: rgba(16, 185, 129, 0.15);
+  color: var(--green);
+  border-color: rgba(16, 185, 129, 0.4);
+}
+
+.ws-ctrl-group {
+  margin-left: auto;
+  display: flex;
+  gap: 4px;
+}
+
+.ws-ctrl {
+  padding: 2px 6px;
+  font-size: 10px;
+}
+
+/* Stop confirmation modal */
+.modal-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.6);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 100;
+}
+
+.modal-overlay.hidden {
+  display: none;
+}
+
+.modal {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 24px;
+  max-width: 400px;
+  width: 90%;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.modal h3 {
+  margin: 0;
+  font-size: 14px;
+  color: var(--text);
+}
+
+.modal p {
+  margin: 0;
+  font-size: 12px;
+  color: var(--text-dim);
+  line-height: 1.6;
+}
+
+.modal-actions {
+  display: flex;
+  gap: 8px;
+  justify-content: flex-end;
+  margin-top: 4px;
+}
+
+.modal-actions .nest-btn {
+  padding: 5px 14px;
+  font-size: 12px;
+}
+
+.modal-actions .nest-btn.stop {
+  background: rgba(239, 68, 68, 0.1);
+  color: var(--red);
+  border-color: rgba(239, 68, 68, 0.4);
+}
+
+.modal-actions .nest-btn.stop:hover {
+  background: rgba(239, 68, 68, 0.25);
+}
+
 /* Workspaces panel */
-.workspaces-list {
+.gaggles-list {
   padding: 10px;
   overflow-y: auto;
   display: flex;
@@ -379,51 +546,51 @@ main {
   gap: 8px;
 }
 
-.workspace-card {
+.gaggle-card {
   background: var(--panel-2);
   border: 1px solid var(--border);
   border-radius: 6px;
   padding: 8px 10px;
 }
 
-.workspace-card .head {
+.gaggle-card .head {
   display: flex;
   align-items: center;
   gap: 6px;
 }
 
-.workspace-card .head .dot {
+.gaggle-card .head .dot {
   width: 8px;
   height: 8px;
   border-radius: 50%;
 }
 
-.workspace-card .head .name {
+.gaggle-card .head .name {
   font-weight: 600;
 }
 
-.workspace-card .head .status {
+.gaggle-card .head .status {
   font-size: 10px;
   text-transform: uppercase;
   color: var(--text-dim);
   margin-left: auto;
 }
 
-.workspace-card .head .status.running {
+.gaggle-card .head .status.running {
   color: var(--green);
 }
 
-.workspace-card .head .status.crashed {
+.gaggle-card .head .status.crashed {
   color: var(--red);
 }
 
-.workspace-card .meta {
+.gaggle-card .meta {
   color: var(--text-faint);
   font-size: 11px;
   margin-top: 4px;
 }
 
-.workspace-card .summary {
+.gaggle-card .summary {
   display: flex;
   gap: 10px;
   margin-top: 6px;
@@ -431,7 +598,7 @@ main {
   font-variant-numeric: tabular-nums;
 }
 
-.workspace-card .summary .pill {
+.gaggle-card .summary .pill {
   padding: 1px 6px;
   border-radius: 3px;
   background: var(--border);

@@ -2,9 +2,9 @@
 // Single-page app, plain ES modules, no build step.
 
 const state = {
-  workspaces: [], // [{ name, path, color, status, api_url, ... }]
+  gaggles: [], // [{ name, path, color, status, api_url, ... }]
   selected: 'all',
-  states: {}, // workspaceName -> latest state snapshot
+  states: {}, // gaggleName -> latest state snapshot
   logs: [], // newest at the end, capped
   logFilters: { level: '', search: '' },
   autoscroll: true,
@@ -44,10 +44,10 @@ function el(tag, attrs = {}, children = []) {
   return e;
 }
 
-function colorFor(workspaceName) {
-  const w = state.workspaces.find((x) => x.name === workspaceName);
+function colorFor(gaggleName) {
+  const w = state.gaggles.find((x) => x.name === gaggleName);
   if (w && w.color) return w.color;
-  const idx = state.workspaces.findIndex((x) => x.name === workspaceName);
+  const idx = state.gaggles.findIndex((x) => x.name === gaggleName);
   return COLORS_FALLBACK[Math.max(0, idx) % COLORS_FALLBACK.length];
 }
 
@@ -104,22 +104,26 @@ function handleMessage(msg) {
     renderStats();
     renderPipeline();
     renderWorkers();
-    renderWorkspaces();
+    renderGaggles();
   } else if (msg.type === 'log') {
     state.logs.push(msg.event);
     if (state.logs.length > MAX_LOGS) state.logs.splice(0, state.logs.length - MAX_LOGS);
     renderLogs();
+  } else if (msg.type === 'gaggles') {
+    state.gaggles = msg.gaggles ?? [];
+    renderTabs();
+    renderGaggles();
   }
 }
 
 // ─── Bootstrap fetches ──────────────────────────────────────────────────────
 async function bootstrap() {
   try {
-    const wsRes = await fetch('/api/workspaces');
+    const wsRes = await fetch('/api/gaggles');
     const wsJson = await wsRes.json();
-    state.workspaces = wsJson.workspaces ?? [];
+    state.gaggles = wsJson.gaggles ?? [];
   } catch {
-    state.workspaces = [];
+    state.gaggles = [];
   }
   try {
     const stRes = await fetch('/api/state');
@@ -148,7 +152,7 @@ async function bootstrap() {
         level: r.level,
         message: r.message,
         context: {
-          workspace: state.workspaces.find((w) => w.path && r.workspace_id)?.name,
+          workspace: state.gaggles.find((w) => w.path && r.workspace_id)?.name,
           issue_id: r.issue_id,
           repo_alias: r.repo_alias,
           session_id: r.session_id,
@@ -169,7 +173,7 @@ function renderAll() {
   renderArchonChip();
   renderPipeline();
   renderWorkers();
-  renderWorkspaces();
+  renderGaggles();
   renderLogs();
 }
 
@@ -196,7 +200,7 @@ function renderTabs() {
   const root = $('#ws-tabs');
   root.innerHTML = '';
   root.appendChild(makeTab('all', 'All projects', null));
-  for (const w of state.workspaces) {
+  for (const w of state.gaggles) {
     root.appendChild(makeTab(w.name, w.name, w.color || colorFor(w.name)));
   }
 }
@@ -216,7 +220,7 @@ function renderConnStat() {
 }
 
 function visibleWorkspaceNames() {
-  if (state.selected === 'all') return state.workspaces.map((w) => w.name);
+  if (state.selected === 'all') return state.gaggles.map((w) => w.name);
   return [state.selected];
 }
 
@@ -238,7 +242,7 @@ function renderStats() {
 
 function renderPipeline() {
   const names = visibleWorkspaceNames();
-  let running = 0, gated = 0, queued = 0, retries = 0;
+  let running = 0, gated = 0, queued = 0, retries = 0, failed = 0;
   const issuesByKey = new Map(); // issue_identifier -> { id, title, workspace, targets: [{repo, status}] }
 
   for (const name of names) {
@@ -248,6 +252,7 @@ function renderPipeline() {
     gated += s.supervised_gates?.length ?? 0;
     queued += (s.pending_targets ?? []).reduce((acc, p) => acc + p.targets.length, 0);
     retries += s.retry_attempts?.length ?? 0;
+    failed += s.failed?.length ?? 0;
 
     for (const w of s.running ?? []) {
       const key = `${name}:${w.issue.identifier}`;
@@ -280,7 +285,7 @@ function renderPipeline() {
     el('div', { class: 'item' }, [el('span', { class: 'count', style: { color: 'var(--green)' } }, String(running)), el('span', { class: 'label' }, 'running')]),
     el('div', { class: 'item' }, [el('span', { class: 'count', style: { color: 'var(--amber)' } }, String(gated)), el('span', { class: 'label' }, 'gate wait')]),
     el('div', { class: 'item' }, [el('span', { class: 'count', style: { color: 'var(--purple)' } }, String(queued)), el('span', { class: 'label' }, 'queued')]),
-    el('div', { class: 'item' }, [el('span', { class: 'count', style: { color: 'var(--text-dim)' } }, String(retries)), el('span', { class: 'label' }, 'retries')]),
+    el('div', { class: 'item' }, [el('span', { class: 'count', style: { color: 'var(--red)' } }, String(failed)), el('span', { class: 'label' }, 'failed')]),
   );
 
   const list = $('#pipeline-list');
@@ -312,10 +317,11 @@ function renderWorkers() {
     if (!s) continue;
     for (const w of s.running ?? []) cards.push({ name, kind: 'running', w });
     for (const g of s.supervised_gates ?? []) cards.push({ name, kind: 'gate', w: g });
+    for (const f of s.failed ?? []) cards.push({ name, kind: 'failed', w: f });
   }
 
   if (cards.length === 0) {
-    root.appendChild(el('div', { class: 'empty' }, 'No active workers.'));
+    root.appendChild(el('div', { class: 'empty' }, 'No workers.'));
     return;
   }
 
@@ -378,30 +384,137 @@ function renderWorkers() {
           el('div', { class: 'actions' }, [el('a', linkAttrs, linkText)]),
         ]),
       );
+    } else if (kind === 'failed') {
+      const agoStr = w.failed_at ? formatAgoMs(w.failed_at) : 'unknown time ago';
+      const reasonText = w.reason ?? 'see Linear comment for details';
+      const btn = el('button', { class: 'redispatch-btn' }, 'Re-dispatch');
+      btn.addEventListener('click', async () => {
+        btn.disabled = true;
+        btn.textContent = 'Dispatching…';
+        const actionsEl = btn.parentElement;
+        const existing = actionsEl?.querySelector('.redispatch-error');
+        if (existing) existing.remove();
+        try {
+          const res = await fetch(
+            `/api/gaggles/${encodeURIComponent(name)}/targets/redispatch`,
+            {
+              method: 'POST',
+              headers: { 'content-type': 'application/json' },
+              body: JSON.stringify({ issue_id: w.issue_id, repo_alias: w.repo_alias }),
+            },
+          );
+          if (!res.ok) {
+            const data = await res.json().catch(() => ({}));
+            throw new Error(data.error ?? `HTTP ${res.status}`);
+          }
+          btn.closest('.worker-card')?.remove();
+        } catch (err) {
+          btn.disabled = false;
+          btn.textContent = 'Re-dispatch';
+          const errEl = el('span', { class: 'redispatch-error' }, err.message ?? 'failed');
+          btn.parentElement?.appendChild(errEl);
+        }
+      });
+      root.appendChild(
+        el('div', { class: 'worker-card failed' }, [
+          el('div', { class: 'head' }, [
+            el('div', { class: 'who' }, [
+              el('span', { class: 'ws-color', style: { background: colorFor(name) } }),
+              `${w.issue_identifier} · ${w.repo_alias}`,
+            ]),
+            el('span', { class: 'badge failed' }, `failed · ${agoStr}`),
+          ]),
+          el('div', { class: 'meta' }, w.issue_title || ''),
+          el('div', { class: 'fail-reason' }, reasonText),
+          el('div', { class: 'actions' }, [btn]),
+        ]),
+      );
     }
   }
 }
 
-function renderWorkspaces() {
-  const root = $('#workspaces-list');
+// ─── Workspace controls ──────────────────────────────────────────────────────
+async function apiPost(path) {
+  try {
+    await fetch(path, { method: 'POST' });
+  } catch {
+    /* ignore — server will broadcast the result */
+  }
+}
+
+function activeArchonCount(workspaceName) {
+  const s = state.states[workspaceName];
+  return (s?.running?.length ?? 0);
+}
+
+function showStopModal(workspace, onConfirm) {
+  const count = activeArchonCount(workspace.name);
+  const modal = $('#stop-modal');
+  $('#modal-title').textContent = `Stop "${workspace.name}"?`;
+  if (count > 0) {
+    $('#modal-body').textContent =
+      `This gaggle has ${count} active Archon ${count === 1 ? 'worker' : 'workers'} running. ` +
+      `The orchestrator will stop; Archon workers will continue processing independently and can be cancelled in the Archon UI.`;
+  } else {
+    $('#modal-body').textContent = `No active Archon workers. The orchestrator will stop cleanly.`;
+  }
+  modal.classList.remove('hidden');
+
+  const cleanup = () => {
+    modal.classList.add('hidden');
+    $('#modal-stop').replaceWith($('#modal-stop').cloneNode(true));
+    $('#modal-cancel').replaceWith($('#modal-cancel').cloneNode(true));
+    rewireModal();
+  };
+
+  $('#modal-stop').addEventListener('click', () => { cleanup(); onConfirm(); }, { once: true });
+  $('#modal-cancel').addEventListener('click', cleanup, { once: true });
+}
+
+function rewireModal() {
+  $('#modal-cancel').addEventListener('click', () => $('#stop-modal').classList.add('hidden'), { once: true });
+}
+
+function renderGaggles() {
+  const root = $('#gaggles-list');
   root.innerHTML = '';
-  if (state.workspaces.length === 0) {
-    root.appendChild(el('div', { class: 'empty' }, 'No workspaces registered.'));
+  if (state.gaggles.length === 0) {
+    root.appendChild(el('div', { class: 'empty' }, 'No gaggles registered.'));
     return;
   }
-  for (const w of state.workspaces) {
+  for (const w of state.gaggles) {
     const s = state.states[w.name];
     const slots = s ? `${s.slots_used}/${s.max_concurrent_agents}` : '—';
     const runCount = s?.running?.length ?? 0;
     const gateCount = s?.supervised_gates?.length ?? 0;
     const queuedCount = (s?.pending_targets ?? []).reduce((acc, p) => acc + p.targets.length, 0);
+    const isStopped = w.status === 'stopped' || w.status === 'crashed';
+
+    const stopBtn = el('button', {
+      class: 'nest-btn stop ws-ctrl',
+      title: 'Stop gaggle',
+      onclick: (e) => {
+        e.stopPropagation();
+        showStopModal(w, () => apiPost(`/api/gaggles/${encodeURIComponent(w.name)}/stop`));
+      },
+    }, '■');
+
+    const startBtn = el('button', {
+      class: 'nest-btn start ws-ctrl',
+      title: 'Start gaggle',
+      onclick: (e) => {
+        e.stopPropagation();
+        apiPost(`/api/gaggles/${encodeURIComponent(w.name)}/start`);
+      },
+    }, '▶');
 
     root.appendChild(
-      el('div', { class: 'workspace-card', onclick: () => { state.selected = w.name; renderAll(); } }, [
+      el('div', { class: 'gaggle-card', onclick: () => { state.selected = w.name; renderAll(); } }, [
         el('div', { class: 'head' }, [
           el('span', { class: 'dot', style: { background: w.color || colorFor(w.name) } }),
           el('span', { class: 'name' }, w.name),
           el('span', { class: `status ${w.status}` }, w.status || 'unknown'),
+          el('div', { class: 'ws-ctrl-group' }, isStopped ? [startBtn] : [stopBtn]),
         ]),
         el('div', { class: 'meta' }, w.path),
         el('div', { class: 'summary' }, [
@@ -465,6 +578,34 @@ function formatContext(ctx) {
   }
   return parts.length ? ' · ' + parts.join('').trim() : '';
 }
+
+// ─── Nest-level controls ─────────────────────────────────────────────────────
+$('#btn-stop-all').addEventListener('click', () => {
+  const running = state.gaggles.filter((w) => w.status !== 'stopped' && w.status !== 'crashed');
+  if (running.length === 0) return;
+  const workerCount = running.reduce((sum, w) => sum + activeArchonCount(w.name), 0);
+
+  $('#modal-title').textContent = 'Stop all gaggles?';
+  $('#modal-body').textContent = workerCount > 0
+    ? `${running.length} ${running.length === 1 ? 'gaggle' : 'gaggles'} will stop. ` +
+      `There ${workerCount === 1 ? 'is' : 'are'} ${workerCount} active Archon ${workerCount === 1 ? 'worker' : 'workers'} — ` +
+      `they will continue running independently and can be cancelled in the Archon UI.`
+    : `${running.length} ${running.length === 1 ? 'gaggle' : 'gaggles'} will stop cleanly.`;
+  $('#stop-modal').classList.remove('hidden');
+
+  const cleanup = () => {
+    $('#stop-modal').classList.add('hidden');
+    $('#modal-stop').replaceWith($('#modal-stop').cloneNode(true));
+    $('#modal-cancel').replaceWith($('#modal-cancel').cloneNode(true));
+    rewireModal();
+  };
+  $('#modal-stop').addEventListener('click', () => { cleanup(); apiPost('/api/gaggles/stop-all'); }, { once: true });
+  $('#modal-cancel').addEventListener('click', cleanup, { once: true });
+});
+
+$('#btn-start-all').addEventListener('click', () => {
+  apiPost('/api/gaggles/start-all');
+});
 
 // ─── Filter wiring ──────────────────────────────────────────────────────────
 $('#log-level').addEventListener('change', (e) => {
