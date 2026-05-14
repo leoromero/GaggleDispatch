@@ -279,6 +279,22 @@ export interface CachedAnalysis {
   cached_at: number;
 }
 
+export interface FailedTargetInfo {
+  issue: Issue;
+  repo_target: RepoTarget;
+  reason: string | null;
+  failed_at: number; // unix ms
+}
+
+export interface FailedTargetSummary {
+  issue_id: string;
+  issue_identifier: string;
+  issue_title: string;
+  repo_alias: string;
+  reason: string | null;
+  failed_at: number; // unix ms
+}
+
 // ─── 4.1.7 Run Attempt ──────────────────────────────────────────────────────
 export type RunStatus =
   | 'PreparingWorkspace'
@@ -409,6 +425,12 @@ export interface OrchestratorState {
    * every parentTransition call.
    */
   parent_machine_states: Map<string, 'unclaimed' | 'analyzing' | 'claimed' | 'done' | 'cancelled'>;
+  /**
+   * In-memory record of currently-failed targets. Keyed by workerKey.
+   * Written when a target enters `failed`, cleared on retry or terminal.
+   * Reason is null after restart (see Linear comment for full context).
+   */
+  failed_targets: Map<string, FailedTargetInfo>;
   claude_totals: { input_tokens: number; output_tokens: number; total_tokens: number; seconds_running: number };
 }
 

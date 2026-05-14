@@ -15,6 +15,7 @@ export function createInitialState(cfg: ServiceConfig): OrchestratorState {
     detached_archon_runs: new Map(),
     target_machine_states: new Map(),
     parent_machine_states: new Map(),
+    failed_targets: new Map(),
     claude_totals: { input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0 },
   };
 }
