@@ -3,8 +3,9 @@
  */
 
 import chalk from 'chalk';
-import { existsSync, mkdirSync, writeFileSync } from 'node:fs';
+import { cpSync, existsSync, mkdirSync, writeFileSync } from 'node:fs';
 import { dirname, isAbsolute, join, resolve as resolvePath } from 'node:path';
+import { stubEnvFile } from '../util/env-file.ts';
 import * as YAML from 'yaml';
 import { isInside, expandPath } from '../util/paths.ts';
 import { runRepoAdd } from './repo-add.ts';
@@ -225,6 +226,16 @@ export async function runInit(opts: { cwd?: string }): Promise<void> {
   writeFileSync(workflowPath, `${banner}\n---\n${fmStr}---\n\n${body}`);
   success(`Created ${workflowPath}`);
 
+  // Create <base_folder>/.env with commented stubs so `gaggle setup` has a
+  // known file to merge into — and so operators can hand-edit if preferred.
+  const envPath = join(baseFolderResolved, '.env');
+  // ANTHROPIC_API_KEY is omitted — inherited from Claude Code's credential store.
+  stubEnvFile(envPath, [
+    { key: 'LINEAR_API_KEY', comment: 'Linear → Settings → API → Personal API keys' },
+    { key: 'GH_TOKEN', comment: 'github.com → Settings → Developer settings → Personal access tokens (repo scope)' },
+  ]);
+  info(`Created ${envPath} — run 'gaggle setup' to fill in your API keys`);
+
   // Prompt for repos and call repo add for each.
   while (true) {
     const url = await readLine('Add a repository? Enter URL or press Enter to finish', '');
@@ -239,21 +250,38 @@ export async function runInit(opts: { cwd?: string }): Promise<void> {
   // Ensure workflow_templates directory exists with examples.
   await ensureDefaultTemplates(join(cwd, 'workflow_templates'));
 
+  // Copy the gaggle Claude Code skill so agents in this project understand
+  // how to interact with the orchestrator (run workflows, signal blockers, etc.)
+  copyGaggleSkill(cwd);
+
   console.log('');
   info('Next steps:');
   if (oauthBlock) {
-    console.log('  1. export LINEAR_OAUTH_CLIENT_SECRET=...   # from the Linear OAuth app');
-    console.log('  2. export ANTHROPIC_API_KEY=...');
-    console.log('  3. gaggle auth linear   # browser pops up; authorize the app');
-    console.log('  4. gaggle sync          # clone repos and parse gaggle.md files');
-    console.log('  5. gaggle start         # start the orchestrator');
+    console.log(`  1. gaggle setup             # fill in API keys in ${envPath}`);
+    console.log('  2. export LINEAR_OAUTH_CLIENT_SECRET=...   # from the Linear OAuth app');
+    console.log('  3. gaggle auth linear       # browser pops up; authorize the app');
+    console.log('  4. gaggle sync              # clone repos and parse gaggle.md files');
+    console.log('  5. gaggle start             # start the orchestrator');
   } else {
-    console.log('  1. gaggle setup     # configure LINEAR_API_KEY and ANTHROPIC_API_KEY');
+    console.log(`  1. gaggle setup     # fill in API keys in ${envPath}`);
     console.log('  2. gaggle sync      # clone repos and parse gaggle.md files');
     console.log('  3. gaggle start     # start the orchestrator');
   }
+  console.log('');
+  console.log(chalk.dim('  Then open Claude Code in this directory and say: "Start the orchestrator"'));
 
   closeRl();
+}
+
+function copyGaggleSkill(cwd: string): void {
+  // Source lives two levels up from src/cli/ in the GaggleDispatch repo.
+  const src = join(import.meta.dir, '..', '..', '.claude', 'skills', 'gaggle');
+  const dest = join(cwd, '.claude', 'skills', 'gaggle');
+  if (!existsSync(src)) return; // gracefully skip in compiled/stripped builds
+  if (existsSync(dest)) return; // never overwrite an existing customised copy
+  mkdirSync(join(cwd, '.claude', 'skills'), { recursive: true });
+  cpSync(src, dest, { recursive: true });
+  info(`Copied gaggle skill to ${dest}`);
 }
 
 async function ensureDefaultTemplates(dir: string): Promise<void> {
