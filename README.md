@@ -211,16 +211,84 @@ On any restart, GaggleDispatch reads tracker labels to reconstruct full in-fligh
 local state file, no manual recovery. A crash between label-write and process-launch is safe:
 the orphaned label is detected and the work is re-queued on the next tick.
 
-## Requirements
+## Getting Started
 
-- **Bun** ≥ 1.1.0 ([install](https://bun.sh))
-- **git** in PATH
-- **gh** ([GitHub CLI](https://cli.github.com/)) authenticated (`gh auth login` or `GH_TOKEN`)
-- **Archon CLI** (`archon`) in PATH
-- **Linear API key** (Settings → API → Personal API keys)
-- **Anthropic API key** (console.anthropic.com)
+> **New to GaggleDispatch?** Use the guided setup — it walks through every step interactively.
+>
+> **Already have Claude Code and just want the CLI commands?** Jump to the [Manual setup](#manual-setup) section.
 
-## Install
+### Guided setup (recommended)
+
+Clone the repo and let the setup wizard handle the rest:
+
+```bash
+git clone https://github.com/<you>/GaggleDispatch.git
+cd GaggleDispatch
+bun install
+claude
+```
+
+Then say: **"Set up GaggleDispatch"**
+
+The wizard walks through: CLI installation, API key configuration, `WORKFLOW.md` initialization, registering repositories, syncing repos, and scaffolding missing `gaggle.md` files.
+
+<details>
+<summary><b>Prerequisites</b> — Bun, git, GitHub CLI, and Archon</summary>
+
+**Bun** — [bun.sh](https://bun.sh)
+
+```bash
+# macOS/Linux
+curl -fsSL https://bun.sh/install | bash
+
+# Windows (PowerShell)
+irm bun.sh/install.ps1 | iex
+```
+
+**GitHub CLI** — [cli.github.com](https://cli.github.com/)
+
+```bash
+# macOS
+brew install gh
+
+# Windows
+winget install GitHub.cli
+
+# Linux (Debian/Ubuntu)
+sudo apt install gh
+```
+
+Then authenticate: `gh auth login`
+
+**Claude Code** — [claude.ai/code](https://claude.ai/code)
+
+```bash
+# macOS/Linux
+curl -fsSL https://claude.ai/install.sh | bash
+
+# Windows (PowerShell)
+irm https://claude.ai/install.ps1 | iex
+```
+
+**Archon CLI** — [archon.diy](https://archon.diy)
+
+```bash
+# macOS/Linux
+curl -fsSL https://archon.diy/install | bash
+
+# Windows (PowerShell)
+irm https://archon.diy/install.ps1 | iex
+```
+
+Then verify: `archon version`
+
+**Linear API key** — Linear → Settings → API → Personal API keys
+
+**Claude Code** — [claude.ai/code](https://claude.ai/code), authenticated via `claude /login`. GaggleDispatch inherits the Anthropic API key from Claude Code's credential store — no separate key needed.
+
+</details>
+
+### Manual setup
 
 ```bash
 git clone https://github.com/<you>/GaggleDispatch.git
@@ -231,14 +299,12 @@ bun link  # makes `gaggle` (and alias `symphony`) available globally
 
 Or run any command directly with `bun run src/cli/index.ts <subcommand>`.
 
-## Quick start
-
 ```bash
-# 1. One-time API key setup (masked input, never logged).
-gaggle setup
-
-# 2. Bootstrap a new project — creates WORKFLOW.md and workflow_templates/.
+# 1. Bootstrap a new project — creates WORKFLOW.md, workflow_templates/, and <base_folder>/.env.
 gaggle init
+
+# 2. Fill in API keys (masked input, stored in <base_folder>/.env, never logged).
+gaggle setup
 
 # 3. Register repositories (the only sanctioned way to mutate WORKFLOW.md).
 gaggle repo add https://github.com/myorg/patient-ingestion-service
@@ -282,9 +348,24 @@ The CLI is the **only** sanctioned way to mutate `WORKFLOW.md`'s `repositories` 
 
 GaggleDispatch supports two ways of authenticating against the Linear API.
 
+### API keys and the .env file
+
+`gaggle init` creates `<base_folder>/.env` with commented stubs for every required key.
+`gaggle setup` fills them in interactively (masked input, validated). The file is loaded
+automatically at startup — no shell restarts or `export` commands needed.
+
+```
+<base_folder>/.env          ← written by `gaggle setup`, loaded by every `gaggle` command
+<base_folder>/repos/        ← local repo checkouts
+<base_folder>/registry.synced.yaml
+```
+
+Process environment variables always take precedence over `.env` values, so CI/CD secrets
+and shell exports work without any configuration changes.
+
 ### API key (default, simplest)
 
-Set `LINEAR_API_KEY` in your environment with a personal API key from Linear → Settings → API → Personal API keys. All API calls (comments, label changes, state transitions) are attributed to that user.
+Set `LINEAR_API_KEY` via `gaggle setup` (stored in `<base_folder>/.env`) or export it in your shell. All API calls (comments, label changes, state transitions) are attributed to that user.
 
 ```yaml
 tracker:
