@@ -12,6 +12,7 @@ export function buildIssueMessage(args: {
   repo_target: RepoTarget;
   analysis: IssueAnalysis;
   attempt: number | null;
+  sub_issue_url?: string | null;
 }): string {
   const { issue, repo_target, attempt } = args;
 
@@ -23,7 +24,7 @@ export function buildIssueMessage(args: {
 
   return (
     `Issue: ${issue.identifier} — ${issue.title}\n` +
-    `URL: ${issue.url ?? ''}\n` +
+    `URL: ${args.sub_issue_url ?? issue.url ?? ''}\n` +
     `Repo: ${repo_target.repo_alias}\n` +
     `Components: ${components}\n` +
     `Analysis: ${analysis.analysis_summary}\n` +
@@ -38,6 +39,7 @@ export function buildGaggleEnv(args: {
   repo_target: RepoTarget;
   analysis: IssueAnalysis;
   attempt: number | null;
+  sub_issue_url?: string | null;
 }): Record<string, string> {
   const { issue, repo_target, analysis, attempt } = args;
   return {
