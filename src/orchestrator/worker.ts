@@ -37,6 +37,7 @@ export interface WorkerStartArgs {
   analysis: IssueAnalysis;
   attempt: number | null;
   source_branch: string;
+  sub_issue_url?: string | null;
   /** When set, used as the Archon message instead of building one from issue+target. */
   message_override?: string;
 }
@@ -66,8 +67,8 @@ export async function spawnWorker(args: WorkerStartArgs, cb: WorkerCallbacks): P
     return { cancel: () => {}, done: Promise.resolve() };
   }
 
-  const message = args.message_override ?? buildIssueMessage({ issue, repo_target, analysis, attempt });
-  const env = buildGaggleEnv({ issue, repo_target, analysis, attempt });
+  const message = args.message_override ?? buildIssueMessage({ issue, repo_target, analysis, attempt, sub_issue_url: args.sub_issue_url ?? null });
+  const env = buildGaggleEnv({ issue, repo_target, analysis, attempt, sub_issue_url: args.sub_issue_url ?? null });
 
   log.info('Launching Archon workflow', {
     archon_workflow: repo_target.archon_workflow,

@@ -407,6 +407,7 @@ export interface OrchestratorState {
   retry_attempts: Map<string, RetryEntry>;
   analysis_cache: Map<string, CachedAnalysis>;
   sibling_subissues: Map<string, Map<string, string>>;
+  sibling_subissue_urls: Map<string, Map<string, string>>;
   subissue_snapshot: Map<string, { state: string; labels: string[]; refreshed_at: number }>;
   /**
    * Sub-issues whose Archon process was found still alive at startup recovery.

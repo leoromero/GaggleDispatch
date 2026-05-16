@@ -518,6 +518,9 @@ export class Orchestrator {
     this.state.running.set(key, placeholder);
 
     const branch = this.cfg.repositories.find((r) => r.url === target.repo_url)?.default_branch ?? 'main';
+    const subIssueUrl = subIssueId
+      ? (this.state.sibling_subissue_urls.get(parentIssue.id)?.get(target.repo_alias) ?? null)
+      : null;
     const workerArgs: WorkerStartArgs = {
       cfg: this.cfg,
       workspace: this.workspace,
@@ -529,6 +532,7 @@ export class Orchestrator {
         ?? { issue_id: parentIssue.id, analysis_summary: '', repo_targets: [target] },
       attempt,
       source_branch: branch,
+      sub_issue_url: subIssueUrl,
       message_override: messageOverride,
     };
 
@@ -896,11 +900,15 @@ export class Orchestrator {
       });
 
       let map = this.state.sibling_subissues.get(issue.id);
-      if (!map) {
-        map = new Map();
-        this.state.sibling_subissues.set(issue.id, map);
-      }
+      if (!map) { map = new Map(); this.state.sibling_subissues.set(issue.id, map); }
       map.set(target.repo_alias, sub.id);
+
+      if (sub.url) {
+        let urlMap = this.state.sibling_subissue_urls.get(issue.id);
+        if (!urlMap) { urlMap = new Map(); this.state.sibling_subissue_urls.set(issue.id, urlMap); }
+        urlMap.set(target.repo_alias, sub.url);
+      }
+
       logger.info('Created sub-issue', { issue_id: issue.id, repo_alias: target.repo_alias, sub_issue_id: sub.id });
       return sub.id;
     } catch (err) {
@@ -1018,30 +1026,11 @@ export class Orchestrator {
     const key = workerKey(issue.id, target.repo_alias);
     const targetId = subIssueId ?? issue.id;
 
-    // 1. Fetch the plan from the Archon artifacts directory (file system read,
-    //    not modeled by the SM). Falls back to the gate_message on any failure.
-    let planContent: string | null = null;
-    try {
-      const runDetail = await this.archon.getRunDetail(run_id);
-      const workingPath = runDetail?.run?.working_path;
-      if (workingPath) {
-        const parts = workingPath.replace(/\\/g, '/').split('/');
-        const wtIdx = parts.indexOf('worktrees');
-        if (wtIdx !== -1) {
-          const workspaceBase = parts.slice(0, wtIdx).join(sep);
-          const planPath = join(workspaceBase, 'artifacts', 'runs', run_id, 'investigation.md');
-          if (existsSync(planPath)) {
-            planContent = await Bun.file(planPath).text();
-          }
-        }
-      }
-    } catch {
-      // Non-fatal — fall back to gate_message below
-    }
-
-    const commentBody = planContent
-      ? `🤖 **GaggleDispatch — plan gate**\n\n${planContent}\n\n---\n\n_Reply with **approve** (optionally with notes) to start implementation, or **reject: \\<feedback\\>** to request a revised plan._`
-      : `🤖 **GaggleDispatch — supervised gate**\n\n${gate_message}\n\n_Reply with **approve** or **reject**, optionally followed by your message._`;
+    // gate_message comes from Archon's metadata.approval.message via the poller, with
+    // $nodeId.output references already resolved by Archon before storing. For the
+    // supervised workflow, $post-summary.output is embedded in the plan-gate message,
+    // so gate_message already contains the full architectural summary.
+    const commentBody = `🤖 **GaggleDispatch — plan gate**\n\n${gate_message}`;
 
     // 2. Post the comment. The SM emits post_comment effects in some
     //    transitions, but here we need the comment id back to store on the gate

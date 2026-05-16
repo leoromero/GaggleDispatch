@@ -5,8 +5,9 @@
  * front matter map produced by the workflow loader. Produces a typed `ServiceConfig`.
  */
 
-import { dirname, isAbsolute, resolve } from 'node:path';
+import { dirname, isAbsolute, join, resolve } from 'node:path';
 import { ConfigValidationError } from '../domain/errors.ts';
+import { applyEnvFile } from '../util/env-file.ts';
 import type {
   ArchonConfig,
   AgentConfig,
@@ -137,6 +138,18 @@ function parseAuthConfig(raw: unknown): AuthConfig {
 export function buildServiceConfig(def: WorkflowDefinition): ServiceConfig {
   const root = def.config;
   const projectDir = dirname(def.source_path);
+
+  // Load <base_folder>/.env before any $VAR resolution so secrets written by
+  // `gaggle setup` are visible to resolveSecretOrLiteral() below.
+  // Process environment always wins (applyEnvFile skips keys already present).
+  const baseFolderEarly = asString(
+    asObject(root.registry, 'registry').base_folder,
+    'registry.base_folder',
+    '',
+  );
+  if (baseFolderEarly) {
+    applyEnvFile(join(expandPath(baseFolderEarly, projectDir), '.env'));
+  }
 
   // ── tracker ──────────────────────────────────────────────────────────────
   const trackerRaw = asObject(root.tracker, 'tracker');

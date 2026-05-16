@@ -1,12 +1,20 @@
 /**
  * `gaggle setup` — interactive API key wizard (Section 20).
+ *
+ * Keys are stored in <base_folder>/.env (next to the synced registry and repo
+ * clones). This file is scoped to one gaggle deployment, loaded automatically
+ * at startup by buildServiceConfig, and never touched by the project repo's
+ * own .env. Process environment variables always take precedence.
  */
 
 import chalk from 'chalk';
-import { appendFileSync, chmodSync, existsSync } from 'node:fs';
-import { homedir } from 'node:os';
-import { join } from 'node:path';
-import { run } from '../util/subprocess.ts';
+import { existsSync } from 'node:fs';
+import { join, resolve as resolvePath } from 'node:path';
+import * as YAML from 'yaml';
+import { readFileSync } from 'node:fs';
+import { mergeEnvFile, parseEnvFile } from '../util/env-file.ts';
+import { expandPath } from '../util/paths.ts';
+import { splitFrontMatter } from '../config/loader.ts';
 
 interface KeyDef {
   envVar: string;
@@ -15,6 +23,9 @@ interface KeyDef {
   validate: (key: string) => Promise<{ ok: boolean; detail?: string }>;
 }
 
+// ANTHROPIC_API_KEY is intentionally omitted — Claude Code manages Anthropic
+// auth through its own credential store. GaggleDispatch inherits it from the
+// Claude Code session the same way Archon does.
 const KEYS: KeyDef[] = [
   {
     envVar: 'LINEAR_API_KEY',
@@ -28,7 +39,10 @@ const KEYS: KeyDef[] = [
           body: JSON.stringify({ query: '{ viewer { id name email } }' }),
         });
         if (!res.ok) return { ok: false };
-        const data = (await res.json()) as { data?: { viewer?: { name?: string; email?: string } }; errors?: unknown[] };
+        const data = (await res.json()) as {
+          data?: { viewer?: { name?: string; email?: string } };
+          errors?: unknown[];
+        };
         if (data.errors) return { ok: false };
         const v = data.data?.viewer;
         if (!v) return { ok: false };
@@ -38,43 +52,10 @@ const KEYS: KeyDef[] = [
       }
     },
   },
-  {
-    envVar: 'ANTHROPIC_API_KEY',
-    label: 'Anthropic API key',
-    source: 'console.anthropic.com → API Keys',
-    validate: async (key) => {
-      try {
-        const res = await fetch('https://api.anthropic.com/v1/messages', {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            'x-api-key': key,
-            'anthropic-version': '2023-06-01',
-          },
-          body: JSON.stringify({
-            model: 'claude-sonnet-4-5',
-            max_tokens: 1,
-            messages: [{ role: 'user', content: 'ping' }],
-          }),
-        });
-        if (res.status === 401 || res.status === 403) return { ok: false };
-        if (res.status === 400) {
-          // Model name might be unavailable; key still likely valid.
-          return { ok: true, detail: 'API key accepted (model name not verified)' };
-        }
-        if (!res.ok) return { ok: false };
-        return { ok: true, detail: 'API key accepted (model: claude-sonnet-4-5)' };
-      } catch {
-        return { ok: false };
-      }
-    },
-  },
 ];
 
 async function readPasswordHidden(prompt: string): Promise<string> {
   process.stdout.write(prompt);
-  // Bun.stdin doesn't have a clean tty raw mode helper at the level we need;
-  // use Node's readline with output muted. This works on Win32, macOS, Linux.
   const readline = await import('node:readline');
   const rl = readline.createInterface({
     input: process.stdin,
@@ -87,7 +68,6 @@ async function readPasswordHidden(prompt: string): Promise<string> {
     const orig = rl._writeToOutput?.bind(rl);
     // @ts-ignore
     rl._writeToOutput = (s: string) => {
-      // Echo only newlines/carriage returns; replace others with bullet
       if (s === '\n' || s === '\r\n' || s === '\r') {
         orig?.(s);
       } else {
@@ -108,53 +88,62 @@ async function readLine(prompt: string): Promise<string> {
   return new Promise((resolve) => rl.question('', (a) => { rl.close(); resolve(a); }));
 }
 
-function persistEnvVarUnix(envVar: string, value: string): string {
-  const shell = process.env.SHELL ?? '';
-  let profile = '';
-  if (shell.includes('zsh') && existsSync(join(homedir(), '.zshrc'))) profile = join(homedir(), '.zshrc');
-  else if (shell.includes('bash') && existsSync(join(homedir(), '.bashrc'))) profile = join(homedir(), '.bashrc');
-  else profile = join(homedir(), '.profile');
-
-  const line = `\nexport ${envVar}="${value.replace(/"/g, '\\"')}"\n`;
-  appendFileSync(profile, line, { encoding: 'utf8', mode: 0o600 });
+/** Resolve the base_folder path from WORKFLOW.md without full config validation. */
+function resolveBaseFolder(cwd: string): string | null {
+  const workflowPath = resolvePath(cwd, 'WORKFLOW.md');
+  if (!existsSync(workflowPath)) return null;
   try {
-    chmodSync(profile, 0o600);
+    const { config } = splitFrontMatter(readFileSync(workflowPath, 'utf8'));
+    const reg = config.registry;
+    if (!reg || typeof reg !== 'object' || Array.isArray(reg)) return null;
+    const raw = (reg as Record<string, unknown>).base_folder;
+    if (typeof raw !== 'string' || !raw) return null;
+    return expandPath(raw, cwd);
   } catch {
-    /* ignore */
-  }
-  return profile;
-}
-
-async function persistEnvVarWindows(envVar: string, value: string): Promise<void> {
-  // Use PowerShell to set HKCU\Environment user-scoped variable WITHOUT echoing it.
-  const escaped = value.replace(/'/g, "''");
-  const ps = `[Environment]::SetEnvironmentVariable('${envVar}', '${escaped}', 'User') | Out-Null`;
-  const r = await run(['powershell', '-NoProfile', '-NonInteractive', '-Command', ps]);
-  if (r.exitCode !== 0) {
-    throw new Error(`Failed to persist ${envVar}: ${r.stderr.slice(0, 300)}`);
+    return null;
   }
 }
 
-export async function runSetup(opts: { reset?: boolean } = {}): Promise<void> {
+export async function runSetup(opts: { reset?: boolean; cwd?: string } = {}): Promise<void> {
+  const cwd = opts.cwd ? resolvePath(opts.cwd) : process.cwd();
+  const baseFolder = resolveBaseFolder(cwd);
+  const envPath = baseFolder ? join(baseFolder, '.env') : null;
+
   console.log(chalk.bold('\nGaggleDispatch Setup — API Key Configuration'));
-  console.log('Keys are stored as user environment variables. They are never logged or displayed.\n');
+  if (envPath) {
+    console.log(chalk.gray(`Keys will be stored in: ${envPath}`));
+  } else {
+    console.log(chalk.yellow(
+      'WORKFLOW.md not found in current directory.\n' +
+      'Run `gaggle init` first to create it, then re-run `gaggle setup`.\n' +
+      'Keys entered now will only apply to this session.',
+    ));
+  }
+  console.log(chalk.gray('Keys are never logged or displayed. Process environment takes precedence.\n'));
+
+  // Load existing .env so we can show "already set" prompts.
+  const existingEnv: Record<string, string> = envPath && existsSync(envPath)
+    ? parseEnvFile(readFileSync(envPath, 'utf8'))
+    : {};
+
+  const collected: Record<string, string> = {};
 
   for (let i = 0; i < KEYS.length; i++) {
     const k = KEYS[i]!;
     console.log(chalk.cyan(`[${i + 1}/${KEYS.length}] ${k.label}`));
     console.log(chalk.gray(`  Source: ${k.source}`));
 
-    const existing = process.env[k.envVar];
-    if (existing && !opts.reset) {
-      const ans = await readLine(`  ${k.envVar} is already set. Overwrite? [y/N]: `);
+    const alreadySet = k.envVar in existingEnv && existingEnv[k.envVar] !== '';
+    if (alreadySet && !opts.reset) {
+      const ans = await readLine(`  ${k.envVar} is already set in .env. Overwrite? [y/N]: `);
       if (!/^y(es)?$/i.test(ans.trim())) {
         console.log(chalk.gray('  Skipping (kept existing value).\n'));
         continue;
       }
     }
 
-    let success = false;
-    for (let attempt = 0; attempt < 3 && !success; attempt++) {
+    let saved = false;
+    for (let attempt = 0; attempt < 3 && !saved; attempt++) {
       const key = (await readPasswordHidden('  Enter key (input hidden): ')).trim();
       if (!key) {
         console.log(chalk.yellow('  Empty input; aborted.'));
@@ -167,27 +156,28 @@ export async function runSetup(opts: { reset?: boolean } = {}): Promise<void> {
         continue;
       }
       console.log(chalk.green(`✓  ${result.detail ?? 'OK'}`));
-      try {
-        if (process.platform === 'win32') {
-          await persistEnvVarWindows(k.envVar, key);
-          console.log(chalk.gray(`  Saved to user environment via [Environment]::SetEnvironmentVariable.`));
-        } else {
-          const profile = persistEnvVarUnix(k.envVar, key);
-          console.log(chalk.gray(`  Appended to ${profile} (chmod 600).`));
-        }
-        process.env[k.envVar] = key;
-        success = true;
-      } catch (err) {
-        console.log(chalk.red(`  ✗ Persist failed: ${(err as Error).message}`));
-      }
+      collected[k.envVar] = key;
+      process.env[k.envVar] = key;
+      saved = true;
     }
-    if (!success) {
+    if (!saved && !(k.envVar in collected)) {
       console.log(chalk.yellow(`  Skipping ${k.envVar} — you can re-run 'gaggle setup' later.\n`));
     } else {
       console.log('');
     }
   }
 
-  console.log(chalk.bold('Setup complete.'));
-  console.log('Restart your terminal (or current shell) for the variables to take effect, then run:\n  gaggle init   (if WORKFLOW.md does not yet exist)\n  gaggle sync\n  gaggle start\n');
+  if (Object.keys(collected).length > 0) {
+    if (envPath) {
+      mergeEnvFile(envPath, collected);
+      console.log(chalk.bold('Setup complete.'));
+      console.log(chalk.gray(`Keys saved to ${envPath} (mode 600).`));
+      console.log('They are loaded automatically the next time any gaggle command runs.\n');
+    } else {
+      console.log(chalk.bold('Setup complete (session only).'));
+      console.log(chalk.yellow('Keys were NOT persisted — run `gaggle init` then `gaggle setup` again to save them.\n'));
+    }
+  } else {
+    console.log(chalk.bold('No changes made.'));
+  }
 }

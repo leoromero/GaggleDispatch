@@ -181,15 +181,19 @@ nodes:
     # (TS build + unit tests + E2E commonly exceed it). Tune per repo.
     timeout: 1800000
     bash: |
-      set -euo pipefail
       mkdir -p "\$ARTIFACTS_DIR"
       if [ -f ".gaggle/validate.sh" ]; then
         echo "[validate] running .gaggle/validate.sh"
         bash .gaggle/validate.sh 2>&1 | tee "\$ARTIFACTS_DIR/validation.txt"
-        echo "SCRIPT_OK" > "\$ARTIFACTS_DIR/.validate-mode"
+        if [ \${PIPESTATUS[0]} -eq 0 ]; then
+          echo "SCRIPT_OK" > "\$ARTIFACTS_DIR/.validate-mode"
+        else
+          echo "SCRIPT_FAILED" > "\$ARTIFACTS_DIR/.validate-mode"
+        fi
       else
         echo "FALLBACK" > "\$ARTIFACTS_DIR/.validate-mode"
       fi
+      exit 0
     depends_on: [check-blocker]
     when: "$check-blocker.output == 'CONTINUE'"
 
@@ -206,7 +210,12 @@ nodes:
 
       If the mode is SCRIPT_OK:
       - Read \`\$ARTIFACTS_DIR/validation.txt\` — these are the real test results.
+      - If there are no failures, write a summary to \`\$ARTIFACTS_DIR/validation.md\` and proceed.
       - If any failures are shown, fix them and re-run \`bash .gaggle/validate.sh\`, repeating until green.
+
+      If the mode is SCRIPT_FAILED:
+      - Read \`\$ARTIFACTS_DIR/validation.txt\` — these are the failed test/lint/type-check results.
+      - Diagnose and fix every failure, then re-run \`bash .gaggle/validate.sh\` until it exits 0.
       - Write a summary to \`\$ARTIFACTS_DIR/validation.md\`.
 
       If the mode is FALLBACK (no .gaggle/validate.sh found):
@@ -222,8 +231,9 @@ nodes:
       - Test results (pass/fail counts)
       - Type check / lint status
       - Build status
-      - Verification notes Only mark validation complete when
-      everything passes.
+      - Verification notes
+
+      Only mark validation complete when everything passes.
 
   # ═══════════════════════════════════════════════════════════════
   # PHASE 5: CREATE DRAFT PR
@@ -704,7 +714,8 @@ nodes:
     bash: |
       set -euo pipefail
       if [ ! -f "\$ARTIFACTS_DIR/plan-summary.md" ]; then
-        echo "WARNING: plan-summary.md not found, skipping Linear post" >&2
+        echo "WARNING: plan-summary.md not found" >&2
+        echo "(no architectural summary available)"
         exit 0
       fi
       BODY=$(cat "\$ARTIFACTS_DIR/plan-summary.md")
@@ -715,6 +726,7 @@ nodes:
         --data "{\\"query\\": \\"mutation { commentCreate(input: { issueId: \\\\\\"\\$GAGGLE_ISSUE_ID\\\\\\", body: \\$ESCAPED }) { success comment { id } } }\\"}" \\
         -o "\$ARTIFACTS_DIR/post-summary-result.txt" \\
         || echo "WARNING: failed to post summary to Linear" >&2
+      cat "\$ARTIFACTS_DIR/plan-summary.md"
     depends_on: [summarize]
 
   # ═══════════════════════════════════════════════════════════════
@@ -730,7 +742,7 @@ nodes:
       message: |
         ## Architectural Summary
 
-        $(cat "\$ARTIFACTS_DIR/plan-summary.md")
+        $post-summary.output
 
         ---
 
@@ -805,15 +817,19 @@ nodes:
     # (TS build + unit tests + E2E commonly exceed it). Tune per repo.
     timeout: 1800000
     bash: |
-      set -euo pipefail
       mkdir -p "\$ARTIFACTS_DIR"
       if [ -f ".gaggle/validate.sh" ]; then
         echo "[validate] running .gaggle/validate.sh"
         bash .gaggle/validate.sh 2>&1 | tee "\$ARTIFACTS_DIR/validation.txt"
-        echo "SCRIPT_OK" > "\$ARTIFACTS_DIR/.validate-mode"
+        if [ \${PIPESTATUS[0]} -eq 0 ]; then
+          echo "SCRIPT_OK" > "\$ARTIFACTS_DIR/.validate-mode"
+        else
+          echo "SCRIPT_FAILED" > "\$ARTIFACTS_DIR/.validate-mode"
+        fi
       else
         echo "FALLBACK" > "\$ARTIFACTS_DIR/.validate-mode"
       fi
+      exit 0
     depends_on: [implement]
 
   - id: validate
@@ -829,7 +845,12 @@ nodes:
 
       If the mode is SCRIPT_OK:
       - Read \`\$ARTIFACTS_DIR/validation.txt\` — these are the real test results.
+      - If there are no failures, write a summary to \`\$ARTIFACTS_DIR/validation.md\` and proceed.
       - If any failures are shown, fix them and re-run \`bash .gaggle/validate.sh\`, repeating until green.
+
+      If the mode is SCRIPT_FAILED:
+      - Read \`\$ARTIFACTS_DIR/validation.txt\` — these are the failed test/lint/type-check results.
+      - Diagnose and fix every failure, then re-run \`bash .gaggle/validate.sh\` until it exits 0.
       - Write a summary to \`\$ARTIFACTS_DIR/validation.md\`.
 
       If the mode is FALLBACK (no .gaggle/validate.sh found):
@@ -846,6 +867,8 @@ nodes:
       - Type check / lint status
       - Build status
       - Verification notes
+
+      Only mark validation complete when everything passes.
 
   # ═══════════════════════════════════════════════════════════════
   # PHASE 6: CREATE DRAFT PR
