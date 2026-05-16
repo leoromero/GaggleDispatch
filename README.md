@@ -294,7 +294,7 @@ Then verify: `archon version`
 git clone https://github.com/<you>/GaggleDispatch.git
 cd GaggleDispatch
 bun install
-bun link  # makes `gaggle` (and alias `symphony`) available globally
+bun link  # makes `gaggle` available globally
 ```
 
 Or run any command directly with `bun run src/cli/index.ts <subcommand>`.
