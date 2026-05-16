@@ -232,16 +232,16 @@ export class LinearClient {
     description?: string;
     assignee_id: string | null;
     state_name: string;
-  }): Promise<{ id: string; identifier: string }> {
+  }): Promise<{ id: string; identifier: string; url: string | null }> {
     const team = await this.resolveTeam();
     const stateId = await this.resolveStateId(team.id, args.state_name);
     const data = await this.query<{
-      issueCreate: { success: boolean; issue: { id: string; identifier: string } | null };
+      issueCreate: { success: boolean; issue: { id: string; identifier: string; url: string | null } | null };
     }>(
       `mutation($input: IssueCreateInput!) {
         issueCreate(input: $input) {
           success
-          issue { id identifier }
+          issue { id identifier url }
         }
       }`,
       {
