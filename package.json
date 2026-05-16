@@ -5,8 +5,7 @@
   "type": "module",
   "license": "MIT",
   "bin": {
-    "gaggle": "./src/cli/index.ts",
-    "symphony": "./src/cli/index.ts"
+    "gaggle": "./src/cli/index.ts"
   },
   "scripts": {
     "start": "bun run src/cli/index.ts start",

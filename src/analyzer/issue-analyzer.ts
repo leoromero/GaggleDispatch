@@ -338,7 +338,7 @@ If it is NOT listed, use the repo's \`default_workflow\` instead and note it in 
 Rules:
 - repo_alias must match the \`name\` field in that repo's gaggle.md front matter exactly.
 - components must be names from that repo's gaggle.md \`components\` list.
-- For depends_on + ready_when: use "merged" when this repo's changes depend on another repo's PR being merged first. Omit depends_on when repos can be worked on in parallel.
+- For depends_on + ready_when: use "merged" when this repo's changes depend on another repo's PR being merged first (e.g. shared types, config). Use "deployed:dev" when this repo's agent needs to call the upstream repo's live API endpoints — i.e. the upstream service must actually be running, not just merged (e.g. a frontend consuming a new backend API). Omit depends_on when repos can be worked on in parallel.
 - Output JSON only.`;
 }
 
