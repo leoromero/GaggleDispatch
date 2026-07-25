@@ -11,3 +11,6 @@ Thumbs.db
 .vscode/
 bun.lockb
 *.tsbuildinfo
+
+# Executor database (docker compose up -d)
+.env

@@ -16,6 +16,7 @@ import { runSync } from './sync.ts';
 import { runStatus, runPs } from './status.ts';
 import { runStart } from './start.ts';
 import { runTemplatesUpdate } from './templates-update.ts';
+import { runDbMigrate, runDoctor } from './doctor.ts';
 import {
   runNestAdd,
   runNestInit,
@@ -48,6 +49,24 @@ program
   .description('Bootstrap a new GaggleDispatch deployment (creates WORKFLOW.md)')
   .action(async () => {
     await runInit({ cwd: program.opts().cwd });
+  });
+
+// ── doctor ─────────────────────────────────────────────────────────────
+program
+  .command('doctor')
+  .description('Check that this host can run workflows (bash, git, gh, database)')
+  .option('--json', 'machine-readable output')
+  .action(async (opts: { json?: boolean }) => {
+    await runDoctor({ cwd: program.opts().cwd, json: opts.json });
+  });
+
+// ── db ────────────────────────────────────────────────────────────────
+const db = program.command('db').description('Manage the executor database');
+
+db.command('migrate')
+  .description('Apply pending schema migrations')
+  .action(async () => {
+    await runDbMigrate({ cwd: program.opts().cwd });
   });
 
 // ── repo subcommands ────────────────────────────────────────────────────────
