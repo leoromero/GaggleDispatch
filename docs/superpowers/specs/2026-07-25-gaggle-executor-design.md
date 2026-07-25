@@ -1,7 +1,7 @@
 # Gaggle Executor — replacing Archon with an in-house workflow engine
 
 Date: 2026-07-25
-Status: Approved — direction settled, see §12
+Status: Implemented. See §13 for where the build diverged from this design.
 
 **Settled decisions:** in-process engine · PostgreSQL only (no SQLite) · keep Archon's
 YAML syntax · bundled command files with per-repo override · `bash:` nodes require
@@ -17,7 +17,7 @@ engine that:
   script, a loop, or a human approval gate;
 - lets each node **select its context** — which upstream outputs, which prior
   conversation, which artifacts — explicitly;
-- persists everything to **SQLite or PostgreSQL** so runs are **resumable** across
+- persists everything to **PostgreSQL** so runs are **resumable** across
   gate pauses, crashes, and restarts;
 - keeps GaggleDispatch's orchestrator, state machine, and Linear integration
   essentially unchanged.
@@ -105,7 +105,7 @@ of 18. `gaggle doctor` should check for it alongside `git` and `gh`.
 │  │             approval · cancel                            │    │
 │  │  providers/ claude (Agent SDK)                          │    │
 │  │  isolation/ git worktree create/list/cleanup            │    │
-│  │  store/     sqlite.ts · postgres.ts (one interface)     │    │
+│  │  store/     postgres.ts (+ memory.ts, a test double)    │    │
 │  └─────────────────────────────────────────────────────────┘    │
 │  hub/server.ts ── /api/workflows/runs* (read) + dashboard       │
 └─────────────────────────────────────────────────────────────────┘
@@ -230,10 +230,21 @@ the dashboard can show what each node was given.
 ### 7.1 Store
 
 **PostgreSQL only.** No SQLite driver, no dual-dialect abstraction. That buys real
-`JSONB`, `TIMESTAMPTZ`, transactional multi-row state transitions, `SELECT … FOR
-UPDATE SKIP LOCKED` for run leasing, and `LISTEN/NOTIFY` if we later want push
-instead of poll for the dashboard. A single `Store` class over `postgres` (or `pg`),
-plain SQL, a numbered `migrations/NNN_*.sql` runner, no ORM.
+`JSONB`, `TIMESTAMPTZ`, transactional multi-row state transitions, conditional
+leasing, and `LISTEN/NOTIFY` if we later want push instead of poll for the
+dashboard.
+
+Built on **Bun's native SQL driver**, which costs no dependency and gives
+parameterization from tagged templates. Migrations are versioned SQL strings in
+`store/migrations.ts` rather than `.sql` files on disk, so
+`bun build --target=bun` still produces a self-contained binary — a compiled CLI
+that must locate a migrations directory at runtime is a deployment footgun.
+Ordering and one-time application are unchanged.
+
+A `MemoryStore` implements the same `Store` interface as a test double. It is
+not a second backend: it exists so engine semantics can be tested without a
+database, and a shared conformance suite runs against both so drift surfaces as
+a test failure.
 
 Trade-off accepted: Postgres becomes a hard runtime prerequisite for `gaggle start`.
 Mitigate with a `docker-compose.yml` in the repo, a `DATABASE_URL` check in
@@ -246,19 +257,19 @@ and why.
 
 ### 7.2 Schema
 
-```sql
-CREATE TYPE run_status  AS ENUM ('pending','running','paused','completed',
-                                 'failed','cancelled','interrupted');
-CREATE TYPE node_status AS ENUM ('pending','running','completed','failed',
-                                 'skipped','cancelled','interrupted');
+Statuses are TEXT with a CHECK constraint rather than Postgres ENUMs:
+`ALTER TYPE ... ADD VALUE` cannot run inside a transaction on older servers,
+which would make adding a status a migration hazard for no real benefit.
 
+```sql
 CREATE TABLE workflow_runs (
   id                UUID PRIMARY KEY,
   workflow_name     TEXT NOT NULL,
   workflow_source   TEXT NOT NULL,        -- path the YAML was loaded from
   workflow_hash     TEXT NOT NULL,        -- sha256 of normalized YAML; guards resume
   user_message      TEXT NOT NULL,
-  status            run_status NOT NULL,
+  status            TEXT NOT NULL CHECK (status IN
+                      ('pending','running','paused','completed','failed','cancelled','interrupted')),
   repo_slug         TEXT,
   working_path      TEXT,                 -- worktree or live checkout
   base_branch       TEXT,
@@ -277,7 +288,8 @@ CREATE TABLE workflow_run_nodes (
   run_id            UUID NOT NULL REFERENCES workflow_runs(id) ON DELETE CASCADE,
   node_id           TEXT NOT NULL,
   node_type         TEXT NOT NULL,
-  status            node_status NOT NULL,
+  status            TEXT NOT NULL CHECK (status IN
+                      ('pending','running','completed','failed','skipped','cancelled','interrupted')),
   attempt           INT NOT NULL DEFAULT 0,
   output            TEXT,                 -- resolves $nodeId.output
   output_json       JSONB,                -- parsed when output_format is set
@@ -552,3 +564,70 @@ mechanical, off the 3 → 4 → 6 critical path, and keeping them out of the exe
 keeps those reviewable. Phase 1.5 must land **before** phase 8 so the deletion commit
 removes the old persistence in one pass and the tree never sits in a four-technology
 interim state.
+
+
+---
+
+## 13. What actually got built
+
+The design held. This records where the implementation diverged, and what the
+tests found along the way — the parts worth knowing before touching this code.
+
+### Divergences
+
+| Design said | Built | Why |
+|---|---|---|
+| `CREATE TYPE ... AS ENUM` for statuses | `TEXT` + `CHECK` | `ALTER TYPE ADD VALUE` cannot run in a transaction on older servers, making a new status a migration hazard |
+| Numbered `migrations/NNN_*.sql` files | Versioned SQL strings in `store/migrations.ts` | `bun build --target=bun` must stay a self-contained binary; locating a migrations directory at runtime is a deployment footgun |
+| `postgres` or `pg` npm driver | Bun's built-in SQL | Zero dependency, parameterization from tagged templates |
+| Port 5433 | 55432 | 5432 and 5433 were both already bound on the development host |
+| Postgres only | Plus a `MemoryStore` test double | Not a second backend — it lets engine semantics be tested with no database. A shared conformance suite runs against both so drift fails a test |
+| Workflow-level `interactive:` honoured | Parsed, no behaviour | Vestigial: it existed because an Archon background worker had no channel to deliver a gate message. Gates here always pause the run and persist the prompt |
+| `self-fix` / `simplify` marked `at_most_once` | Left idempotent | They re-read state and fix what remains; marking them would force a human into every crash for no gain. Only `create-pr`, `report` and `post-summary` are marked |
+
+### Bugs the tests caught
+
+Each of these would have mattered in production, and none was visible by
+reading the code:
+
+1. **`hashWorkflow` excluded every node body.** It used `JSON.stringify(v, keys)`,
+   whose replacer-array form is an allowlist applied at *every* nesting level.
+   The resume guard would have accepted an edited prompt and reused stale
+   cached output.
+2. **A node could ignore its timeout entirely.** `proc.kill()` terminates bash
+   but not its children, so `sleep 30` outlived the kill and held the stdout
+   pipe open — the runner never observed the exit. Fixed with a process-tree
+   kill and by letting exit, not the output pumps, drive completion. The shell
+   suite went from 61s to 2.5s. The same failure mode then reappeared in the
+   crash-recovery test, where a killed child kept renewing its lease.
+3. **Resume was a no-op.** `failed` counted as settled and carried forward, so
+   every resume re-reported the same failure without retrying anything. Only
+   `completed` survives now.
+4. **Bun stored JSONB as a string scalar.** `${JSON.stringify(obj)}::jsonb`
+   produces a jsonb *string*, not an object; passing the object directly is
+   correct. The reader's string-parsing masked it, so the round-trip test
+   passed while the stored data was wrong — only the metadata *merge* test
+   surfaced it.
+5. **Bun rejects array parameters** (`= ANY($1)` → "malformed array literal")
+   and **mangles a cast on a placeholder inside `sql.unsafe()`**, silently
+   yielding `{}`.
+6. **`\$NAME` was still substituted** in shell bodies when escapes were off,
+   turning `"\$HOME"` into `"\<value>"`.
+
+### Verification
+
+835 tests. `store-conformance` runs against MemoryStore always and real
+Postgres when `TEST_DATABASE_URL` is set. `engine.test.ts` drives the public
+`WorkflowExecutor` interface with a stubbed model, covering routing, gates,
+loops, retries, resume and dry-run without an API key. `recovery.test.ts` ends
+by killing a real child process mid-node and driving the run to completion from
+a fresh process against Postgres.
+
+The parity check that phase 7 existed for is in `commands.test.ts`: every
+`command:` node in the shipped templates resolves.
+
+### Not done
+
+**§12.2 phase 1.5** — the analysis cache, scaffold jobs, synced registry and
+hub history are still on their original storage. The boundary and the reasoning
+stand; the migration is independent of the executor and can land separately.
