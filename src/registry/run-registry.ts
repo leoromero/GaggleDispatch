@@ -3,8 +3,8 @@
  *
  * Two parallel maps live in <base_folder>/gaggle-runs.json:
  *
- *   entries  — workerKey → Archon DB run id, written while a worker is live
- *              so the orchestrator can rebind to the right Archon run on
+ *   entries  — workerKey → run id, written while a worker is live
+ *              so the orchestrator can rebind to the right run on
  *              restart instead of guessing by repo basename.
  *
  *   retries  — workerKey → retry meta (attempt count, due-at timestamp,
@@ -70,7 +70,7 @@ function save(baseFolder: string, data: RunsFile): void {
 
 // ─── run entries ───────────────────────────────────────────────────────────
 
-/** Record that a worker started and its Archon DB run id is now known. */
+/** Record that a worker started and its run id is now known. */
 export function writeRunEntry(
   baseFolder: string,
   workerKey: string,

@@ -115,7 +115,7 @@ export type ParentEvent =
  *               exists so a crash here is recoverable.
  *
  * running       Entered: Archon subprocess spawned (or detached run discovered
- *                        at startup). Archon DB run id may not be captured yet.
+ *                        at startup). run id may not be captured yet.
  *               Exited:  worker_succeeded → succeeded; worker_failed → retrying;
  *                        gate_paused → gate_waiting.
  *               Labels:  `gaggle:running`.

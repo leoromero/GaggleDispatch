@@ -491,7 +491,7 @@ export class Orchestrator {
     };
   }
 
-  /** Launch Archon for a (parentIssue, repoTarget, subIssueId) triple. Shared by drainPendingTargets, dispatchSubIssueFromPoll, and promoteQueuedSiblings.
+  /** Launch a workflow run for a (parentIssue, repoTarget, subIssueId) triple. Shared by drainPendingTargets, dispatchSubIssueFromPoll, and promoteQueuedSiblings.
    *  If `analysisOverride` is provided it is passed to the worker — used by
    *  the SM-driven retry path so the cached parent analysis is preserved. */
   private async launchWorker(
@@ -572,7 +572,7 @@ export class Orchestrator {
             sub_issue_id: subIssueId,
             repo_alias: target.repo_alias,
           });
-          log.info('Captured Archon run id', { run_id: db_run_id });
+          log.info('Run created', { run_id: db_run_id });
         },
         onGatePaused: (run_id, gate_message) => { void this.handleGatePaused(parentIssue, target, subIssueId, run_id, gate_message, attempt); },
         onExit: (event) => {
@@ -590,7 +590,7 @@ export class Orchestrator {
     }
   }
 
-  /** Spawn the `archon workflow approve <run_id> <comment>` subprocess that
+  /** Record the approval and resume the run, rebinding the live session so that
    *  stores the comment as the gate's output AND resumes the workflow. The
    *  callbacks thread back into handleWorkerExit / handleGatePaused so the
    *  resumed workflow flows through the same SM transitions as a fresh worker. */
@@ -980,14 +980,14 @@ export class Orchestrator {
 
           case 'poller_stalled':
             // Stall = `last_activity_at` frozen while status === 'running'.
-            // We used to cancel here, but that turned out to be destructive:
-            //   - Killing the local watcher subprocess does NOT stop Archon's
-            //     daemon-side run, so the work continues while we post a
-            //     spurious "worker failed" comment to Linear.
-            //   - Long Claude tool calls (e.g. Opus implementer steps) can
-            //     legitimately exceed any reasonable stall threshold.
-            // Now informational only — keep polling, let Archon's actual
-            // terminal status (failed / cancelled / completed) drive cleanup.
+            // Informational only: a long Claude tool call (an Opus implementer
+            // step, say) can legitimately exceed any threshold worth setting,
+            // and cancelling on suspicion would post a "worker failed" comment
+            // over work that was fine. Keep polling and let the run's real
+            // terminal status drive cleanup.
+            //
+            // Note this is now a genuine kill if we acted on it — the run is
+            // in this process — which is a further reason not to.
             logger.warn('Poller: stall detected (informational; not cancelling)', {
               issue_id: issue.id, repo_alias: target.repo_alias, run_id: runId,
               last_activity_at: event.last_activity_at,
@@ -995,7 +995,7 @@ export class Orchestrator {
             break;
 
           case 'poller_run_not_found':
-            logger.warn('Poller: run not found in Archon API', {
+            logger.warn('Poller: run no longer exists', {
               issue_id: issue.id, repo_alias: target.repo_alias, run_id: runId,
             });
             break;
@@ -1036,8 +1036,8 @@ export class Orchestrator {
     const key = workerKey(issue.id, target.repo_alias);
     const targetId = subIssueId ?? issue.id;
 
-    // gate_message comes from Archon's metadata.approval.message via the poller, with
-    // $nodeId.output references already resolved by Archon before storing. For the
+    // gate_message comes from the run's metadata.approval.message, with
+    // $nodeId.output references already resolved before storing. For the
     // supervised workflow, $post-summary.output is embedded in the plan-gate message,
     // so gate_message already contains the full architectural summary.
     const commentBody = `🤖 **GaggleDispatch — plan gate**\n\n${gate_message}`;
@@ -1439,7 +1439,7 @@ export class Orchestrator {
         // gate_approved → running. SM emits label swap + executor_approve_and_resume
         // effect; the applier looks up the gate's run_id, calls the
         // approveAndResume hook (which spawns the subprocess that approves+
-        // resumes via the Archon CLI), and deletes the supervised_gate entry.
+        // resumes the run), and deletes the supervised_gate entry.
         await this.emitTargetEvent('gate_waiting',
           { kind: 'gate_approved', message: classifiedMessage || null },
           this.buildGateTransitionCtx(gate));
@@ -1471,7 +1471,7 @@ export class Orchestrator {
   /**
    * Worker exit handler. Determines the appropriate target state machine event
    * (worker_succeeded / worker_failed) and drives the transition through
-   * targetTransition + EffectApplier. The supervised-gate special case (Archon
+   * targetTransition + EffectApplier. The supervised-gate special case (the
    * exited 0 but is actually paused) is handled inline before the SM call,
    * because handleGatePaused does plan-fetch + commenting work the SM doesn't
    * yet model.
@@ -1495,12 +1495,13 @@ export class Orchestrator {
     const targetId = subIssueId ?? issue.id;
     const dbRunId = session?.run_id ?? null;
     // Capture before the session is deleted below — used in the failure log
-    // so the operator can see what the Archon CLI was doing right before exit.
+    // so the operator sees the last node output without querying the run.
     const recentOutput = session?.recent_output.slice() ?? [];
 
-    // Pre-SM: detect the gate-pause-disguised-as-success case and defer to the
-    // gate handler. The Archon CLI exits 0 when the workflow pauses at an
-    // approval gate; we must distinguish that from a true completion.
+    // Defence in depth: confirm a reported success really is one before
+    // treating it as terminal. The engine signals a pause with its own event
+    // rather than a zero exit, so this should never fire — but a run that is
+    // actually `paused` must never be recorded as complete.
     if (event.type === 'run_succeeded' && dbRunId) {
       try {
         const runDetail = await this.executorClient.getRunDetail(dbRunId);
@@ -1527,7 +1528,7 @@ export class Orchestrator {
     if (event.type === 'run_succeeded' && dbRunId) {
       smEvent = { kind: 'worker_succeeded' };
     } else if (event.type === 'run_succeeded') {
-      smEvent = { kind: 'worker_failed', reason: 'archon_succeeded_without_run_id' };
+      smEvent = { kind: 'worker_failed', reason: 'run_succeeded_without_run_id' };
     } else {
       smEvent = { kind: 'worker_failed', reason: event.type };
     }
@@ -1562,9 +1563,9 @@ export class Orchestrator {
       });
       await this.promoteQueuedSiblings(issue);
     } else {
-      // Include the tail of Archon CLI output so the failure cause is
+      // Include the tail of node output so the failure cause is
       // visible without leaving the gaggle log (recent_output ring
-      // buffer is fed by every archon_output event).
+      // buffer is fed by every node_output event).
       const lastLines = recentOutput.slice(-15);
       logger.warn('Worker exited abnormally', {
         issue_id: issue.id,
@@ -1621,7 +1622,7 @@ export class Orchestrator {
     return out;
   }
 
-  /** Promote sibling sub-issues from gaggle:queued → gaggle:running and launch Archon. */
+  /** Promote sibling sub-issues from gaggle:queued → gaggle:running and launch their runs. */
   private async promoteQueuedSiblings(parentIssue: Issue): Promise<void> {
     const sibMap = this.state.sibling_subissues.get(parentIssue.id);
     if (!sibMap || sibMap.size === 0) return;
@@ -1777,7 +1778,7 @@ export class Orchestrator {
   private async executeRetry(key: string, issue: Issue, target: RepoTarget, attempt: number): Promise<void> {
     this.state.retry_attempts.delete(key);
 
-    // If Archon already succeeded for this (issue, repo) pair, the sub-issue was marked Done.
+    // If a run already succeeded for this (issue, repo) pair, the sub-issue was marked Done.
     // Do not re-dispatch — release the claim and stop.
     if (this.state.target_machine_states.get(key) === 'succeeded') {
       logger.info('Worker already completed successfully; skipping retry', {
@@ -1881,10 +1882,9 @@ export class Orchestrator {
         // Skip `pr_ready_state` even when it appears in `terminal_states`.
         // The Linear↔GitHub integration moves issues to this state when a
         // PR is opened, but the workflow itself usually has post-PR phases
-        // (multi-agent review, self-fix, validation) that are still running
-        // in Archon. Cancelling here would tear down the local watcher and
-        // post a misleading "worker failed" comment while the actual run
-        // continues server-side.
+        // (multi-agent review, self-fix, validation) still to run. Cancelling
+        // here would abandon that work part-way and post a misleading
+        // "worker failed" comment.
         const prReady = this.cfg.tracker.pr_ready_state;
         const isTerminal =
           this.cfg.tracker.terminal_states.includes(issue.state) &&
@@ -1923,7 +1923,7 @@ export class Orchestrator {
         ) {
           // Active OR pr_ready_state: refresh the cached issue snapshot but
           // keep the worker alive. pr_ready_state is treated as "PR is open,
-          // post-PR phases (review/self-fix) may still be running in Archon".
+          // post-PR phases (review/self-fix) may still be running".
           for (const [, session] of this.state.running) {
             if (session.issue.id === issue.id) session.issue = issue;
           }
@@ -1942,7 +1942,7 @@ export class Orchestrator {
       }
     }
 
-    // Poll detached Archon runs (processes found still running at startup that we
+    // Poll detached runs (runs found still alive at startup that we
     // cannot re-attach to). Check if they have since completed, failed, or paused.
     // NOTE: this block must run even when state.running is empty (the typical post-crash case).
     if (this.state.detached_runs.size > 0) {
@@ -1964,7 +1964,7 @@ export class Orchestrator {
           try { await this.tracker.removeLabel(targetId, this.cfg.tracker.gaggle_labels.running); } catch { /* ignore */ }
           try { await this.tracker.updateIssueState(targetId, completedState(this.cfg)); } catch { /* ignore */ }
           this.state.target_machine_states.set(key, 'succeeded');
-          logger.info('Detached Archon run completed — marked Done', {
+          logger.info('Detached run completed — marked Done', {
             run_id: det.run_id,
             repo_alias: det.repo_alias,
           });
@@ -1986,7 +1986,7 @@ export class Orchestrator {
           });
           try { await this.tracker.removeLabel(targetId, this.cfg.tracker.gaggle_labels.running); } catch { /* ignore */ }
           try { await this.tracker.applyLabel(targetId, this.cfg.tracker.gaggle_labels.waiting_human); } catch { /* ignore */ }
-          logger.info('Detached Archon run moved to gate — restored supervised gate', {
+          logger.info('Detached run moved to gate — restored supervised gate', {
             run_id: det.run_id,
             repo_alias: det.repo_alias,
           });
@@ -1994,8 +1994,8 @@ export class Orchestrator {
           // failed or not_found — re-queue
           try { await this.tracker.removeLabel(targetId, this.cfg.tracker.gaggle_labels.running); } catch { /* ignore */ }
           try { await this.tracker.applyLabel(targetId, this.cfg.tracker.gaggle_labels.queued); } catch { /* ignore */ }
-          this.scheduleRetry(det.parent_issue, det.repo_target, 1, `detached_archon_${status}`);
-          logger.warn('Detached Archon run failed or not found — re-queued', {
+          this.scheduleRetry(det.parent_issue, det.repo_target, 1, `detached_run_${status}`);
+          logger.warn('Detached run failed or not found — re-queued', {
             run_id: det.run_id,
             repo_alias: det.repo_alias,
             status,
@@ -2083,7 +2083,7 @@ export class Orchestrator {
     const persistedRunIds = allRunEntries(this.cfg.registry.base_folder);
     const persistedRetries = allRetryEntries(this.cfg.registry.base_folder);
     const runsById = new Map<string, RunRecord>(executorRuns.map((r) => [r.id, r]));
-    logger.info('Archon status snapshot at startup', {
+    logger.info('Run status snapshot at startup', {
       total_runs: executorRuns.length,
       persisted_run_ids: Object.keys(persistedRunIds).length,
       persisted_retries: Object.keys(persistedRetries).length,
@@ -2125,21 +2125,21 @@ export class Orchestrator {
         map.set(aliasGuess, issue.id);
       }
 
-      const archonRun = this.resolveArchonRun(parentId, aliasGuess, ctx);
+      const runRecord = this.resolveRunForTarget(parentId, aliasGuess, ctx);
       const identity: TargetIdentity = {
         parent_issue_id: parentId,
         repo_alias: aliasGuess ?? '',
         target_issue_id: issue.id,
       };
 
-      // Classify the target's state from labels + Archon status. The classifier
+      // Classify the target's state from labels + run status. The classifier
       // collapses the four-way (running / paused / completed / failed-or-missing)
-      // Archon-status switch into a single TargetState we can dispatch on.
+      // run-status switch into a single TargetState we can dispatch on.
       const classification = classifyTargetState({
         identity,
         target_labels: new Set(['running']),
         linear_state: issue.state ?? '',
-        executor_run: archonRun,
+        executor_run: runRecord,
         persisted_retry: ctx.persistedRetries[workerKey(parentId, aliasGuess ?? '')] ?? null,
       });
 
@@ -2150,12 +2150,12 @@ export class Orchestrator {
 
       switch (effectiveState) {
         case 'running': {
-          // Archon still alive — track as detached; reconciler will poll.
+          // Run still alive — track as detached; the reconciler will poll it.
           const key = workerKey(parentId, aliasGuess!);
           const target = this.buildRepoTargetForAlias(aliasGuess!, issue);
           const parentIssue = this.state.pending_issues.get(parentId) ?? issue;
           this.state.detached_runs.set(key, {
-            run_id: archonRun!.id,
+            run_id: runRecord!.id,
             parent_issue: parentIssue as Issue,
             sub_issue_id: issue.parent_id ? issue.id : null,
             repo_alias: aliasGuess!,
@@ -2169,62 +2169,62 @@ export class Orchestrator {
             sub_issue_id: issue.parent_id ? issue.id : null,
             cancel: () => {},
           }));
-          logger.info('Recovered: Archon still running — tracking as detached', {
+          logger.info('Recovered: run still going — tracking as detached', {
             issue_identifier: issue.identifier,
             repo_alias: aliasGuess!,
-            run_id: archonRun!.id,
+            run_id: runRecord!.id,
           });
           break;
         }
 
         case 'gate_waiting': {
-          // Archon paused at a gate — restore the supervised gate entry and
+          // Run paused at a gate — restore the supervised gate entry and
           // swap running → waiting-human so labels reflect reality.
           const key = workerKey(parentId, aliasGuess!);
           const target = this.buildRepoTargetForAlias(aliasGuess!, issue);
           const parentIssue = this.state.pending_issues.get(parentId) ?? issue;
           this.state.supervised_gates.set(key, {
-            run_id: archonRun!.id,
+            run_id: runRecord!.id,
             issue_id: parentId,
             issue: parentIssue as Issue,
             repo_alias: aliasGuess!,
             repo_target: target,
             sub_issue_id: issue.parent_id ? issue.id : null,
             paused_at: Date.now(),
-            gate_message: archonRun!.metadata?.approval?.message ?? '(recovered gate)',
+            gate_message: runRecord!.metadata?.approval?.message ?? '(recovered gate)',
             comment_id: null,
             gate_state_applied: false,
             attempt: null,
           });
           try { await this.tracker.removeLabel(issue.id, this.cfg.tracker.gaggle_labels.running); } catch { /* ignore */ }
           try { await this.tracker.applyLabel(issue.id, this.cfg.tracker.gaggle_labels.waiting_human); } catch { /* ignore */ }
-          logger.info('Recovered: Archon paused at gate — restored supervised gate', {
+          logger.info('Recovered: run paused at gate — restored supervised gate', {
             issue_identifier: issue.identifier,
             repo_alias: aliasGuess!,
-            run_id: archonRun!.id,
+            run_id: runRecord!.id,
           });
           break;
         }
 
         case 'succeeded': {
-          // Archon finished while we were down — mark target Done.
+          // Run finished while we were down — mark target Done.
           try { await this.tracker.removeLabel(issue.id, this.cfg.tracker.gaggle_labels.running); } catch { /* ignore */ }
           try { await this.tracker.updateIssueState(issue.id, completedState(this.cfg)); } catch { /* ignore */ }
           this.state.target_machine_states.set(workerKey(parentId, aliasGuess!), 'succeeded');
-          logger.info('Recovered: Archon completed while down — marked Done', {
+          logger.info('Recovered: run completed while down — marked Done', {
             issue_identifier: issue.identifier,
             repo_alias: aliasGuess!,
-            run_id: archonRun!.id,
+            run_id: runRecord!.id,
           });
           break;
         }
 
         case 'retrying':
         default: {
-          // Archon crashed, run not found, or alias unresolvable — re-queue.
+          // Run crashed, missing, or alias unresolvable — re-queue.
           try { await this.tracker.removeLabel(issue.id, this.cfg.tracker.gaggle_labels.running); } catch { /* ignore */ }
           try { await this.tracker.applyLabel(issue.id, this.cfg.tracker.gaggle_labels.queued); } catch { /* ignore */ }
-          logger.info('Recovered: Archon not found or crashed — re-queued', {
+          logger.info('Recovered: run missing or crashed — re-queued', {
             issue_identifier: issue.identifier,
             repo_alias: aliasGuess ?? '(unknown)',
           });
@@ -2365,9 +2365,9 @@ export class Orchestrator {
   private async releaseOrphanedClaims(ctx: RecoveryContext): Promise<void> {
     // Orphaned claimed parents: check whether all recovered siblings (if any) have already
     // completed.  Three cases:
-    //   (a) Running sub whose Archon run completed → sibling_subissues IS populated but every
+    //   (a) Running sub whose run completed → sibling_subissues IS populated but every
     //       entry has target_machine_states === 'succeeded'.  Work is done → release to terminal.
-    //   (b) No running/queued siblings at all but a persisted run entry shows Archon completed
+    //   (b) No running/queued siblings at all but a persisted run entry shows the run completed
     //       (crash after handleWorkerExit removed the running label but before
     //       maybeReleaseClaim) → release to terminal.
     //   (c) No siblings and no completed run → crash before the first worker was ever launched
@@ -2408,7 +2408,7 @@ export class Orchestrator {
   private recoverWaitingIssues(ctx: RecoveryContext): void {
     // Build lookups from issue_id → repo_alias and issue_id → run_id using persisted
     // run entries, so parent issues (no [alias] title prefix) can have their gates fully
-    // recovered after a restart — including the run_id needed to approve/reject in Archon.
+    // recovered after a restart — including the run_id needed to approve or reject.
     const runAliasById = new Map<string, string>();
     const runIdById = new Map<string, string>();
     for (const entry of Object.values(ctx.persistedRunIds)) {
@@ -2447,7 +2447,7 @@ export class Orchestrator {
         attempt: null,
       });
       this.state.target_machine_states.set(key, 'gate_waiting');
-      logger.info('Recovered supervised gate (Archon process gone)', {
+      logger.info('Recovered supervised gate (executor process gone)', {
         issue_identifier: issue.identifier,
       });
     }
@@ -2466,7 +2466,7 @@ export class Orchestrator {
     return fallback?.[1].repo_alias ?? null;
   }
 
-  private resolveArchonRun(
+  private resolveRunForTarget(
     parentId: string,
     alias: string | null,
     ctx: RecoveryContext,
