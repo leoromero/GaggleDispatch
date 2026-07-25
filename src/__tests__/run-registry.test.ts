@@ -40,7 +40,7 @@ describe('run-registry', () => {
 
   test('writeRunEntry creates gaggle-runs.json', () => {
     writeRunEntry(tmpDir, 'SYM-1__myrepo', {
-      archon_run_id: 'abc123def456abc123def456abc123de',
+      run_id: 'abc123def456abc123def456abc123de',
       parent_issue_id: 'pid1',
       sub_issue_id: 'sid1',
       repo_alias: 'myrepo',
@@ -50,14 +50,14 @@ describe('run-registry', () => {
 
   test('readRunEntry retrieves a written entry', () => {
     const entry = {
-      archon_run_id: 'abc123def456abc123def456abc123de',
+      run_id: 'abc123def456abc123def456abc123de',
       parent_issue_id: 'pid1',
       sub_issue_id: 'sid1',
       repo_alias: 'myrepo',
     };
     writeRunEntry(tmpDir, 'SYM-1__myrepo', entry);
     const result = readRunEntry(tmpDir, 'SYM-1__myrepo');
-    expect(result?.archon_run_id).toBe(entry.archon_run_id);
+    expect(result?.run_id).toBe(entry.run_id);
     expect(result?.parent_issue_id).toBe(entry.parent_issue_id);
     expect(result?.sub_issue_id).toBe(entry.sub_issue_id);
     expect(result?.repo_alias).toBe(entry.repo_alias);
@@ -66,7 +66,7 @@ describe('run-registry', () => {
 
   test('writeRunEntry stores null sub_issue_id correctly', () => {
     writeRunEntry(tmpDir, 'SYM-2__other', {
-      archon_run_id: 'deadbeefdeadbeefdeadbeefdeadbeef',
+      run_id: 'deadbeefdeadbeefdeadbeefdeadbeef',
       parent_issue_id: 'pid2',
       sub_issue_id: null,
       repo_alias: 'other',
@@ -75,16 +75,16 @@ describe('run-registry', () => {
   });
 
   test('allRunEntries returns all written entries', () => {
-    writeRunEntry(tmpDir, 'SYM-1__repo-a', { archon_run_id: 'aaa', parent_issue_id: 'p1', sub_issue_id: null, repo_alias: 'repo-a' });
-    writeRunEntry(tmpDir, 'SYM-2__repo-b', { archon_run_id: 'bbb', parent_issue_id: 'p2', sub_issue_id: 's2', repo_alias: 'repo-b' });
+    writeRunEntry(tmpDir, 'SYM-1__repo-a', { run_id: 'aaa', parent_issue_id: 'p1', sub_issue_id: null, repo_alias: 'repo-a' });
+    writeRunEntry(tmpDir, 'SYM-2__repo-b', { run_id: 'bbb', parent_issue_id: 'p2', sub_issue_id: 's2', repo_alias: 'repo-b' });
     const all = allRunEntries(tmpDir);
     expect(Object.keys(all)).toHaveLength(2);
-    expect(all['SYM-1__repo-a']?.archon_run_id).toBe('aaa');
-    expect(all['SYM-2__repo-b']?.archon_run_id).toBe('bbb');
+    expect(all['SYM-1__repo-a']?.run_id).toBe('aaa');
+    expect(all['SYM-2__repo-b']?.run_id).toBe('bbb');
   });
 
   test('deleteRunEntry removes the entry', () => {
-    writeRunEntry(tmpDir, 'SYM-1__myrepo', { archon_run_id: 'x', parent_issue_id: 'p', sub_issue_id: null, repo_alias: 'myrepo' });
+    writeRunEntry(tmpDir, 'SYM-1__myrepo', { run_id: 'x', parent_issue_id: 'p', sub_issue_id: null, repo_alias: 'myrepo' });
     expect(readRunEntry(tmpDir, 'SYM-1__myrepo')).not.toBeNull();
     deleteRunEntry(tmpDir, 'SYM-1__myrepo');
     expect(readRunEntry(tmpDir, 'SYM-1__myrepo')).toBeNull();
@@ -95,18 +95,18 @@ describe('run-registry', () => {
   });
 
   test('deleteRunEntry preserves other entries', () => {
-    writeRunEntry(tmpDir, 'SYM-1__a', { archon_run_id: 'a', parent_issue_id: 'p1', sub_issue_id: null, repo_alias: 'a' });
-    writeRunEntry(tmpDir, 'SYM-2__b', { archon_run_id: 'b', parent_issue_id: 'p2', sub_issue_id: null, repo_alias: 'b' });
+    writeRunEntry(tmpDir, 'SYM-1__a', { run_id: 'a', parent_issue_id: 'p1', sub_issue_id: null, repo_alias: 'a' });
+    writeRunEntry(tmpDir, 'SYM-2__b', { run_id: 'b', parent_issue_id: 'p2', sub_issue_id: null, repo_alias: 'b' });
     deleteRunEntry(tmpDir, 'SYM-1__a');
     const all = allRunEntries(tmpDir);
     expect(Object.keys(all)).toHaveLength(1);
-    expect(all['SYM-2__b']?.archon_run_id).toBe('b');
+    expect(all['SYM-2__b']?.run_id).toBe('b');
   });
 
   test('writeRunEntry overwrites an existing entry for the same key', () => {
-    writeRunEntry(tmpDir, 'SYM-1__myrepo', { archon_run_id: 'first', parent_issue_id: 'p', sub_issue_id: null, repo_alias: 'myrepo' });
-    writeRunEntry(tmpDir, 'SYM-1__myrepo', { archon_run_id: 'second', parent_issue_id: 'p', sub_issue_id: null, repo_alias: 'myrepo' });
-    expect(readRunEntry(tmpDir, 'SYM-1__myrepo')?.archon_run_id).toBe('second');
+    writeRunEntry(tmpDir, 'SYM-1__myrepo', { run_id: 'first', parent_issue_id: 'p', sub_issue_id: null, repo_alias: 'myrepo' });
+    writeRunEntry(tmpDir, 'SYM-1__myrepo', { run_id: 'second', parent_issue_id: 'p', sub_issue_id: null, repo_alias: 'myrepo' });
+    expect(readRunEntry(tmpDir, 'SYM-1__myrepo')?.run_id).toBe('second');
     expect(Object.keys(allRunEntries(tmpDir))).toHaveLength(1);
   });
 
@@ -120,10 +120,10 @@ describe('run-registry', () => {
   });
 
   test('file is valid JSON after multiple writes and deletes', () => {
-    writeRunEntry(tmpDir, 'k1', { archon_run_id: 'a', parent_issue_id: 'p', sub_issue_id: null, repo_alias: 'r' });
-    writeRunEntry(tmpDir, 'k2', { archon_run_id: 'b', parent_issue_id: 'p', sub_issue_id: null, repo_alias: 'r' });
+    writeRunEntry(tmpDir, 'k1', { run_id: 'a', parent_issue_id: 'p', sub_issue_id: null, repo_alias: 'r' });
+    writeRunEntry(tmpDir, 'k2', { run_id: 'b', parent_issue_id: 'p', sub_issue_id: null, repo_alias: 'r' });
     deleteRunEntry(tmpDir, 'k1');
-    writeRunEntry(tmpDir, 'k3', { archon_run_id: 'c', parent_issue_id: 'p', sub_issue_id: null, repo_alias: 'r' });
+    writeRunEntry(tmpDir, 'k3', { run_id: 'c', parent_issue_id: 'p', sub_issue_id: null, repo_alias: 'r' });
     const raw = readFileSync(join(tmpDir, 'gaggle-runs.json'), 'utf8');
     expect(() => JSON.parse(raw)).not.toThrow();
     const parsed = JSON.parse(raw) as { entries: Record<string, unknown> };
@@ -160,9 +160,9 @@ describe('retry-registry', () => {
   });
 
   test('retry and run entries coexist in the same file under different maps', () => {
-    writeRunEntry(tmpDir, 'k1', { archon_run_id: 'a', parent_issue_id: 'p', sub_issue_id: null, repo_alias: 'r' });
+    writeRunEntry(tmpDir, 'k1', { run_id: 'a', parent_issue_id: 'p', sub_issue_id: null, repo_alias: 'r' });
     writeRetryEntry(tmpDir, 'k1', { parent_issue_id: 'p', sub_issue_id: null, repo_alias: 'r', attempt: 2, due_at_ms: 100, reason: 'x' });
-    expect(readRunEntry(tmpDir, 'k1')?.archon_run_id).toBe('a');
+    expect(readRunEntry(tmpDir, 'k1')?.run_id).toBe('a');
     expect(readRetryEntry(tmpDir, 'k1')?.attempt).toBe(2);
     // Independent lifecycles
     deleteRunEntry(tmpDir, 'k1');

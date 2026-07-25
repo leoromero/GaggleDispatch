@@ -354,7 +354,7 @@ describe('readiness predicate', () => {
   describe('repoTargetReady', () => {
     const makeTarget = (depends_on: string[], ready_when = 'merged'): RepoTarget => ({
       repo_url: '', repo_alias: 'fe', local_path: '/fe',
-      archon_workflow: 'wf', rationale: 'r', components: [],
+      workflow: 'wf', rationale: 'r', components: [],
       depends_on, ready_when,
     });
 
@@ -416,7 +416,7 @@ describe('buildGaggleEnv', () => {
     };
     const target: RepoTarget = {
       repo_url: 'https://github.com/o/r', repo_alias: 'repo-r', local_path: '/r',
-      archon_workflow: 'gaggle/fix', rationale: 'why', components: [],
+      workflow: 'gaggle/fix', rationale: 'why', components: [],
     };
     const analysis: IssueAnalysis = { issue_id: 'i1', analysis_summary: 'summary', repo_targets: [] };
     const env = buildGaggleEnv({ issue, repo_target: target, analysis, attempt: null });
@@ -424,7 +424,7 @@ describe('buildGaggleEnv', () => {
     expect(env.GAGGLE_ISSUE_IDENTIFIER).toBe('SYM-1');
     expect(env.GAGGLE_ISSUE_TITLE).toBe('A bug');
     expect(env.GAGGLE_REPO_ALIAS).toBe('repo-r');
-    expect(env.GAGGLE_ARCHON_WORKFLOW).toBe('gaggle/fix');
+    expect(env.GAGGLE_WORKFLOW).toBe('gaggle/fix');
     expect(env.GAGGLE_ATTEMPT).toBe('first');
     expect(env.GAGGLE_ANALYSIS_SUMMARY).toBe('summary');
   });
@@ -435,7 +435,7 @@ describe('buildGaggleEnv', () => {
       priority: 0, state: 'In Progress', branch_name: null, url: null,
       labels: [], blocked_by: [], created_at: null, updated_at: null,
     };
-    const target: RepoTarget = { repo_url: '', repo_alias: 'r', local_path: '', archon_workflow: '', rationale: '', components: [] };
+    const target: RepoTarget = { repo_url: '', repo_alias: 'r', local_path: '', workflow: '', rationale: '', components: [] };
     const analysis: IssueAnalysis = { issue_id: 'i1', analysis_summary: '', repo_targets: [] };
     expect(buildGaggleEnv({ issue, repo_target: target, analysis, attempt: 2 }).GAGGLE_ATTEMPT).toBe('2');
   });
@@ -450,7 +450,7 @@ describe('issue message construction', () => {
     };
     const target: RepoTarget = {
       repo_url: 'https://github.com/o/r', repo_alias: 'r', local_path: '/r',
-      archon_workflow: 'gaggle/gaggle-fix-issue', rationale: 'why', components: ['c'],
+      workflow: 'gaggle/gaggle-fix-issue', rationale: 'why', components: ['c'],
     };
     const analysis: IssueAnalysis = {
       issue_id: 'iss-1', analysis_summary: 'sum', repo_targets: [target],

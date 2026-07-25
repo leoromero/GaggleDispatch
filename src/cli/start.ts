@@ -82,11 +82,11 @@ export async function runStart(opts: {
   // polling kicks in. The per-run `after_run` hook handles merged branches
   // continuously; this catches the long tail. Configured via
   // archon.startup_cleanup_age_days (default 7; 0 to disable).
-  if (cfg.archon.startup_cleanup_age_days > 0) {
-    console.log(chalk.cyan(`Sweeping Archon worktrees idle > ${cfg.archon.startup_cleanup_age_days} days...`));
+  if (cfg.executor.startup_cleanup_age_days > 0) {
+    console.log(chalk.cyan(`Sweeping Archon worktrees idle > ${cfg.executor.startup_cleanup_age_days} days...`));
     const { runStartupArchonCleanup } = await import('../executor/archon-cleanup.ts');
     await runStartupArchonCleanup({
-      ageDays: cfg.archon.startup_cleanup_age_days,
+      ageDays: cfg.executor.startup_cleanup_age_days,
       repos: ctx.repositories.map((r) => ({ alias: r.name, cwd: r.local_path })),
     });
   }

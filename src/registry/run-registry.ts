@@ -20,7 +20,7 @@ import { logger } from '../util/logger.ts';
 const FILENAME = 'gaggle-runs.json';
 
 interface RunEntry {
-  archon_run_id: string;
+  run_id: string;
   parent_issue_id: string;
   sub_issue_id: string | null;
   repo_alias: string;

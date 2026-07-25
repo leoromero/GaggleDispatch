@@ -189,7 +189,7 @@ export class EffectApplier {
       // ─── Persistence ───────────────────────────────────────────────────
       case 'persist_run':
         writeRunEntry(this.deps.registryBaseFolder, effect.key, {
-          archon_run_id: effect.run_id,
+          run_id: effect.run_id,
           parent_issue_id: effect.meta.parent_issue_id,
           sub_issue_id: effect.meta.sub_issue_id,
           repo_alias: effect.meta.repo_alias,
@@ -232,7 +232,7 @@ export class EffectApplier {
 
       // ─── In-memory state ───────────────────────────────────────────────
       case 'register_detached_run':
-        // Caller populates detached_archon_runs directly during recovery
+        // Caller populates detached_runs directly during recovery
         // classification; this effect is informational. Logging only.
         logger.info('register_detached_run', {
           parent_issue_id: effect.identity.parent_issue_id,

@@ -108,7 +108,7 @@ export class Orchestrator {
     this.workspace = deps.workspace;
     this.registry = deps.registry;
     this.syncer = deps.syncer;
-    this.archon = deps.archonClient ?? new ArchonClient(deps.cfg.archon.api_url);
+    this.archon = deps.archonClient ?? new ArchonClient(deps.cfg.executor.api_url);
     this.state = createInitialState(this.cfg);
 
     deps.registry.on(() => {
@@ -475,7 +475,7 @@ export class Orchestrator {
       repo_url: repo.url,
       repo_alias: repo.name,
       local_path: repo.local_path,
-      archon_workflow: repo.default_workflow ?? this.cfg.archon.default_workflow,
+      workflow: repo.default_workflow ?? this.cfg.executor.default_workflow,
       rationale: subIssue.description ?? subIssue.title,
       components: [],
     };
@@ -538,30 +538,30 @@ export class Orchestrator {
 
     try {
       const handle = await spawnWorker(workerArgs, {
-        onStarted: (pid) => { const s = this.state.running.get(key); if (s) { s.archon_pid = pid; s.last_archon_timestamp = new Date().toISOString(); } },
+        onStarted: (pid) => { const s = this.state.running.get(key); if (s) { s.run_pid = pid; s.last_event_at = new Date().toISOString(); } },
         onOutput: (line) => {
           const s = this.state.running.get(key);
           if (s) {
-            s.last_archon_message = line;
-            s.last_archon_timestamp = new Date().toISOString();
+            s.last_message = line;
+            s.last_event_at = new Date().toISOString();
             s.turn_count += 1;
-            s.recent_archon_output.push(line);
-            if (s.recent_archon_output.length > 50) s.recent_archon_output.shift();
+            s.recent_output.push(line);
+            if (s.recent_output.length > 50) s.recent_output.shift();
           }
         },
         onRunId: (db_run_id) => {
           const s = this.state.running.get(key);
           if (s) {
-            s.archon_db_run_id = db_run_id;
+            s.run_id = db_run_id;
             this.attachPoller(key, db_run_id, parentIssue, target, subIssueId, attempt);
           }
           writeRunEntry(this.cfg.registry.base_folder, key, {
-            archon_run_id: db_run_id,
+            run_id: db_run_id,
             parent_issue_id: parentIssue.id,
             sub_issue_id: subIssueId,
             repo_alias: target.repo_alias,
           });
-          log.info('Captured Archon run id', { archon_run_id: db_run_id });
+          log.info('Captured Archon run id', { run_id: db_run_id });
         },
         onGatePaused: (run_id, gate_message) => { void this.handleGatePaused(parentIssue, target, subIssueId, run_id, gate_message, attempt); },
         onExit: (event) => {
@@ -571,7 +571,7 @@ export class Orchestrator {
       });
       const sess = this.state.running.get(key);
       if (sess) sess.cancel = handle.cancel;
-      log.info('Worker spawned', { workflow: target.archon_workflow });
+      log.info('Worker spawned', { workflow: target.workflow });
     } catch (err) {
       this.state.running.delete(key);
       try { await this.tracker.removeLabel(targetId, this.cfg.tracker.gaggle_labels.running); } catch { /* ignore */ }
@@ -602,39 +602,39 @@ export class Orchestrator {
     this.state.running.set(key, session);
 
     const resumeHandle = approveAndResumeArchon(
-      this.cfg.archon.command,
+      this.cfg.executor.command,
       runId,
       message ?? undefined,
-      this.cfg.archon.turn_timeout_ms,
+      this.cfg.executor.turn_timeout_ms,
       (e) => {
         const s = this.state.running.get(key);
         switch (e.type) {
           case 'archon_started':
-            if (s) { s.archon_pid = e.pid; s.last_archon_timestamp = new Date().toISOString(); }
+            if (s) { s.run_pid = e.pid; s.last_event_at = new Date().toISOString(); }
             break;
           case 'archon_output':
             if (s) {
-              s.last_archon_message = e.line;
-              s.last_archon_timestamp = new Date().toISOString();
+              s.last_message = e.line;
+              s.last_event_at = new Date().toISOString();
               s.turn_count += 1;
-              s.recent_archon_output.push(e.line);
-              if (s.recent_archon_output.length > 50) s.recent_archon_output.shift();
+              s.recent_output.push(e.line);
+              if (s.recent_output.length > 50) s.recent_output.shift();
             }
             break;
-          case 'archon_run_id':
+          case 'run_id':
             if (s) {
-              s.archon_db_run_id = e.db_run_id;
+              s.run_id = e.db_run_id;
               // Post-approve grace window: Archon briefly reports the paused
               // run as `failed`/`cancelled` while the resumed run takes over.
               // Skipping the first poll by ~pollIntervalMs avoids a spurious
               // "Poller: run reached failed/cancelled status" log.
               this.attachPoller(
                 key, e.db_run_id, parentIssue, target, subIssueId, attempt,
-                this.cfg.archon.poll_interval_ms,
+                this.cfg.executor.poll_interval_ms,
               );
             }
             writeRunEntry(this.cfg.registry.base_folder, key, {
-              archon_run_id: e.db_run_id,
+              run_id: e.db_run_id,
               parent_issue_id: parentIssue.id,
               sub_issue_id: subIssueId,
               repo_alias: target.repo_alias,
@@ -868,7 +868,7 @@ export class Orchestrator {
         issue_id: issue.id,
         issue_identifier: issue.identifier,
         repo_alias: target.repo_alias,
-        workflow: target.archon_workflow,
+        workflow: target.workflow,
       });
     }
 
@@ -943,7 +943,7 @@ export class Orchestrator {
 
         switch (event.type) {
           case 'poller_heartbeat':
-            if (session) session.last_archon_timestamp = event.record.last_activity_at ?? new Date().toISOString();
+            if (session) session.last_event_at = event.record.last_activity_at ?? new Date().toISOString();
             break;
 
           case 'poller_gate_paused':
@@ -994,8 +994,8 @@ export class Orchestrator {
         }
       },
       {
-        pollIntervalMs: this.cfg.archon.poll_interval_ms,
-        stallTimeoutMs: this.cfg.archon.stall_timeout_ms,
+        pollIntervalMs: this.cfg.executor.poll_interval_ms,
+        stallTimeoutMs: this.cfg.executor.stall_timeout_ms,
         ...(initialDelayMs !== undefined ? { initialDelayMs } : {}),
       },
     );
@@ -1363,7 +1363,7 @@ export class Orchestrator {
     for (const [key, gate] of this.state.supervised_gates) {
       const targetId = gate.sub_issue_id ?? gate.issue_id;
       // Timeout → gate_timed_out (SM emits archon_reject, label swap, schedule_retry).
-      if (this.cfg.archon.gate_timeout_ms > 0 && Date.now() - gate.paused_at > this.cfg.archon.gate_timeout_ms) {
+      if (this.cfg.executor.gate_timeout_ms > 0 && Date.now() - gate.paused_at > this.cfg.executor.gate_timeout_ms) {
         await this.resolveGateStateTransition(targetId, gate);
         await this.emitTargetEvent('gate_waiting', { kind: 'gate_timed_out' }, this.buildGateTransitionCtx(gate));
         logger.info('Gate timed out — retry scheduled', { issue_id: gate.issue_id, repo_alias: gate.repo_alias });
@@ -1483,10 +1483,10 @@ export class Orchestrator {
     const session = this.state.running.get(key);
     const subIssueId = session?.sub_issue_id ?? this.state.sibling_subissues.get(issue.id)?.get(target.repo_alias) ?? null;
     const targetId = subIssueId ?? issue.id;
-    const dbRunId = session?.archon_db_run_id ?? null;
+    const dbRunId = session?.run_id ?? null;
     // Capture before the session is deleted below — used in the failure log
     // so the operator can see what the Archon CLI was doing right before exit.
-    const recentOutput = session?.recent_archon_output.slice() ?? [];
+    const recentOutput = session?.recent_output.slice() ?? [];
 
     // Pre-SM: detect the gate-pause-disguised-as-success case and defer to the
     // gate handler. The Archon CLI exits 0 when the workflow pauses at an
@@ -1497,7 +1497,7 @@ export class Orchestrator {
         const run = runDetail?.run;
         if (run?.status === 'paused') {
           logger.info('Worker exit was gate pause — treating as supervised gate', {
-            issue_id: issue.id, repo_alias: target.repo_alias, archon_run_id: dbRunId,
+            issue_id: issue.id, repo_alias: target.repo_alias, run_id: dbRunId,
           });
           session?.stopPoller?.();
           this.state.running.delete(key);
@@ -1553,7 +1553,7 @@ export class Orchestrator {
       await this.promoteQueuedSiblings(issue);
     } else {
       // Include the tail of Archon CLI output so the failure cause is
-      // visible without leaving the gaggle log (recent_archon_output ring
+      // visible without leaving the gaggle log (recent_output ring
       // buffer is fed by every archon_output event).
       const lastLines = recentOutput.slice(-15);
       logger.warn('Worker exited abnormally', {
@@ -1561,9 +1561,9 @@ export class Orchestrator {
         repo_alias: target.repo_alias,
         type: event.type,
         exit_code: event.exit_code,
-        archon_run_id: dbRunId,
+        run_id: dbRunId ?? undefined,
         next_attempt: (attempt ?? 0) + 1,
-        last_archon_output: lastLines.length > 0 ? lastLines.join('\n') : '(no output captured)',
+        last_output: lastLines.length > 0 ? lastLines.join('\n') : '(no output captured)',
       });
     }
 
@@ -1935,17 +1935,17 @@ export class Orchestrator {
     // Poll detached Archon runs (processes found still running at startup that we
     // cannot re-attach to). Check if they have since completed, failed, or paused.
     // NOTE: this block must run even when state.running is empty (the typical post-crash case).
-    if (this.state.detached_archon_runs.size > 0) {
+    if (this.state.detached_runs.size > 0) {
       const freshRuns = await this.archon.listRuns();
       const freshById = new Map<string, ArchonRunRecord>(freshRuns.map((r) => [r.id, r]));
 
-      for (const [key, det] of [...this.state.detached_archon_runs]) {
-        const run = freshById.get(det.archon_run_id);
+      for (const [key, det] of [...this.state.detached_runs]) {
+        const run = freshById.get(det.run_id);
         const status = run?.status ?? 'not_found';
 
         if (status === 'running') continue; // still going
 
-        this.state.detached_archon_runs.delete(key);
+        this.state.detached_runs.delete(key);
         this.state.running.delete(key); // free the slot
 
         const targetId = det.sub_issue_id ?? det.parent_issue.id;
@@ -1955,7 +1955,7 @@ export class Orchestrator {
           try { await this.tracker.updateIssueState(targetId, completedState(this.cfg)); } catch { /* ignore */ }
           this.state.target_machine_states.set(key, 'succeeded');
           logger.info('Detached Archon run completed — marked Done', {
-            archon_run_id: det.archon_run_id,
+            run_id: det.run_id,
             repo_alias: det.repo_alias,
           });
           await this.promoteQueuedSiblings(det.parent_issue);
@@ -1977,7 +1977,7 @@ export class Orchestrator {
           try { await this.tracker.removeLabel(targetId, this.cfg.tracker.gaggle_labels.running); } catch { /* ignore */ }
           try { await this.tracker.applyLabel(targetId, this.cfg.tracker.gaggle_labels.waiting_human); } catch { /* ignore */ }
           logger.info('Detached Archon run moved to gate — restored supervised gate', {
-            archon_run_id: det.archon_run_id,
+            run_id: det.run_id,
             repo_alias: det.repo_alias,
           });
         } else {
@@ -1986,7 +1986,7 @@ export class Orchestrator {
           try { await this.tracker.applyLabel(targetId, this.cfg.tracker.gaggle_labels.queued); } catch { /* ignore */ }
           this.scheduleRetry(det.parent_issue, det.repo_target, 1, `detached_archon_${status}`);
           logger.warn('Detached Archon run failed or not found — re-queued', {
-            archon_run_id: det.archon_run_id,
+            run_id: det.run_id,
             repo_alias: det.repo_alias,
             status,
           });
@@ -2144,8 +2144,8 @@ export class Orchestrator {
           const key = workerKey(parentId, aliasGuess!);
           const target = this.buildRepoTargetForAlias(aliasGuess!, issue);
           const parentIssue = this.state.pending_issues.get(parentId) ?? issue;
-          this.state.detached_archon_runs.set(key, {
-            archon_run_id: archonRun!.id,
+          this.state.detached_runs.set(key, {
+            run_id: archonRun!.id,
             parent_issue: parentIssue as Issue,
             sub_issue_id: issue.parent_id ? issue.id : null,
             repo_alias: aliasGuess!,
@@ -2162,7 +2162,7 @@ export class Orchestrator {
           logger.info('Recovered: Archon still running — tracking as detached', {
             issue_identifier: issue.identifier,
             repo_alias: aliasGuess!,
-            archon_run_id: archonRun!.id,
+            run_id: archonRun!.id,
           });
           break;
         }
@@ -2191,7 +2191,7 @@ export class Orchestrator {
           logger.info('Recovered: Archon paused at gate — restored supervised gate', {
             issue_identifier: issue.identifier,
             repo_alias: aliasGuess!,
-            archon_run_id: archonRun!.id,
+            run_id: archonRun!.id,
           });
           break;
         }
@@ -2204,7 +2204,7 @@ export class Orchestrator {
           logger.info('Recovered: Archon completed while down — marked Done', {
             issue_identifier: issue.identifier,
             repo_alias: aliasGuess!,
-            archon_run_id: archonRun!.id,
+            run_id: archonRun!.id,
           });
           break;
         }
@@ -2378,7 +2378,7 @@ export class Orchestrator {
       const workDone =
         (sibMap && sibMap.size > 0) || // at least one sibling completed during recovery
         Object.values(ctx.persistedRunIds).some(
-          (e) => e.parent_issue_id === parentId && ctx.archonRunsById.get(e.archon_run_id)?.status === 'completed',
+          (e) => e.parent_issue_id === parentId && ctx.archonRunsById.get(e.run_id)?.status === 'completed',
         );
 
       if (workDone) {
@@ -2396,14 +2396,14 @@ export class Orchestrator {
   }
 
   private recoverWaitingIssues(ctx: RecoveryContext): void {
-    // Build lookups from issue_id → repo_alias and issue_id → archon_run_id using persisted
+    // Build lookups from issue_id → repo_alias and issue_id → run_id using persisted
     // run entries, so parent issues (no [alias] title prefix) can have their gates fully
     // recovered after a restart — including the run_id needed to approve/reject in Archon.
     const runAliasById = new Map<string, string>();
     const runIdById = new Map<string, string>();
     for (const entry of Object.values(ctx.persistedRunIds)) {
       runAliasById.set(entry.parent_issue_id, entry.repo_alias);
-      runIdById.set(entry.parent_issue_id, entry.archon_run_id);
+      runIdById.set(entry.parent_issue_id, entry.run_id);
     }
 
     for (const issue of ctx.waitingIssues) {
@@ -2425,7 +2425,7 @@ export class Orchestrator {
           repo_url: '',
           repo_alias: aliasGuess,
           local_path: '',
-          archon_workflow: '',
+          workflow: '',
           rationale: '',
           components: [],
         },
@@ -2464,7 +2464,7 @@ export class Orchestrator {
     const key = workerKey(parentId, alias ?? '');
     const persistedEntry = ctx.persistedRunIds[key];
     let run: ArchonRunRecord | null = persistedEntry
-      ? (ctx.archonRunsById.get(persistedEntry.archon_run_id) ?? null)
+      ? (ctx.archonRunsById.get(persistedEntry.run_id) ?? null)
       : null;
     if (!run && alias) {
       const repoBasename =
@@ -2481,7 +2481,7 @@ export class Orchestrator {
       repo_url: repoMeta?.url ?? '',
       repo_alias: alias,
       local_path: repoMeta?.local_path ?? '',
-      archon_workflow: repoMeta?.default_workflow ?? this.cfg.archon.default_workflow,
+      workflow: repoMeta?.default_workflow ?? this.cfg.executor.default_workflow,
       rationale: issue.description ?? issue.title,
       components: [],
     };

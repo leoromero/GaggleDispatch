@@ -127,16 +127,16 @@ export class IssueAnalyzer {
           issue_id: issue.id,
           repo: matched.name,
           desired: complexityWorkflow,
-          fallback: matched.default_workflow || this.cfg.archon.default_workflow,
+          fallback: matched.default_workflow || this.cfg.executor.default_workflow,
         });
-        archonWf = matched.default_workflow || this.cfg.archon.default_workflow;
+        archonWf = matched.default_workflow || this.cfg.executor.default_workflow;
       }
 
       const target: RepoTarget = {
         repo_url: matched.url,
         repo_alias: sanitizeId(matched.name),
         local_path: matched.local_path,
-        archon_workflow: archonWf,
+        workflow: archonWf,
         rationale: typeof obj.rationale === 'string' ? obj.rationale : '',
         components: Array.isArray(obj.components)
           ? (obj.components as unknown[]).filter((c): c is string => typeof c === 'string')
@@ -328,9 +328,9 @@ Examples: new feature page, API shape change, auth flow update, multi-service ch
 
 ## Workflow assignment
 
-The \`archon_workflow\` field in EACH repo_target MUST be determined by complexity, not by the repo's default:
-- complexity == "simple"  → archon_workflow = "gaggle/gaggle-fix-issue"
-- complexity == "complex" → archon_workflow = "gaggle/gaggle-supervised"
+The \`workflow\` field in EACH repo_target MUST be determined by complexity, not by the repo's default:
+- complexity == "simple"  → workflow = "gaggle/gaggle-fix-issue"
+- complexity == "complex" → workflow = "gaggle/gaggle-supervised"
 
 Then verify that workflow is listed in that repo's \`available_workflows\` in gaggle.md.
 If it is NOT listed, use the repo's \`default_workflow\` instead and note it in the rationale.

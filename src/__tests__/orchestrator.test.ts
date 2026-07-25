@@ -335,14 +335,14 @@ describe('Orchestrator.stop', () => {
       issue: makeIssue(),
       identifier: 'X',
       repo_alias: 'r',
-      repo_target: { repo_url: '', repo_alias: 'r', local_path: '', archon_workflow: '', rationale: '', components: [] },
+      repo_target: { repo_url: '', repo_alias: 'r', local_path: '', workflow: '', rationale: '', components: [] },
       sub_issue_id: null,
-      archon_pid: null,
-      archon_db_run_id: null,
-      archon_workflow: '',
-      last_archon_event: null,
-      last_archon_timestamp: null,
-      last_archon_message: null, recent_archon_output: [],
+      run_pid: null,
+      run_id: null,
+      workflow: '',
+      last_event: null,
+      last_event_at: null,
+      last_message: null, recent_output: [],
       claude_input_tokens: 0,
       claude_output_tokens: 0,
       claude_total_tokens: 0,
@@ -507,12 +507,12 @@ describe('shouldDispatch eligibility', () => {
       repo_alias: 'repo-a',
       repo_target: makeRepoTarget(),
       sub_issue_id: null,
-      archon_pid: null,
-      archon_db_run_id: null,
-      archon_workflow: 'gaggle/gaggle-fix-issue',
-      last_archon_event: null,
-      last_archon_timestamp: null,
-      last_archon_message: null, recent_archon_output: [],
+      run_pid: null,
+      run_id: null,
+      workflow: 'gaggle/gaggle-fix-issue',
+      last_event: null,
+      last_event_at: null,
+      last_message: null, recent_output: [],
       claude_input_tokens: 0,
       claude_output_tokens: 0,
       claude_total_tokens: 0,
@@ -669,8 +669,8 @@ describe('emitTargetEvent populates target_machine_states', () => {
     o.getState().running.set('p1__fe', {
       session_id: 'x', issue, identifier: 'SYM-201', repo_alias: 'fe',
       repo_target: makeRepoTarget({ repo_alias: 'fe' }), sub_issue_id: null,
-      archon_pid: 1, archon_db_run_id: 'r1',
-      archon_workflow: '', last_archon_event: null, last_archon_timestamp: null, last_archon_message: null, recent_archon_output: [],
+      run_pid: 1, run_id: 'r1',
+      workflow: '', last_event: null, last_event_at: null, last_message: null, recent_output: [],
       claude_input_tokens: 0, claude_output_tokens: 0, claude_total_tokens: 0, turn_count: 0,
       started_at: new Date().toISOString(), attempt: null,
     });
@@ -724,8 +724,8 @@ describe('emitTargetEvent populates target_machine_states', () => {
     o.getState().running.set('p1__fe', {
       session_id: 'x', issue, identifier: 'SYM-203', repo_alias: 'fe',
       repo_target: makeRepoTarget({ repo_alias: 'fe' }), sub_issue_id: null,
-      archon_pid: 1, archon_db_run_id: 'r1',
-      archon_workflow: '', last_archon_event: null, last_archon_timestamp: null, last_archon_message: null, recent_archon_output: [],
+      run_pid: 1, run_id: 'r1',
+      workflow: '', last_event: null, last_event_at: null, last_message: null, recent_output: [],
       claude_input_tokens: 0, claude_output_tokens: 0, claude_total_tokens: 0, turn_count: 0,
       started_at: new Date().toISOString(), attempt: null,
     });
@@ -785,8 +785,8 @@ describe('emitTargetEvent populates target_machine_states', () => {
     o.getState().running.set('p1__fe', {
       session_id: 'x', issue, identifier: 'SYM-204', repo_alias: 'fe',
       repo_target: makeRepoTarget({ repo_alias: 'fe' }), sub_issue_id: null,
-      archon_pid: 1, archon_db_run_id: 'r1',
-      archon_workflow: '', last_archon_event: null, last_archon_timestamp: null, last_archon_message: null, recent_archon_output: [],
+      run_pid: 1, run_id: 'r1',
+      workflow: '', last_event: null, last_event_at: null, last_message: null, recent_output: [],
       claude_input_tokens: 0, claude_output_tokens: 0, claude_total_tokens: 0, turn_count: 0,
       started_at: new Date().toISOString(), attempt: null,
       cancel: () => { cancelCount++; },
@@ -841,8 +841,8 @@ describe('emitTargetEvent populates target_machine_states', () => {
     o.getState().running.set('p1__fe', {
       session_id: 'x', issue, identifier: 'SYM-202', repo_alias: 'fe',
       repo_target: makeRepoTarget({ repo_alias: 'fe' }), sub_issue_id: null,
-      archon_pid: 1, archon_db_run_id: 'r1',
-      archon_workflow: '', last_archon_event: null, last_archon_timestamp: null, last_archon_message: null, recent_archon_output: [],
+      run_pid: 1, run_id: 'r1',
+      workflow: '', last_event: null, last_event_at: null, last_message: null, recent_output: [],
       claude_input_tokens: 0, claude_output_tokens: 0, claude_total_tokens: 0, turn_count: 0,
       started_at: new Date().toISOString(), attempt: null,
     });
@@ -905,8 +905,8 @@ describe('hot path: handleGatePaused', () => {
     o.getState().running.set('p1__fe', {
       session_id: 'x', issue, identifier: 'SYM-300', repo_alias: 'fe',
       repo_target: makeRepoTarget({ repo_alias: 'fe' }), sub_issue_id: null,
-      archon_pid: 1, archon_db_run_id: 'r1',
-      archon_workflow: '', last_archon_event: null, last_archon_timestamp: null, last_archon_message: null, recent_archon_output: [],
+      run_pid: 1, run_id: 'r1',
+      workflow: '', last_event: null, last_event_at: null, last_message: null, recent_output: [],
       claude_input_tokens: 0, claude_output_tokens: 0, claude_total_tokens: 0, turn_count: 0,
       started_at: new Date().toISOString(), attempt: null,
     });
@@ -969,8 +969,8 @@ describe('hot path: handleWorkerExit failure â†’ failed (no-auto-retry poli
     o.getState().running.set('p1__fe', {
       session_id: 'x', issue, identifier: 'SYM-310', repo_alias: 'fe',
       repo_target: makeRepoTarget({ repo_alias: 'fe' }), sub_issue_id: null,
-      archon_pid: 1, archon_db_run_id: 'r1',
-      archon_workflow: '', last_archon_event: null, last_archon_timestamp: null, last_archon_message: null, recent_archon_output: [],
+      run_pid: 1, run_id: 'r1',
+      workflow: '', last_event: null, last_event_at: null, last_message: null, recent_output: [],
       claude_input_tokens: 0, claude_output_tokens: 0, claude_total_tokens: 0, turn_count: 0,
       started_at: new Date().toISOString(), attempt: null,
     });
@@ -1000,7 +1000,7 @@ describe('hot path: pollSupervisedGates timeout', () => {
   test('gate that exceeds gate_timeout_ms â†’ gate_timed_out fires; archon.rejectRun + target parked in failed', async () => {
     const issue = makeIssue({ id: 'p1', identifier: 'SYM-320' });
     const cfg = makeServiceConfig();
-    cfg.archon.gate_timeout_ms = 1000; // tiny timeout
+    cfg.executor.gate_timeout_ms = 1000; // tiny timeout
     const calls: TrackerCall[] = [];
     const archonCalls: string[] = [];
     const tracker = {
@@ -1516,7 +1516,7 @@ describe('crash recovery â€” recoverFromLinearLabels', () => {
     const ARCHON_RUN_ID = 'deadbeefdeadbeefdeadbeefdeadbeef';
     try {
       writeRunEntry(BASE, WORKER_KEY, {
-        archon_run_id: ARCHON_RUN_ID,
+        run_id: ARCHON_RUN_ID,
         parent_issue_id: 'p1',
         sub_issue_id: 'sub-be',
         repo_alias: 'trialmatch-be',
@@ -1663,7 +1663,7 @@ describe('crash recovery â€” recoverFromLinearLabels', () => {
     const WORKER_KEY = 'p1__trialmatch-be';
     const ARCHON_RUN_ID = 'cafebabecafebabecafebabecafebabe';
     writeRunEntry(BASE, WORKER_KEY, {
-      archon_run_id: ARCHON_RUN_ID,
+      run_id: ARCHON_RUN_ID,
       parent_issue_id: 'p1',
       sub_issue_id: 'sub-be',
       repo_alias: 'trialmatch-be',
@@ -1696,8 +1696,8 @@ describe('crash recovery â€” recoverFromLinearLabels', () => {
     await o.start();
 
     // The run should be tracked as a detached run (not re-queued).
-    const detached = o.getState().detached_archon_runs;
-    const found = [...detached.values()].find((d) => d.archon_run_id === ARCHON_RUN_ID);
+    const detached = o.getState().detached_runs;
+    const found = [...detached.values()].find((d) => d.run_id === ARCHON_RUN_ID);
     expect(found).toBeDefined();
     expect(found?.repo_alias).toBe('trialmatch-be');
 
@@ -1713,7 +1713,7 @@ describe('crash recovery â€” recoverFromLinearLabels', () => {
     const ARCHON_RUN_ID = 'c0ffeec0ffeec0ffeec0ffeec0ffeec0';
     try {
       writeRunEntry(BASE, WORKER_KEY, {
-        archon_run_id: ARCHON_RUN_ID,
+        run_id: ARCHON_RUN_ID,
         parent_issue_id: 'p1',
         sub_issue_id: 'sub-be',
         repo_alias: 'trialmatch-be',
@@ -1765,7 +1765,7 @@ describe('crash recovery â€” recoverFromLinearLabels', () => {
     const ARCHON_RUN_ID = 'babe1234babe1234babe1234babe1234';
     try {
       writeRunEntry(BASE, WORKER_KEY, {
-        archon_run_id: ARCHON_RUN_ID,
+        run_id: ARCHON_RUN_ID,
         parent_issue_id: 'p1',
         sub_issue_id: 'sub-be',
         repo_alias: 'trialmatch-be',
@@ -1878,8 +1878,8 @@ describe('shouldDispatchSubIssue eligibility', () => {
     const { o } = makeDispatchOrchestrator([sub]);
     o.getState().running.set('p1__trialmatch-be', {
       session_id: 'x', issue: makeIssue(), identifier: 'SYM-53', repo_alias: 'trialmatch-be',
-      repo_target: makeRepoTarget(), sub_issue_id: 'sub1', archon_pid: null, archon_db_run_id: null,
-      archon_workflow: '', last_archon_event: null, last_archon_timestamp: null, last_archon_message: null, recent_archon_output: [],
+      repo_target: makeRepoTarget(), sub_issue_id: 'sub1', run_pid: null, run_id: null,
+      workflow: '', last_event: null, last_event_at: null, last_message: null, recent_output: [],
       claude_input_tokens: 0, claude_output_tokens: 0, claude_total_tokens: 0, turn_count: 0,
       started_at: new Date().toISOString(), attempt: null,
     });
@@ -1917,8 +1917,8 @@ describe('reconcileRunningIssues â€” detached run transitions', () => {
 
     // Seed detached run (as if recovered from crash)
     const state = o.getState();
-    state.detached_archon_runs.set('p1__trialmatch-be', {
-      archon_run_id: ARCHON_RUN_ID,
+    state.detached_runs.set('p1__trialmatch-be', {
+      run_id: ARCHON_RUN_ID,
       parent_issue: parent,
       sub_issue_id: 'sub-be',
       repo_alias: 'trialmatch-be',
@@ -1931,7 +1931,7 @@ describe('reconcileRunningIssues â€” detached run transitions', () => {
     await (o as unknown as { reconcileRunningIssues(): Promise<void> }).reconcileRunningIssues();
 
     // Removed from detached map
-    expect(state.detached_archon_runs.size).toBe(0);
+    expect(state.detached_runs.size).toBe(0);
     // Marked completed in Linear
     expect(calls.some((c) => c.op === 'updateIssueState' && c.args[0] === 'sub-be' && c.args[1] === 'Done')).toBe(true);
     // Recorded as succeeded in the SM state map
@@ -1953,8 +1953,8 @@ describe('reconcileRunningIssues â€” detached run transitions', () => {
     });
 
     const state = o.getState();
-    state.detached_archon_runs.set('p1__trialmatch-be', {
-      archon_run_id: ARCHON_RUN_ID,
+    state.detached_runs.set('p1__trialmatch-be', {
+      run_id: ARCHON_RUN_ID,
       parent_issue: parent,
       sub_issue_id: 'sub-be',
       repo_alias: 'trialmatch-be',
@@ -1964,7 +1964,7 @@ describe('reconcileRunningIssues â€” detached run transitions', () => {
 
     await (o as unknown as { reconcileRunningIssues(): Promise<void> }).reconcileRunningIssues();
 
-    expect(state.detached_archon_runs.size).toBe(0);
+    expect(state.detached_runs.size).toBe(0);
     // Re-queued label applied
     expect(calls.some((c) => c.op === 'applyLabel' && c.args[0] === 'sub-be' && (c.args[1] as string).includes('queued'))).toBe(true);
   });
@@ -1979,8 +1979,8 @@ describe('reconcileRunningIssues â€” detached run transitions', () => {
     });
 
     const state = o.getState();
-    state.detached_archon_runs.set('p1__trialmatch-be', {
-      archon_run_id: 'missingmissingmissingmissing1234',
+    state.detached_runs.set('p1__trialmatch-be', {
+      run_id: 'missingmissingmissingmissing1234',
       parent_issue: parent,
       sub_issue_id: 'sub-be',
       repo_alias: 'trialmatch-be',
@@ -1990,7 +1990,7 @@ describe('reconcileRunningIssues â€” detached run transitions', () => {
 
     await (o as unknown as { reconcileRunningIssues(): Promise<void> }).reconcileRunningIssues();
 
-    expect(state.detached_archon_runs.size).toBe(0);
+    expect(state.detached_runs.size).toBe(0);
     expect(calls.some((c) => c.op === 'applyLabel' && c.args[0] === 'sub-be' && (c.args[1] as string).includes('queued'))).toBe(true);
   });
 
@@ -2009,8 +2009,8 @@ describe('reconcileRunningIssues â€” detached run transitions', () => {
     });
 
     const state = o.getState();
-    state.detached_archon_runs.set('p1__trialmatch-be', {
-      archon_run_id: ARCHON_RUN_ID,
+    state.detached_runs.set('p1__trialmatch-be', {
+      run_id: ARCHON_RUN_ID,
       parent_issue: parent,
       sub_issue_id: 'sub-be',
       repo_alias: 'trialmatch-be',
@@ -2021,7 +2021,7 @@ describe('reconcileRunningIssues â€” detached run transitions', () => {
     await (o as unknown as { reconcileRunningIssues(): Promise<void> }).reconcileRunningIssues();
 
     // Still running â€” remains in the map
-    expect(state.detached_archon_runs.size).toBe(1);
+    expect(state.detached_runs.size).toBe(1);
     expect(calls.some((c) => c.op === 'applyLabel')).toBe(false);
     expect(calls.some((c) => c.op === 'updateIssueState')).toBe(false);
   });
@@ -2054,12 +2054,12 @@ describe('maybeReleaseClaim', () => {
       repo_alias: 'repo-a',
       repo_target: makeRepoTarget(),
       sub_issue_id: null,
-      archon_pid: null,
-      archon_db_run_id: null,
-      archon_workflow: '',
-      last_archon_event: null,
-      last_archon_timestamp: null,
-      last_archon_message: null, recent_archon_output: [],
+      run_pid: null,
+      run_id: null,
+      workflow: '',
+      last_event: null,
+      last_event_at: null,
+      last_message: null, recent_output: [],
       claude_input_tokens: 0,
       claude_output_tokens: 0,
       claude_total_tokens: 0,
@@ -2096,8 +2096,8 @@ describe('reconcileRunningIssues â€” live session transitions', () => {
     state.pending_issues.set('p1', issue);
     state.running.set('p1__trialmatch-be', {
       session_id: 's1', issue, identifier: 'SYM-70', repo_alias: 'trialmatch-be',
-      repo_target: makeRepoTarget(), sub_issue_id: null, archon_pid: null, archon_db_run_id: null,
-      archon_workflow: '', last_archon_event: null, last_archon_timestamp: null, last_archon_message: null, recent_archon_output: [],
+      repo_target: makeRepoTarget(), sub_issue_id: null, run_pid: null, run_id: null,
+      workflow: '', last_event: null, last_event_at: null, last_message: null, recent_output: [],
       claude_input_tokens: 0, claude_output_tokens: 0, claude_total_tokens: 0, turn_count: 0,
       started_at: new Date().toISOString(), attempt: null,
       cancel: () => { cancelled = true; },
@@ -2123,8 +2123,8 @@ describe('reconcileRunningIssues â€” live session transitions', () => {
     let cancelled = false;
     state.running.set('p1__trialmatch-be', {
       session_id: 's1', issue, identifier: 'SYM-71', repo_alias: 'trialmatch-be',
-      repo_target: makeRepoTarget(), sub_issue_id: null, archon_pid: null, archon_db_run_id: null,
-      archon_workflow: '', last_archon_event: null, last_archon_timestamp: null, last_archon_message: null, recent_archon_output: [],
+      repo_target: makeRepoTarget(), sub_issue_id: null, run_pid: null, run_id: null,
+      workflow: '', last_event: null, last_event_at: null, last_message: null, recent_output: [],
       claude_input_tokens: 0, claude_output_tokens: 0, claude_total_tokens: 0, turn_count: 0,
       started_at: new Date().toISOString(), attempt: null,
       cancel: () => { cancelled = true; },
@@ -2382,8 +2382,8 @@ describe('reconcileRunningIssues â€” detached paused transition', () => {
     });
 
     const state = o.getState();
-    state.detached_archon_runs.set('p1__trialmatch-be', {
-      archon_run_id: ARCHON_RUN_ID,
+    state.detached_runs.set('p1__trialmatch-be', {
+      run_id: ARCHON_RUN_ID,
       parent_issue: parent,
       sub_issue_id: 'sub-be',
       repo_alias: 'trialmatch-be',
@@ -2393,7 +2393,7 @@ describe('reconcileRunningIssues â€” detached paused transition', () => {
 
     await (o as unknown as { reconcileRunningIssues(): Promise<void> }).reconcileRunningIssues();
 
-    expect(state.detached_archon_runs.size).toBe(0);
+    expect(state.detached_runs.size).toBe(0);
     const gate = state.supervised_gates.get('p1__trialmatch-be');
     expect(gate).toBeDefined();
     expect(gate?.gate_message).toContain('Please review');

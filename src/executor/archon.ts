@@ -17,7 +17,7 @@ export type ArchonEvent =
   | { type: 'archon_output'; line: string }
   | { type: 'archon_gate_paused'; run_id: string; gate_message: string; raw: string }
   /** Emitted once when Archon logs the workflowRunId — use this to correlate with the DB. */
-  | { type: 'archon_run_id'; db_run_id: string }
+  | { type: 'run_id'; db_run_id: string }
   | { type: 'archon_succeeded' }
   | { type: 'archon_failed'; exit_code: number }
   | { type: 'archon_timed_out' }
@@ -151,7 +151,7 @@ export function startArchon(opts: ExecutorOptions, onEvent: (e: ArchonEvent) => 
       const m = line.match(WORKFLOW_RUN_ID_REGEX);
       if (m?.[1]) {
         capturedDbRunId = m[1];
-        onEvent({ type: 'archon_run_id', db_run_id: capturedDbRunId });
+        onEvent({ type: 'run_id', db_run_id: capturedDbRunId });
       }
     }
 
@@ -263,7 +263,7 @@ export function approveAndResumeArchon(
       const m = line.match(WORKFLOW_RUN_ID_REGEX);
       if (m?.[1]) {
         capturedDbRunId = m[1];
-        onEvent({ type: 'archon_run_id', db_run_id: capturedDbRunId });
+        onEvent({ type: 'run_id', db_run_id: capturedDbRunId });
       }
     }
     if (capturedRunId === null) {

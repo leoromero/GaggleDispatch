@@ -147,7 +147,7 @@ export function startHubServer(opts: HubServerOptions): HubServerHandle {
             workspace_id: wsId,
             issue_id: g.issue_id,
             repo_alias: g.repo_alias,
-            archon_run_id: g.run_id,
+            run_id: g.run_id,
             action: 'paused',
             gate_message: g.gate_message,
             paused_at,
@@ -269,7 +269,7 @@ export function startHubServer(opts: HubServerOptions): HubServerHandle {
       }
       const stopMatch = req.method === 'POST' && url.pathname.match(/^\/api\/gaggles\/([^/]+)\/stop$/);
       if (stopMatch) {
-        const name = decodeURIComponent(stopMatch[1]);
+        const name = decodeURIComponent(stopMatch[1]!);
         void opts.manager.stopWorkspace(name).then(() => {
           setTimeout(broadcastGaggles, 200);
         });
@@ -277,7 +277,7 @@ export function startHubServer(opts: HubServerOptions): HubServerHandle {
       }
       const startMatch = req.method === 'POST' && url.pathname.match(/^\/api\/gaggles\/([^/]+)\/start$/);
       if (startMatch) {
-        const name = decodeURIComponent(startMatch[1]);
+        const name = decodeURIComponent(startMatch[1]!);
         const entry = opts.cfg.workspaces.find((w) => w.name === name);
         if (!entry) return Response.json({ error: 'gaggle not found' }, { status: 404 });
         void opts.manager.startWorkspace(entry).then(() => {

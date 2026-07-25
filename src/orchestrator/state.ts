@@ -13,7 +13,7 @@ export function createInitialState(cfg: ServiceConfig): OrchestratorState {
     sibling_subissues: new Map(),
     sibling_subissue_urls: new Map(),
     subissue_snapshot: new Map(),
-    detached_archon_runs: new Map(),
+    detached_runs: new Map(),
     target_machine_states: new Map(),
     parent_machine_states: new Map(),
     failed_targets: new Map(),

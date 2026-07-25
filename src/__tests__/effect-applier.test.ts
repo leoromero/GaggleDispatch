@@ -240,7 +240,7 @@ describe('EffectApplier: persistence', () => {
     const file = join(baseFolder, 'gaggle-runs.json');
     expect(existsSync(file)).toBe(true);
     const data = JSON.parse(readFileSync(file, 'utf8'));
-    expect(data.entries['p1__trialmatch-be'].archon_run_id).toBe('cafebabecafebabecafebabecafebabe');
+    expect(data.entries['p1__trialmatch-be'].run_id).toBe('cafebabecafebabecafebabecafebabe');
   });
 
   test('delete_run removes the entry', async () => {

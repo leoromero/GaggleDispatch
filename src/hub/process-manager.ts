@@ -78,6 +78,7 @@ export class HubProcessManager {
         api_port: sidecar.api_port,
         pid: sidecar.pid,
         started_at: sidecar.started_at,
+        manualStopped: false,
         last_exit_code: null,
         last_exit_at: null,
         restart_count: 0,

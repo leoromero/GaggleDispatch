@@ -30,7 +30,7 @@ export interface RunRow {
   issue_identifier: string;
   repo_alias: string;
   session_id: string | null;
-  archon_run_id: string | null;
+  run_id: string | null;
   started_at: string;
   ended_at: string | null;
   status: string;
@@ -56,7 +56,7 @@ export interface GateEventRow {
   workspace_id: number;
   issue_id: string;
   repo_alias: string;
-  archon_run_id: string | null;
+  run_id: string | null;
   action: 'paused' | 'approved' | 'rejected' | 'timed_out';
   gate_message: string | null;
   paused_at: string;
@@ -86,7 +86,7 @@ CREATE TABLE IF NOT EXISTS runs (
   issue_identifier TEXT NOT NULL,
   repo_alias      TEXT NOT NULL,
   session_id      TEXT,
-  archon_run_id   TEXT,
+  run_id   TEXT,
   started_at      TEXT NOT NULL,
   ended_at        TEXT,
   status          TEXT NOT NULL,
@@ -117,7 +117,7 @@ CREATE TABLE IF NOT EXISTS gate_events (
   workspace_id  INTEGER NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
   issue_id      TEXT NOT NULL,
   repo_alias    TEXT NOT NULL,
-  archon_run_id TEXT,
+  run_id TEXT,
   action        TEXT NOT NULL,
   gate_message  TEXT,
   paused_at     TEXT NOT NULL,
@@ -151,7 +151,7 @@ export interface RecordRunStartInput {
   issue_identifier: string;
   repo_alias: string;
   session_id?: string | null;
-  archon_run_id?: string | null;
+  run_id?: string | null;
   started_at: string;
   status?: string;
 }
@@ -172,7 +172,7 @@ export interface RecordGateInput {
   workspace_id: number;
   issue_id: string;
   repo_alias: string;
-  archon_run_id?: string | null;
+  run_id?: string | null;
   action: 'paused' | 'approved' | 'rejected' | 'timed_out';
   gate_message?: string | null;
   paused_at: string;
@@ -239,7 +239,7 @@ export class HistoryDb {
     this.db
       .query(
         `INSERT OR IGNORE INTO runs
-           (workspace_id, issue_id, issue_identifier, repo_alias, session_id, archon_run_id, started_at, status)
+           (workspace_id, issue_id, issue_identifier, repo_alias, session_id, run_id, started_at, status)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)`,
       )
       .run(
@@ -248,7 +248,7 @@ export class HistoryDb {
         input.issue_identifier,
         input.repo_alias,
         input.session_id ?? null,
-        input.archon_run_id ?? null,
+        input.run_id ?? null,
         input.started_at,
         input.status ?? 'running',
       );
@@ -355,14 +355,14 @@ export class HistoryDb {
     this.db
       .query(
         `INSERT INTO gate_events
-           (workspace_id, issue_id, repo_alias, archon_run_id, action, gate_message, paused_at, resolved_at)
+           (workspace_id, issue_id, repo_alias, run_id, action, gate_message, paused_at, resolved_at)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)`,
       )
       .run(
         input.workspace_id,
         input.issue_id,
         input.repo_alias,
-        input.archon_run_id ?? null,
+        input.run_id ?? null,
         input.action,
         input.gate_message ?? null,
         input.paused_at,

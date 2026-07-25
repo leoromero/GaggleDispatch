@@ -113,25 +113,38 @@ export interface AgentConfig {
   max_concurrent_agents_by_state: Record<string, number>;
 }
 
-export interface ArchonConfig {
-  command: string;
-  /** Base URL of the Archon HTTP API. Default: http://localhost:3090. */
-  api_url: string;
-  /** How often (ms) to poll Archon's API for run status. Default: 5 000. */
-  poll_interval_ms: number;
-  turn_timeout_ms: number;
-  stall_timeout_ms: number;
+export interface ExecutorConfig {
+  /** Postgres connection string. Defaults to `$DATABASE_URL`. */
+  database_url: string;
+  /** Workflow dispatched when a repo's gaggle.md declares none. */
   default_workflow: string;
+  /** Hard ceiling on a single run's wall-clock time. Default: 1 h. */
+  max_run_duration_ms: number;
+  /** Per-node idle timeout for AI streaming. Default: 5 min. Overridable per node. */
+  node_idle_timeout_ms: number;
+  /** Default total execution limit for `bash:` / `script:` nodes. Default: 2 min. */
+  bash_timeout_ms: number;
+  /** Informational stall threshold — no node activity for this long. 0 disables. */
+  stall_timeout_ms: number;
+  /** Auto-reject a supervised gate after this long with no human reply. 0 disables. */
   gate_timeout_ms: number;
   /**
-   * If > 0, run `archon isolation cleanup <days>` once at orchestrator
-   * startup, per registered repo. Removes Archon worktrees idle for more
-   * than N days — catches abandoned, cancelled, and orphaned ones in one
-   * sweep. The per-run `after_run` hook handles merged-branch cleanup
-   * continuously; this complements it for the long tail.
+   * If > 0, sweep worktrees idle for more than N days once at orchestrator
+   * startup, per registered repo — catching abandoned, cancelled, and orphaned
+   * ones. Worktrees backing an open PR are always preserved.
    * Set to 0 to disable. Default: 7.
    */
   startup_cleanup_age_days: number;
+  /** How often a live run refreshes its lease. Must be well under `lease_ttl_ms`. */
+  lease_heartbeat_ms: number;
+  /** A run whose lease is older than this is considered crashed and reclaimable. */
+  lease_ttl_ms: number;
+
+  // ── legacy Archon fields; removed in phase 8 with the Archon executor ────
+  /** @deprecated */ command: string;
+  /** @deprecated */ api_url: string;
+  /** @deprecated */ poll_interval_ms: number;
+  /** @deprecated */ turn_timeout_ms: number;
 }
 
 export interface ClaudeConfig {
@@ -174,7 +187,7 @@ export interface ServiceConfig {
   workspace: WorkspaceConfig;
   hooks: HooksConfig;
   agent: AgentConfig;
-  archon: ArchonConfig;
+  executor: ExecutorConfig;
   claude: ClaudeConfig;
   workflow_templates: WorkflowTemplatesConfig;
   registry: RegistryConfig;
@@ -260,7 +273,7 @@ export interface RepoTarget {
   repo_url: string;
   repo_alias: string;
   local_path: string;
-  archon_workflow: string;
+  workflow: string;
   rationale: string;
   components: string[];
   depends_on?: string[];
@@ -313,7 +326,7 @@ export interface RunAttempt {
   issue_id: string;
   issue_identifier: string;
   repo_alias: string;
-  archon_workflow: string;
+  workflow: string;
   attempt: number | null;
   checkout_path: string;
   started_at: string;
@@ -329,19 +342,19 @@ export interface LiveSession {
   repo_alias: string;
   repo_target: RepoTarget;
   sub_issue_id: string | null;
-  archon_pid: number | null;
+  run_pid: number | null;
   /** Archon DB run id captured from the `workflowRunId` log line at startup. */
-  archon_db_run_id: string | null;
-  archon_workflow: string;
-  last_archon_event: string | null;
-  last_archon_timestamp: string | null;
-  last_archon_message: string | null;
+  run_id: string | null;
+  workflow: string;
+  last_event: string | null;
+  last_event_at: string | null;
+  last_message: string | null;
   /**
    * Ring buffer of the most recent stdout/stderr lines from the Archon CLI
    * subprocess (capped). Surfaced in the worker-exit log when a worker fails
    * so the operator doesn't have to dig into Archon's own logs to see why.
    */
-  recent_archon_output: string[];
+  recent_output: string[];
   claude_input_tokens: number;
   claude_output_tokens: number;
   claude_total_tokens: number;
@@ -386,9 +399,9 @@ export interface SupervisedGateEntry {
  * We cannot re-attach to its stdout/stderr, so we track it here and poll
  * `archon workflow status` periodically to detect completion.
  */
-export interface DetachedArchonRun {
+export interface DetachedRun {
   /** Archon database run id (hex string from `archon workflow status --json`). */
-  archon_run_id: string;
+  run_id: string;
   parent_issue: Issue;
   sub_issue_id: string | null;
   repo_alias: string;
@@ -413,7 +426,7 @@ export interface OrchestratorState {
    * Sub-issues whose Archon process was found still alive at startup recovery.
    * Keyed by workerKey (parentId__repoAlias). Polled each reconcile tick.
    */
-  detached_archon_runs: Map<string, DetachedArchonRun>;
+  detached_runs: Map<string, DetachedRun>;
   /**
    * Per-target state machine state, keyed by workerKey. Updated after every
    * targetTransition call via Orchestrator.emitTargetEvent. Phase 5 will
@@ -440,7 +453,7 @@ export interface ScaffoldJob {
   slug: string;
   url: string;
   checkout_path: string;
-  archon_run_id: string | null;
+  run_id: string | null;
   workflow_name: string;
   branch: string;
   started_at: string;

@@ -49,7 +49,7 @@ export function buildGaggleEnv(args: {
     GAGGLE_ISSUE_URL: issue.url ?? '',
     GAGGLE_REPO_ALIAS: repo_target.repo_alias,
     GAGGLE_REPO_URL: repo_target.repo_url,
-    GAGGLE_ARCHON_WORKFLOW: repo_target.archon_workflow,
+    GAGGLE_WORKFLOW: repo_target.workflow,
     GAGGLE_ATTEMPT: attempt === null ? 'first' : String(attempt),
     GAGGLE_ANALYSIS_SUMMARY: analysis.analysis_summary,
   };

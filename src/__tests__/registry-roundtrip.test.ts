@@ -89,7 +89,7 @@ describe('scaffold-jobs round-trip', () => {
       slug: 'repo',
       url: 'https://github.com/o/repo',
       checkout_path: '/tmp/checkouts/repo',
-      archon_run_id: null,
+      run_id: null,
       workflow_name: 'gaggle/gaggle-scaffold',
       branch: 'main',
       started_at: '2026-05-09T00:00:00Z',
@@ -109,11 +109,11 @@ describe('scaffold-jobs round-trip', () => {
   test('write then load preserves all fields', () => {
     const dir = tmp();
     mkdirSync(dir, { recursive: true });
-    const j = job({ last_status: 'completed', archon_run_id: 'r-1', pr_url: 'https://github.com/x/y/pull/1' });
+    const j = job({ last_status: 'completed', run_id: 'r-1', pr_url: 'https://github.com/x/y/pull/1' });
     writeScaffoldJobs(dir, { jobs: [j] });
     const loaded = loadScaffoldJobs(dir);
     expect(loaded.jobs.length).toBe(1);
-    expect(loaded.jobs[0]!.archon_run_id).toBe('r-1');
+    expect(loaded.jobs[0]!.run_id).toBe('r-1');
     expect(loaded.jobs[0]!.last_status).toBe('completed');
     expect(loaded.jobs[0]!.pr_url).toBe('https://github.com/x/y/pull/1');
   });

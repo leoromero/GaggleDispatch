@@ -9,7 +9,7 @@ import { dirname, isAbsolute, join, resolve } from 'node:path';
 import { ConfigValidationError } from '../domain/errors.ts';
 import { applyEnvFile } from '../util/env-file.ts';
 import type {
-  ArchonConfig,
+  ExecutorConfig,
   AgentConfig,
   AuthConfig,
   ClaudeConfig,
@@ -257,17 +257,32 @@ export function buildServiceConfig(def: WorkflowDefinition): ServiceConfig {
     max_concurrent_agents_by_state,
   };
 
-  // ── archon ───────────────────────────────────────────────────────────────
-  const archonRaw = asObject(root.archon, 'archon');
-  const archon: ArchonConfig = {
-    command: asString(archonRaw.command, 'archon.command', 'archon workflow run'),
-    api_url: asString(archonRaw.api_url, 'archon.api_url', 'http://localhost:3090'),
-    poll_interval_ms: asPositiveInt(archonRaw.poll_interval_ms, 'archon.poll_interval_ms', 5_000),
-    turn_timeout_ms: asPositiveInt(archonRaw.turn_timeout_ms, 'archon.turn_timeout_ms', 3_600_000),
-    stall_timeout_ms: asInt(archonRaw.stall_timeout_ms, 'archon.stall_timeout_ms', 300_000),
-    default_workflow: asString(archonRaw.default_workflow, 'archon.default_workflow', 'gaggle/gaggle-fix-issue'),
-    gate_timeout_ms: asInt(archonRaw.gate_timeout_ms, 'archon.gate_timeout_ms', 0),
-    startup_cleanup_age_days: asInt(archonRaw.startup_cleanup_age_days, 'archon.startup_cleanup_age_days', 7),
+  // ── executor ─────────────────────────────────────────────────────────────
+  if (root.archon !== undefined) {
+    throw new ConfigValidationError(
+      'The `archon:` config block was removed. Rename it to `executor:` — GaggleDispatch now runs workflows itself.',
+    );
+  }
+  const execRaw = asObject(root.executor, 'executor');
+  const executor: ExecutorConfig = {
+    database_url: resolveSecretOrLiteral(
+      asOptionalString(execRaw.database_url, 'executor.database_url') ?? '$DATABASE_URL',
+    ),
+    // ── legacy Archon fields; removed in phase 8 with the Archon executor ──
+    command: asString(execRaw.command, 'executor.command', 'archon workflow run'),
+    api_url: asString(execRaw.api_url, 'executor.api_url', 'http://localhost:3090'),
+    poll_interval_ms: asPositiveInt(execRaw.poll_interval_ms, 'executor.poll_interval_ms', 5_000),
+    turn_timeout_ms: asPositiveInt(execRaw.turn_timeout_ms, 'executor.turn_timeout_ms', 3_600_000),
+    default_workflow: asString(execRaw.default_workflow, 'executor.default_workflow', 'gaggle/gaggle-fix-issue'),
+    max_run_duration_ms: asPositiveInt(execRaw.max_run_duration_ms, 'executor.max_run_duration_ms', 3_600_000),
+    node_idle_timeout_ms: asPositiveInt(execRaw.node_idle_timeout_ms, 'executor.node_idle_timeout_ms', 300_000),
+    bash_timeout_ms: asPositiveInt(execRaw.bash_timeout_ms, 'executor.bash_timeout_ms', 120_000),
+    stall_timeout_ms: asInt(execRaw.stall_timeout_ms, 'executor.stall_timeout_ms', 300_000),
+    gate_timeout_ms: asInt(execRaw.gate_timeout_ms, 'executor.gate_timeout_ms', 0),
+    startup_cleanup_age_days: asInt(execRaw.startup_cleanup_age_days, 'executor.startup_cleanup_age_days', 7),
+    /** Heartbeat cadence for the run lease. Must be well under the lease TTL. */
+    lease_heartbeat_ms: asPositiveInt(execRaw.lease_heartbeat_ms, 'executor.lease_heartbeat_ms', 15_000),
+    lease_ttl_ms: asPositiveInt(execRaw.lease_ttl_ms, 'executor.lease_ttl_ms', 60_000),
   };
 
   // ── claude ───────────────────────────────────────────────────────────────
@@ -362,7 +377,7 @@ export function buildServiceConfig(def: WorkflowDefinition): ServiceConfig {
     workspace,
     hooks,
     agent,
-    archon,
+    executor,
     claude,
     workflow_templates,
     registry,

@@ -187,11 +187,12 @@ export async function runInit(opts: { cwd?: string }): Promise<void> {
       max_turns: 30,
       max_retry_backoff_ms: 600_000,
     },
-    archon: {
-      command: 'archon workflow run',
-      turn_timeout_ms: 7_200_000,
-      stall_timeout_ms: 600_000,
+    executor: {
+      database_url: '$DATABASE_URL',
       default_workflow: defaultWorkflow,
+      max_run_duration_ms: 7_200_000,
+      node_idle_timeout_ms: 600_000,
+      stall_timeout_ms: 600_000,
       gate_timeout_ms: 86_400_000,
     },
     workflow_templates: {

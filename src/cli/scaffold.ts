@@ -83,7 +83,7 @@ export async function runRepoScaffold(args: ScaffoldArgs): Promise<void> {
   const existing = jobsBefore.jobs.find((j) => j.slug === slug);
   if (args.async && existing && (existing.last_status === 'running' || existing.last_status === 'paused' || existing.last_status === 'pending')) {
     fatal(
-      `A scaffold job is already running for ${slug} (status: ${existing.last_status}, run-id ${existing.archon_run_id ?? '?'}).\n  Run 'gaggle scaffold status' to inspect, or 'gaggle scaffold cancel ${slug}' to clear it.`,
+      `A scaffold job is already running for ${slug} (status: ${existing.last_status}, run-id ${existing.run_id ?? '?'}).\n  Run 'gaggle scaffold status' to inspect, or 'gaggle scaffold cancel ${slug}' to clear it.`,
     );
   }
 
@@ -96,7 +96,7 @@ export async function runRepoScaffold(args: ScaffoldArgs): Promise<void> {
     info(`Synced ${copied} workflow template(s) to ${targetDir}`);
   }
 
-  const archonArgs = parseArchonCmd(cfg.archon.command, DEFAULT_SCAFFOLD_WORKFLOW, checkout, message);
+  const archonArgs = parseArchonCmd(cfg.executor.command, DEFAULT_SCAFFOLD_WORKFLOW, checkout, message);
 
   if (args.async) {
     const proc = Bun.spawn(archonArgs, {
@@ -110,7 +110,7 @@ export async function runRepoScaffold(args: ScaffoldArgs): Promise<void> {
       slug,
       url: args.url,
       checkout_path: checkout,
-      archon_run_id: null,
+      run_id: null,
       workflow_name: DEFAULT_SCAFFOLD_WORKFLOW,
       branch,
       started_at: new Date().toISOString(),
@@ -161,7 +161,7 @@ export async function runScaffoldStatus(opts: { cwd?: string; json?: boolean; re
   // Single global call: archon workflow status --json
   let archonRuns: Array<{ id: string; working_path?: string; workflow_name?: string; status?: string; started_at?: string }> = [];
   try {
-    const tokens = tokenizeCmd(cfg.archon.command);
+    const tokens = tokenizeCmd(cfg.executor.command);
     const argv = [...tokens.slice(0, -1), 'status', '--json'];
     const r = await run(argv);
     if (r.exitCode === 0 && r.stdout.trim()) {
@@ -184,7 +184,7 @@ export async function runScaffoldStatus(opts: { cwd?: string; json?: boolean; re
       const next = { ...job };
       next.last_polled_at = new Date().toISOString();
 
-      if (next.archon_run_id === null) {
+      if (next.run_id === null) {
         const candidates = archonRuns.filter(
           (r) =>
             r.working_path === job.checkout_path &&
@@ -192,17 +192,17 @@ export async function runScaffoldStatus(opts: { cwd?: string; json?: boolean; re
             (!r.started_at || Date.parse(r.started_at) >= Date.parse(job.started_at) - 5_000),
         );
         if (candidates.length === 1) {
-          next.archon_run_id = candidates[0]!.id;
+          next.run_id = candidates[0]!.id;
         } else if (candidates.length > 1) {
           const sorted = candidates.sort((a, b) => Date.parse(b.started_at ?? '') - Date.parse(a.started_at ?? ''));
-          next.archon_run_id = sorted[0]!.id;
+          next.run_id = sorted[0]!.id;
         } else if (Date.now() - Date.parse(job.started_at) > 30_000) {
           next.last_status = 'unknown';
         }
       }
 
-      if (next.archon_run_id) {
-        const live = archonRuns.find((r) => r.id === next.archon_run_id);
+      if (next.run_id) {
+        const live = archonRuns.find((r) => r.id === next.run_id);
         if (live) {
           next.last_status = (live.status as ScaffoldJob['last_status']) ?? next.last_status;
         } else {
@@ -231,7 +231,7 @@ export async function runScaffoldStatus(opts: { cwd?: string; json?: boolean; re
   console.log(chalk.bold('SLUG'.padEnd(30) + 'STATUS'.padEnd(12) + 'RUN ID'.padEnd(14) + 'AGE'.padEnd(8) + 'PR URL'));
   for (const j of jobs.jobs) {
     const age = ageFromIso(j.started_at);
-    const runId = j.archon_run_id ? j.archon_run_id.slice(0, 8) : '—';
+    const runId = j.run_id ? j.run_id.slice(0, 8) : '—';
     console.log(j.slug.padEnd(30) + j.last_status.padEnd(12) + runId.padEnd(14) + age.padEnd(8) + (j.pr_url ?? '—'));
   }
 }
@@ -244,10 +244,10 @@ export async function runScaffoldCancel(args: { slug: string; cwd?: string }): P
     const jobs = loadScaffoldJobs(baseFolder);
     const job = jobs.jobs.find((j) => j.slug === args.slug);
     if (!job) fatal(`No scaffold job for slug '${args.slug}'.`);
-    if (job!.archon_run_id) {
+    if (job!.run_id) {
       try {
-        await new ArchonClient(cfg.archon.api_url).abandonRun(job!.archon_run_id);
-        info(`Sent abandon to Archon run ${job!.archon_run_id}.`);
+        await new ArchonClient(cfg.executor.api_url).abandonRun(job!.run_id);
+        info(`Sent abandon to Archon run ${job!.run_id}.`);
       } catch (err) {
         console.log(chalk.yellow(`  Could not abandon run: ${(err as Error).message}`));
       }
