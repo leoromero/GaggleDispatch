@@ -391,8 +391,8 @@ describe('the shipped workflow templates', () => {
     });
   }
 
-  test('the .archon workflow in this repo still loads', () => {
-    const res = loadWorkflowFile('.archon/workflows/generate-gaggle-md.yaml');
+  test('the generate-gaggle-md workflow in this repo loads', () => {
+    const res = loadWorkflowFile('.gaggle/workflows/generate-gaggle-md.yaml');
     expect(res.workflow.name).toBe('generate-gaggle-md');
     expect(validateWorkflow(res.workflow).ok).toBe(true);
   });
