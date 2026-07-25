@@ -160,7 +160,7 @@ Connect external tool servers to individual nodes.
 ```yaml
 - id: github-analysis
   prompt: "Analyze recent PRs using GitHub MCP tools"
-  mcp: .archon/mcp/github.json          # Path relative to repo root
+  mcp: .gaggle/mcp/github.json          # Path relative to repo root
   allowed_tools: []                      # MCP-only mode (no built-in tools)
 ```
 
@@ -231,7 +231,7 @@ Combine `mcp:` with `allowed_tools: []` for nodes that should ONLY use MCP tools
 ```yaml
 - id: notify
   prompt: "Send a notification that the workflow completed"
-  mcp: .archon/mcp/ntfy.json
+  mcp: .gaggle/mcp/ntfy.json
   allowed_tools: []                    # No built-in tools, MCP only
 ```
 
@@ -284,7 +284,7 @@ Skills provide **knowledge** (how to do something). MCP provides **capability** 
   prompt: "Triage these issues using GitHub best practices"
   skills:
     - github-triage-guide
-  mcp: .archon/mcp/github.json
+  mcp: .gaggle/mcp/github.json
   allowed_tools: []                    # MCP tools + skill knowledge
 ```
 

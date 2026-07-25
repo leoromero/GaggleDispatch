@@ -25,7 +25,7 @@ interface KeyDef {
 
 // ANTHROPIC_API_KEY is intentionally omitted — Claude Code manages Anthropic
 // auth through its own credential store. GaggleDispatch inherits it from the
-// Claude Code session the same way Archon does.
+// Claude Code session.
 const KEYS: KeyDef[] = [
   {
     envVar: 'LINEAR_API_KEY',

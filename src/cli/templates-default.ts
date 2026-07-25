@@ -1,5 +1,5 @@
 ﻿/**
- * Writes a starter set of Symphony-managed Archon workflow YAML files into
+ * Writes a starter set of Symphony-managed workflow YAML files into
  * `workflow_templates/` next to WORKFLOW.md. Used by `gaggle init`.
  */
 
@@ -177,7 +177,7 @@ nodes:
   # ═══════════════════════════════════════════════════════════════
 
   - id: validate-script
-    # 30 min — Archon's default 120s isn't enough for real test suites
+    # 30 min — the 120s default isn't enough for real test suites
     # (TS build + unit tests + E2E commonly exceed it). Tune per repo.
     timeout: 1800000
     bash: |
@@ -734,7 +734,7 @@ nodes:
 
   # ═══════════════════════════════════════════════════════════════
   # PHASE 3: PLAN APPROVAL GATE
-  # Human sees the plan summary in the gate comment and in Archon output.
+  # Human sees the plan summary in the gate comment and in the run output.
   # Reply "approve" (or any positive response) to start implementation.
   # Reply "reject" with your feedback to receive a revised plan — up to 3 cycles.
   # ═══════════════════════════════════════════════════════════════
@@ -749,7 +749,7 @@ nodes:
 
         ---
 
-        The full implementation plan is in the Archon run output above.
+        The full implementation plan is in the run output above.
 
         - **approve** (optionally with answers to any questions above) — starts implementation immediately
         - **reject: <your feedback>** — triggers a revised plan addressing your concerns
@@ -816,7 +816,7 @@ nodes:
   # ═══════════════════════════════════════════════════════════════
 
   - id: validate-script
-    # 30 min — Archon's default 120s isn't enough for real test suites
+    # 30 min — the 120s default isn't enough for real test suites
     # (TS build + unit tests + E2E commonly exceed it). Tune per repo.
     timeout: 1800000
     bash: |

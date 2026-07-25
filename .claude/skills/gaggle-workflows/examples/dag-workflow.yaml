@@ -9,7 +9,7 @@
 # dependencies, and configuration should match what the user requests.
 #
 # Run with:
-#   archon workflow run smart-issue-fix --branch fix/issue-42 "Fix issue #42"
+#   gaggle workflow run smart-issue-fix --branch fix/issue-42 "Fix issue #42"
 
 name: smart-issue-fix
 description: |
@@ -87,7 +87,7 @@ nodes:
           enum: [low, medium, high, critical]
       required: [issue_type, title]
 
-  # ── COMMAND NODE: Loads .archon/commands/<name>.md ──
+  # ── COMMAND NODE: Loads .gaggle/commands/<name>.md ──
   - id: investigate
     command: investigate-bug
     depends_on: [classify]

@@ -142,10 +142,6 @@ export function makeServiceConfig(overrides: Partial<ServiceConfig> = {}): Servi
       startup_cleanup_age_days: 0,
       lease_heartbeat_ms: 15_000,
       lease_ttl_ms: 60_000,
-      command: 'archon workflow run',
-      api_url: 'http://localhost:3090',
-      poll_interval_ms: 5_000,
-      turn_timeout_ms: 60_000,
     },
     claude: {
       api_key: '',

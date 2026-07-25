@@ -8,7 +8,7 @@ one in parallel. It handles cross-repo dependency ordering, supervised human-app
 crash recovery. It never writes code itself.
 
 > Built on the [Symphony specification](SPEC_SYMPHONY.md) · Extended for multi-repo federation  
-> Default stack: **Linear** (tracker) · **Claude** (analyzer) · **Archon** (executor) — each is
+> Default stack: **Linear** (tracker) · **Claude** (analyzer + workflow engine) · **Postgres** (run state) — each is
 > swappable behind a clean interface.
 
 ### What you get
@@ -21,7 +21,7 @@ crash recovery. It never writes code itself.
   agent loops. You know exactly which phases run, in what order, with human-approval gates at
   defined checkpoints.
 - **Pluggable adapters** — tracker, AI model, and workflow executor are each defined by a narrow
-  interface. Swap Linear for Jira, Claude for another model, or Archon for your own runner without
+  interface. Swap Linear for Jira, or Claude for another model, without
   touching the orchestration core.
 
 ## How it works
@@ -38,7 +38,7 @@ You don't write `gaggle.md` by hand. Run:
 gaggle repo scaffold https://github.com/myorg/my-service
 ```
 
-Archon launches a Claude agent that reads the repo's source code, maps its components and
+A workflow launches a Claude agent that reads the repo's source code, maps its components and
 integrations, and opens a draft PR with the generated `gaggle.md`. Once merged, GaggleDispatch
 syncs it automatically. Every subsequent issue is routed using that living document.
 
@@ -62,12 +62,12 @@ syncs it automatically. Every subsequent issue is routed using that living docum
                           │              │             │             │       │
                           └──────────────┼─────────────┼─────────────┼───────┘
                                          │             │             │
-                            archon workflow run         │             │
+                              workflow engine           │             │
                                          │        (blocked until     │
                                          │         repo-a merged)    │
                                          ▼                           ▼
                                  ┌──────────────┐           ┌──────────────┐
-                                 │   Archon     │           │   Archon     │
+                                 │  workflow    │           │  workflow    │
                                  │  DAG workflow│           │  DAG workflow│
                                  │  (YAML-decl) │           │  (YAML-decl) │
                                  │  classify    │           │  classify    │
@@ -94,16 +94,16 @@ database. GaggleDispatch persists no scheduler state to disk — Linear labels (
 `gaggle:running`, `gaggle:waiting-human`) are the durable record. On crash or restart,
 GaggleDispatch reads those labels and reconstructs exactly where it left off.
 
-## The Archon connection
+## The workflow engine
 
-[Archon](https://github.com/coleam00/Archon) is the workflow executor GaggleDispatch dispatches
-to. Rather than giving Claude an open-ended chat loop and hoping for the best, Archon runs
+GaggleDispatch runs workflows itself, in-process. Rather than giving Claude an open-ended chat
+loop and hoping for the best, the engine runs
 **YAML-declared DAG workflows** — directed acyclic graphs where each node is an explicit phase
 with defined inputs, outputs, tools, and conditions.
 
 This is what "deterministic AI execution" means in practice:
 
-| Free-form agent loop | Archon DAG workflow |
+| Free-form agent loop | DAG workflow |
 |---|---|
 | LLM decides what to do next | Control flow declared in YAML |
 | Any tool at any time | Per-node `allowed_tools` restrictions |
@@ -149,11 +149,11 @@ A minimal example from GaggleDispatch's default workflow:
 
 # partial example — see workflow_templates/ for full workflows
 
-GaggleDispatch bridges Archon with the tracker on two critical events:
+GaggleDispatch bridges the workflow engine with the tracker on two critical events:
 
 - **Approval gates** — when a workflow hits an `approval` node, GaggleDispatch frees the
   concurrency slot, posts the gate message as a tracker comment, and polls for a human reply.
-  `approve` or `reject` resumes the workflow via the Archon API.
+  `approve` or `reject` records the decision and resumes the run in one step.
 - **Cross-repo blockers** — if an agent cannot complete work without a change in another
   repository, it writes a `blocker-request.md` and exits; GaggleDispatch handles the rest
   (see [Agent-driven blocker creation](#agent-driven-blocker-creation) below).
@@ -172,7 +172,7 @@ covered — and extends it in four meaningful ways:
 
 The original Symphony spec targets a single repository per issue. GaggleDispatch removes that
 limit. The Issue Analyzer reads every registered repo's `gaggle.md` and returns multiple
-`repo_targets` — one Archon session per repo, dispatched in parallel.
+`repo_targets` — one workflow run per repo, dispatched in parallel.
 
 Dependency ordering is declared by the analyzer, not hardcoded. `ready_when` values
 (`merged`, `deployed`, `deployed:prod`) refer to Linear labels posted by your CI/CD
@@ -199,7 +199,7 @@ and comments, giving the team full per-repo visibility without manual triage.
 
 ### Agent-driven blocker creation
 
-If an Archon agent discovers mid-implementation that it needs a change in another repository, it
+If an agent discovers mid-implementation that it needs a change in another repository, it
 writes a `blocker-request.md` with a title and description, then exits. GaggleDispatch detects
 the file, creates the upstream issue in the tracker, marks the current issue as blocked, and
 restarts implementation automatically once the blocker is resolved. The agent never needs to know
@@ -233,7 +233,7 @@ Then say: **"Set up GaggleDispatch"**
 The wizard walks through: CLI installation, API key configuration, `WORKFLOW.md` initialization, registering repositories, syncing repos, and scaffolding missing `gaggle.md` files.
 
 <details>
-<summary><b>Prerequisites</b> — Bun, git, GitHub CLI, and Archon</summary>
+<summary><b>Prerequisites</b> — Bun, git, Git Bash, GitHub CLI, and Postgres</summary>
 
 **Bun** — [bun.sh](https://bun.sh)
 
@@ -270,17 +270,20 @@ curl -fsSL https://claude.ai/install.sh | bash
 irm https://claude.ai/install.ps1 | iex
 ```
 
-**Archon CLI** — [archon.diy](https://archon.diy)
+**PostgreSQL** — the engine records every run, node, and gate here, which is what
+makes a run resumable after a crash or a gate that waits overnight.
 
 ```bash
-# macOS/Linux
-curl -fsSL https://archon.diy/install | bash
-
-# Windows (PowerShell)
-irm https://archon.diy/install.ps1 | iex
+docker compose up -d
+export DATABASE_URL=postgres://gaggle:gaggle@localhost:55432/gaggle
 ```
 
-Then verify: `archon version`
+Any reachable Postgres 16+ works; point `DATABASE_URL` at it instead.
+
+**Git Bash (Windows only)** — workflow `bash:` nodes are POSIX scripts. Install
+Git for Windows, or point `GAGGLE_BASH` at a bash executable.
+
+Then verify everything with: `gaggle doctor`
 
 **Linear API key** — Linear → Settings → API → Personal API keys
 
@@ -313,7 +316,7 @@ gaggle repo add https://github.com/myorg/shared-auth-lib
 # 4. Sync — clones repos, parses each repo's gaggle.md, builds the synced registry.
 gaggle sync
 
-# 5. For repos missing a gaggle.md, scaffold one via Archon (opens a draft PR).
+# 5. For repos missing a gaggle.md, scaffold one (opens a draft PR).
 gaggle repo scaffold https://github.com/myorg/shared-auth-lib
 
 # 6. Inspect what GaggleDispatch sees.
@@ -333,7 +336,7 @@ gaggle start
 | `gaggle repo add <url>` | Register a repository in the Source Registry |
 | `gaggle repo remove <url\|slug>` | Deregister a repository (preserves local checkout) |
 | `gaggle repo list [--json]` | List registered repos with sync status |
-| `gaggle repo scaffold <url> [--async]` | Generate a draft `gaggle.md` PR via Archon |
+| `gaggle repo scaffold <url> [--async]` | Generate a draft `gaggle.md` PR |
 | `gaggle scaffold status [--json] [--refresh-pr]` | Refresh and list scaffold jobs |
 | `gaggle scaffold cancel <slug>` | Abandon a scaffold job |
 | `gaggle sync [--repo <slug>] [--quiet]` | Run a single Repo Syncer pass |
@@ -449,12 +452,14 @@ agent:
   max_concurrent_agents: 8
   max_retry_backoff_ms: 600000
 
-archon:
-  command: archon workflow run
-  turn_timeout_ms: 7200000
-  stall_timeout_ms: 600000
+executor:
+  database_url: $DATABASE_URL          # Postgres; run state, nodes, gates, worktrees
   default_workflow: gaggle/gaggle-fix-issue
-  gate_timeout_ms: 86400000               # 24h auto-reject for stale gates
+  max_run_duration_ms: 7200000         # hard ceiling on one run
+  node_idle_timeout_ms: 600000         # per-node idle timeout for AI streaming
+  bash_timeout_ms: 120000              # default total limit for bash:/script: nodes
+  gate_timeout_ms: 86400000            # auto-reject a gate after this long (0 disables)
+  startup_cleanup_age_days: 7          # sweep idle worktrees on boot (0 disables)
 
 claude:
   api_key: $ANTHROPIC_API_KEY
@@ -462,7 +467,7 @@ claude:
 
 workflow_templates:
   path: workflow_templates/               # local, version-controlled with WORKFLOW.md
-  target_subdir: gaggle                   # synced into <repo>/.archon/workflows/gaggle/
+  target_subdir: gaggle                   # synced into <repo>/.gaggle/workflows/gaggle/
 
 registry:
   base_folder: $GAGGLE_BASE_FOLDER        # MUST be outside this project directory
@@ -480,7 +485,7 @@ See `SPEC_SYMPHONY.md` Section 6.4 for additional fields and defaults not shown 
 
 ## Workflow templates
 
-GaggleDispatch is the **single source of truth** for Archon workflow YAML files. Edit a file once in `workflow_templates/` and it propagates to every registered repo's `.archon/workflows/gaggle/` on the next dispatch.
+GaggleDispatch is the **single source of truth** for workflow YAML files. Edit a file once in `workflow_templates/` and it propagates to every registered repo's `.gaggle/workflows/gaggle/` on the next dispatch.
 
 Default templates created by `gaggle init`:
 
@@ -501,15 +506,15 @@ available_workflows:
 
 When a workflow pauses at an `approval` node:
 
-1. GaggleDispatch detects the pause from Archon stderr (capturing the run-id UUID).
+1. The engine pauses the run at the gate and persists the resolved gate message.
 2. Worker moves from `running` → `supervised_gates`. **The concurrency slot is freed** — a paused process consumes no slot.
 3. The gate message is posted as a tracker comment on the (sub-)issue.
 4. The `gaggle:waiting-human` label is applied; if `tracker.gate_waiting_state` is configured, the issue is moved to that parked lane.
 5. GaggleDispatch polls `fetch_issue_comments` every tick. When a human replies with `approve|approved|yes|y|lgtm` or `reject|rejected|no|n|cancel`, GaggleDispatch:
    - Removes `gaggle:waiting-human` and restores the active state.
-   - Calls `archon workflow approve <run-id> --comment "<reply>"` (or `reject ... --reason ...`).
+   - Records the decision and resumes the run, preserving the reply for downstream nodes.
    - Worker resumes with the human reply injected into the next loop iteration.
-6. If `archon.gate_timeout_ms > 0`, gates auto-reject after the timeout.
+6. If `executor.gate_timeout_ms > 0`, gates auto-reject after the timeout.
 
 ## Project layout
 
@@ -520,7 +525,7 @@ GaggleDispatch/
 │   ├── cli/               # All CLI commands (setup, init, repo, sync, status, start, scaffold)
 │   ├── config/            # WORKFLOW.md loader, service-config builder, file watcher
 │   ├── domain/            # Types, errors
-│   ├── executor/          # Archon subprocess executor (gate detection, stall, timeout)
+│   ├── executor/          # the workflow engine: loader, planner, nodes, store, recovery
 │   ├── hub/               # Multi-workspace hub server, dashboard, SQLite history
 │   ├── orchestrator/      # Tick loop, state machine, fan-out, retry, reconciliation
 │   ├── registry/          # Synced registry I/O, Repo Syncer, gaggle.md parser, scaffold-jobs
@@ -550,7 +555,7 @@ bun run cli -- --help
 | `smoke.test.ts`                    | Config loader, `gaggle.md` parser, name-collision detection, util helpers, readiness predicate, issue-message construction, orchestrator state init |
 | `linear.test.ts`                   | `LinearClient` with `globalThis.fetch` stubbed: viewer/team/state/label resolution, all 10 mutations, GraphQL error propagation, label caching, `ensureGaggleLabels` |
 | `analyzer.test.ts`                 | `IssueAnalyzer` with an injected fake `AnalyzerClient`: clean JSON, ```-fenced JSON, prose-surrounded JSON, alias-only reconciliation, `depends_on` + `ready_when` preservation, alias mismatch dropping, zero-targets failure, malformed-JSON failure, model/max_tokens propagation, SDK-error wrapping, fallback workflow, alias sanitization |
-| `executor.test.ts`                 | `RUN_ID_REGEX`, `PAUSE_REGEX`, `detectGatePause`, `tokenizeArchonCommand` (quoting), `buildArchonRunArgv` |
+| `engine.test.ts`                   | End-to-end workflow execution: routing, gates, loops, retries, resume, dry-run |
 | `orchestrator-helpers.test.ts`     | `classifyApprovalIntent` approve/reject/ambiguous, `findHumanReplyAfter` bot/anonymous filtering and timestamp ordering |
 | `orchestrator.test.ts`             | Full-cycle with fakes: `ensureGaggleLabels` on start, `resolveViewerId` opt-in, label-driven recovery (claimed parents + `[alias]`-prefixed running sub-issues), analysis-cache invalidation on registry change, `stop()` cancels every `LiveSession` |
 | `registry-roundtrip.test.ts`       | `registry.synced.yaml` write→load round-trip with all `SyncStatus` values, banner emission, malformed/empty YAML errors; `scaffold_jobs.yaml` round-trip, `upsertJob`/`removeJobBySlug` purity, `loadScaffoldJobs` graceful malformed handling |
@@ -568,7 +573,7 @@ This implementation targets the REQUIRED items in `SPEC_SYMPHONY.md` Section 19.
 - ✅ Issue Analyzer (Claude with full RegistryContext)
 - ✅ Multi-repo incremental fan-out via `pending_targets`
 - ✅ Sibling readiness predicate (`depends_on` + `ready_when`)
-- ✅ Gate-pause detection from Archon stderr; slot-freeing supervised_gates
+- ✅ Exact gate-pause events from the engine; slot-freeing supervised_gates
 - ✅ Gate state-transition support (`gate_waiting_state` / `gate_resume_state`)
 - ✅ Linear adapter — all 10 operations
 - ✅ Sub-issue creation on fan-out > 1

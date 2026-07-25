@@ -81,18 +81,6 @@ export class InvalidWorkspaceCwd extends GaggleError {
   }
 }
 
-export class ArchonNotFound extends GaggleError {
-  constructor() {
-    super('archon_not_found', 'archon CLI not found in PATH');
-  }
-}
-
-export class ArchonExitNonZero extends GaggleError {
-  constructor(code: number) {
-    super('archon_exit_nonzero', `Archon process exited with code ${code}`);
-  }
-}
-
 export class ConfigValidationError extends GaggleError {
   constructor(message: string) {
     super('config_validation_error', message);

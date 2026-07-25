@@ -15,7 +15,6 @@ import {
 } from '../hub/config.ts';
 import { HubProcessManager, resolveCliEntry } from '../hub/process-manager.ts';
 import { startHubServer } from '../hub/server.ts';
-import { ArchonSupervisor } from '../hub/archon-supervisor.ts';
 import { logger } from '../util/logger.ts';
 import { readSidecar, isPidAlive } from '../hub/sidecar.ts';
 
@@ -134,25 +133,9 @@ export async function runNestStart(opts: { only?: string[] }): Promise<void> {
     await manager.startWorkspace(w);
   }
 
-  // Archon supervisor: detect / adopt / spawn as configured.
-  const archon = new ArchonSupervisor(cfg.archon);
-  await archon.start();
-  const archonState = archon.getState();
-  if (archonState.status === 'running') {
-    console.log(
-      chalk.green(
-        `✓ Archon UI at ${archonState.ui_url}${archonState.spawned_by_hub ? ' (spawned)' : ' (adopted)'}`,
-      ),
-    );
-  } else if (archonState.status === 'disabled') {
-    console.log(chalk.dim(`Archon autostart disabled; deep-links will be inactive`));
-  } else {
-    console.log(chalk.yellow(`Archon unreachable at ${archonState.ui_url}; continuing`));
-  }
-
   // Start hub server.
   const dashboardDir = resolveDashboardDir();
-  const hub = startHubServer({ cfg, manager, archon, dashboardDir });
+  const hub = startHubServer({ cfg, manager, dashboardDir });
   console.log(chalk.green(`✓ Nest dashboard at ${hub.url}`));
 
   let shuttingDown = false;
@@ -164,11 +147,6 @@ export async function runNestStart(opts: { only?: string[] }): Promise<void> {
       await hub.stop();
     } catch (e) {
       logger.warn('Hub stop error', { error: (e as Error).message });
-    }
-    try {
-      await archon.stop();
-    } catch (e) {
-      logger.warn('Archon supervisor stop error', { error: (e as Error).message });
     }
     try {
       await manager.stopAll();

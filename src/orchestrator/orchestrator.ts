@@ -23,13 +23,14 @@ import { LinearClient } from '../tracker/linear.ts';
 import { IssueAnalyzer } from '../analyzer/issue-analyzer.ts';
 import { WorkspaceManager } from '../workspace/workspace-manager.ts';
 import {
-  ArchonClient,
-  findArchonRunForRepo,
-  type ArchonRunRecord,
-} from '../executor/archon-client.ts';
-import { ArchonRunPoller } from '../executor/archon-poller.ts';
-import { spawnWorker, buildLiveSession, type WorkerStartArgs } from './worker.ts';
-import { approveAndResumeArchon } from '../executor/archon.ts';
+  ExecutorClient,
+  findRunForRepo,
+  type RunRecord,
+} from '../executor/client.ts';
+import { RunPoller } from '../executor/poller.ts';
+import { spawnWorker, buildLiveSession, toWorkerCallbacks, type WorkerStartArgs } from './worker.ts';
+import type { GaggleExecutor } from '../executor/engine/index.ts';
+import type { Store } from '../executor/store/types.ts';
 import { buildIssueMessage } from '../workspace/message.ts';
 import {
   availableSlots,
@@ -70,8 +71,8 @@ interface RecoveryContext {
   queuedIssues: Issue[];
   waitingIssues: Issue[];
   retryingIssues: Issue[];
-  archonRuns: ArchonRunRecord[];
-  archonRunsById: Map<string, ArchonRunRecord>;
+  executorRuns: RunRecord[];
+  runsById: Map<string, RunRecord>;
   persistedRunIds: ReturnType<typeof allRunEntries>;
   persistedRetries: ReturnType<typeof allRetryEntries>;
 }
@@ -83,9 +84,16 @@ export interface OrchestratorDeps {
   workspace: WorkspaceManager;
   registry: RegistryLoaderHandle;
   syncer: SyncerHandle | null;
-  /** Injected for testing; defaults to a real ArchonClient built from cfg. */
-  archonClient?: ArchonClient;
+  /** The workflow engine. */
+  executor: GaggleExecutor;
+  /** Backing store, for the client adapter and recovery. */
+  store: Store;
+  /** Injected for testing; defaults to one built over `executor` + `store`. */
+  executorClient?: ExecutorClient;
 }
+
+/** Cadence for following a run this process did not start. */
+const POLL_INTERVAL_MS = 5_000;
 
 export class Orchestrator {
   private state: OrchestratorState;
@@ -95,7 +103,8 @@ export class Orchestrator {
   private workspace: WorkspaceManager;
   private registry: RegistryLoaderHandle;
   private syncer: SyncerHandle | null;
-  private archon: ArchonClient;
+  private executor: GaggleExecutor;
+  private executorClient: ExecutorClient;
   private effectApplier: EffectApplier;
   private tickTimer: ReturnType<typeof setTimeout> | null = null;
   private stopped = false;
@@ -108,7 +117,8 @@ export class Orchestrator {
     this.workspace = deps.workspace;
     this.registry = deps.registry;
     this.syncer = deps.syncer;
-    this.archon = deps.archonClient ?? new ArchonClient(deps.cfg.executor.api_url);
+    this.executor = deps.executor;
+    this.executorClient = deps.executorClient ?? new ExecutorClient(deps.executor, deps.store);
     this.state = createInitialState(this.cfg);
 
     deps.registry.on(() => {
@@ -121,7 +131,7 @@ export class Orchestrator {
     this.effectApplier = new EffectApplier({
       cfg: this.cfg,
       tracker: this.tracker,
-      archon: this.archon,
+      executorClient: this.executorClient,
       workspace: this.workspace,
       state: this.state,
       registryBaseFolder: this.cfg.registry.base_folder,
@@ -523,6 +533,7 @@ export class Orchestrator {
       : null;
     const workerArgs: WorkerStartArgs = {
       cfg: this.cfg,
+      executor: this.executor,
       workspace: this.workspace,
       issue: parentIssue,
       repo_target: target,
@@ -601,60 +612,57 @@ export class Orchestrator {
     });
     this.state.running.set(key, session);
 
-    const resumeHandle = approveAndResumeArchon(
-      this.cfg.executor.command,
-      runId,
-      message ?? undefined,
-      this.cfg.executor.turn_timeout_ms,
-      (e) => {
-        const s = this.state.running.get(key);
-        switch (e.type) {
-          case 'archon_started':
-            if (s) { s.run_pid = e.pid; s.last_event_at = new Date().toISOString(); }
-            break;
-          case 'archon_output':
-            if (s) {
-              s.last_message = e.line;
-              s.last_event_at = new Date().toISOString();
-              s.turn_count += 1;
-              s.recent_output.push(e.line);
-              if (s.recent_output.length > 50) s.recent_output.shift();
-            }
-            break;
-          case 'run_id':
-            if (s) {
-              s.run_id = e.db_run_id;
-              // Post-approve grace window: Archon briefly reports the paused
-              // run as `failed`/`cancelled` while the resumed run takes over.
-              // Skipping the first poll by ~pollIntervalMs avoids a spurious
-              // "Poller: run reached failed/cancelled status" log.
-              this.attachPoller(
-                key, e.db_run_id, parentIssue, target, subIssueId, attempt,
-                this.cfg.executor.poll_interval_ms,
-              );
-            }
+    // One call stores the decision and resumes. Under the Archon integration
+    // this needed a subprocess, because the HTTP approve stored the approval
+    // without continuing the run and dropped the human's comment on the way.
+    void (async () => {
+      const handle = await this.executorClient.approveAndWatch(
+        runId,
+        message ?? undefined,
+        toWorkerCallbacks({
+          onStarted: () => {
+            const s = this.state.running.get(key);
+            if (s) s.last_event_at = new Date().toISOString();
+          },
+          onOutput: (line) => {
+            const s = this.state.running.get(key);
+            if (!s) return;
+            s.last_message = line;
+            s.last_event_at = new Date().toISOString();
+            s.turn_count += 1;
+            s.recent_output.push(line);
+            if (s.recent_output.length > 50) s.recent_output.shift();
+          },
+          onRunId: (resumedRunId) => {
+            const s = this.state.running.get(key);
+            if (s) s.run_id = resumedRunId;
             writeRunEntry(this.cfg.registry.base_folder, key, {
-              run_id: e.db_run_id,
+              run_id: resumedRunId,
               parent_issue_id: parentIssue.id,
               sub_issue_id: subIssueId,
               repo_alias: target.repo_alias,
             });
-            break;
-          case 'archon_gate_paused':
-            void this.handleGatePaused(parentIssue, target, subIssueId, e.run_id, e.gate_message, attempt);
-            break;
-          case 'archon_succeeded':
-          case 'archon_failed':
-          case 'archon_timed_out':
-          case 'archon_stalled':
-          case 'archon_cancelled':
+          },
+          onGatePaused: (gateRunId, gateMessage) => {
+            void this.handleGatePaused(
+              parentIssue, target, subIssueId, gateRunId, gateMessage, attempt,
+            );
+          },
+          onExit: (event) => {
             deleteRunEntry(this.cfg.registry.base_folder, key);
-            void this.handleWorkerExit(parentIssue, target, { type: e.type, exit_code: 'exit_code' in e ? e.exit_code : undefined }, attempt);
-            break;
-        }
-      },
-    );
-    session.cancel = resumeHandle.cancel;
+            void this.handleWorkerExit(parentIssue, target, event, attempt);
+          },
+        }),
+      );
+
+      if (!handle) {
+        // The gate vanished between the decision and the resume — most likely
+        // another surface already answered it.
+        logger.warn('Approve found no pending gate; nothing to resume', { run_id: runId });
+        return;
+      }
+      session.cancel = () => void this.executorClient.cancelRun(handle.run_id, 'cancelled');
+    })();
   }
 
   /** Poll-loop recovery path: dispatch a sub-issue that has no gaggle labels (e.g. crash before label was applied). */
@@ -923,7 +931,7 @@ export class Orchestrator {
 
   // ─── poller attachment ───────────────────────────────────────────────────
   /**
-   * Attach an ArchonRunPoller to a live session once the DB run-id is known.
+   * Attach an RunPoller to a live session once the DB run-id is known.
    * The poller provides authoritative status updates independent of subprocess output.
    */
   private attachPoller(
@@ -935,8 +943,8 @@ export class Orchestrator {
     attempt: number | null,
     initialDelayMs?: number,
   ): void {
-    const poller = new ArchonRunPoller(
-      this.archon,
+    const poller = new RunPoller(
+      this.executorClient,
       runId,
       (event) => {
         const session = this.state.running.get(key);
@@ -994,7 +1002,9 @@ export class Orchestrator {
         }
       },
       {
-        pollIntervalMs: this.cfg.executor.poll_interval_ms,
+        // Only adopted runs are polled; live ones deliver events in-process,
+        // so this cadence no longer gates how fast anything is noticed.
+        pollIntervalMs: POLL_INTERVAL_MS,
         stallTimeoutMs: this.cfg.executor.stall_timeout_ms,
         ...(initialDelayMs !== undefined ? { initialDelayMs } : {}),
       },
@@ -1362,7 +1372,7 @@ export class Orchestrator {
   private async pollSupervisedGates(): Promise<void> {
     for (const [key, gate] of this.state.supervised_gates) {
       const targetId = gate.sub_issue_id ?? gate.issue_id;
-      // Timeout → gate_timed_out (SM emits archon_reject, label swap, schedule_retry).
+      // Timeout → gate_timed_out (SM emits executor_reject, label swap, schedule_retry).
       if (this.cfg.executor.gate_timeout_ms > 0 && Date.now() - gate.paused_at > this.cfg.executor.gate_timeout_ms) {
         await this.resolveGateStateTransition(targetId, gate);
         await this.emitTargetEvent('gate_waiting', { kind: 'gate_timed_out' }, this.buildGateTransitionCtx(gate));
@@ -1426,7 +1436,7 @@ export class Orchestrator {
       await this.resolveGateStateTransition(targetId, gate);
 
       if (intent === 'approve') {
-        // gate_approved → running. SM emits label swap + archon_approve_and_resume
+        // gate_approved → running. SM emits label swap + executor_approve_and_resume
         // effect; the applier looks up the gate's run_id, calls the
         // approveAndResume hook (which spawns the subprocess that approves+
         // resumes via the Archon CLI), and deletes the supervised_gate entry.
@@ -1435,7 +1445,7 @@ export class Orchestrator {
           this.buildGateTransitionCtx(gate));
         logger.info('Gate approved — approve+resume spawned via state machine', { issue_id: gate.issue_id, repo_alias: gate.repo_alias, run_id: gate.run_id ?? undefined });
       } else {
-        // reject → gate_rejected (SM emits archon_reject, label → retrying, schedule retry).
+        // reject → gate_rejected (SM emits executor_reject, label → retrying, schedule retry).
         // resolveGateStateTransition already ran above before the approve/reject branch.
         await this.emitTargetEvent('gate_waiting',
           { kind: 'gate_rejected', message: classifiedMessage },
@@ -1491,9 +1501,9 @@ export class Orchestrator {
     // Pre-SM: detect the gate-pause-disguised-as-success case and defer to the
     // gate handler. The Archon CLI exits 0 when the workflow pauses at an
     // approval gate; we must distinguish that from a true completion.
-    if (event.type === 'archon_succeeded' && dbRunId) {
+    if (event.type === 'run_succeeded' && dbRunId) {
       try {
-        const runDetail = await this.archon.getRunDetail(dbRunId);
+        const runDetail = await this.executorClient.getRunDetail(dbRunId);
         const run = runDetail?.run;
         if (run?.status === 'paused') {
           logger.info('Worker exit was gate pause — treating as supervised gate', {
@@ -1511,12 +1521,12 @@ export class Orchestrator {
       }
     }
 
-    // Choose the SM event. `archon_succeeded` without a run id means the
+    // Choose the SM event. `run_succeeded` without a run id means the
     // process never emitted workflow_starting → treat as a failure so we retry.
     let smEvent: TargetEvent;
-    if (event.type === 'archon_succeeded' && dbRunId) {
+    if (event.type === 'run_succeeded' && dbRunId) {
       smEvent = { kind: 'worker_succeeded' };
-    } else if (event.type === 'archon_succeeded') {
+    } else if (event.type === 'run_succeeded') {
       smEvent = { kind: 'worker_failed', reason: 'archon_succeeded_without_run_id' };
     } else {
       smEvent = { kind: 'worker_failed', reason: event.type };
@@ -1849,7 +1859,7 @@ export class Orchestrator {
 
   // ─── reconciliation ──────────────────────────────────────────────────────
   private async reconcileRunningIssues(): Promise<void> {
-    // Stall detection is handled per-session by ArchonRunPoller.
+    // Stall detection is handled per-session by RunPoller.
     // reconcileRunningIssues only reconciles Linear state and detached runs.
 
     const ids = new Set<string>();
@@ -1936,8 +1946,8 @@ export class Orchestrator {
     // cannot re-attach to). Check if they have since completed, failed, or paused.
     // NOTE: this block must run even when state.running is empty (the typical post-crash case).
     if (this.state.detached_runs.size > 0) {
-      const freshRuns = await this.archon.listRuns();
-      const freshById = new Map<string, ArchonRunRecord>(freshRuns.map((r) => [r.id, r]));
+      const freshRuns = await this.executorClient.listRuns();
+      const freshById = new Map<string, RunRecord>(freshRuns.map((r) => [r.id, r]));
 
       for (const [key, det] of [...this.state.detached_runs]) {
         const run = freshById.get(det.run_id);
@@ -2062,23 +2072,23 @@ export class Orchestrator {
   }
 
   private async loadRecoveryContext(): Promise<RecoveryContext> {
-    const [claimedIssues, runningIssues, queuedIssues, waitingIssues, retryingIssues, archonRuns] = await Promise.all([
+    const [claimedIssues, runningIssues, queuedIssues, waitingIssues, retryingIssues, executorRuns] = await Promise.all([
       this.tracker.fetchIssuesByLabel(this.cfg.tracker.gaggle_labels.claimed),
       this.tracker.fetchIssuesByLabel(this.cfg.tracker.gaggle_labels.running),
       this.tracker.fetchIssuesByLabel(this.cfg.tracker.gaggle_labels.queued),
       this.tracker.fetchIssuesByLabel(this.cfg.tracker.gaggle_labels.waiting_human),
       this.tracker.fetchIssuesByLabel(this.cfg.tracker.gaggle_labels.retrying),
-      this.archon.listRuns(),
+      this.executorClient.listRuns(),
     ]);
     const persistedRunIds = allRunEntries(this.cfg.registry.base_folder);
     const persistedRetries = allRetryEntries(this.cfg.registry.base_folder);
-    const archonRunsById = new Map<string, ArchonRunRecord>(archonRuns.map((r) => [r.id, r]));
+    const runsById = new Map<string, RunRecord>(executorRuns.map((r) => [r.id, r]));
     logger.info('Archon status snapshot at startup', {
-      total_runs: archonRuns.length,
+      total_runs: executorRuns.length,
       persisted_run_ids: Object.keys(persistedRunIds).length,
       persisted_retries: Object.keys(persistedRetries).length,
     });
-    return { claimedIssues, runningIssues, queuedIssues, waitingIssues, retryingIssues, archonRuns, archonRunsById, persistedRunIds, persistedRetries };
+    return { claimedIssues, runningIssues, queuedIssues, waitingIssues, retryingIssues, executorRuns, runsById, persistedRunIds, persistedRetries };
   }
 
   private recoverClaimedParents(ctx: RecoveryContext): void {
@@ -2129,7 +2139,7 @@ export class Orchestrator {
         identity,
         target_labels: new Set(['running']),
         linear_state: issue.state ?? '',
-        archon_run: archonRun,
+        executor_run: archonRun,
         persisted_retry: ctx.persistedRetries[workerKey(parentId, aliasGuess ?? '')] ?? null,
       });
 
@@ -2378,7 +2388,7 @@ export class Orchestrator {
       const workDone =
         (sibMap && sibMap.size > 0) || // at least one sibling completed during recovery
         Object.values(ctx.persistedRunIds).some(
-          (e) => e.parent_issue_id === parentId && ctx.archonRunsById.get(e.run_id)?.status === 'completed',
+          (e) => e.parent_issue_id === parentId && ctx.runsById.get(e.run_id)?.status === 'completed',
         );
 
       if (workDone) {
@@ -2460,17 +2470,17 @@ export class Orchestrator {
     parentId: string,
     alias: string | null,
     ctx: RecoveryContext,
-  ): ArchonRunRecord | null {
+  ): RunRecord | null {
     const key = workerKey(parentId, alias ?? '');
     const persistedEntry = ctx.persistedRunIds[key];
-    let run: ArchonRunRecord | null = persistedEntry
-      ? (ctx.archonRunsById.get(persistedEntry.run_id) ?? null)
+    let run: RunRecord | null = persistedEntry
+      ? (ctx.runsById.get(persistedEntry.run_id) ?? null)
       : null;
     if (!run && alias) {
       const repoBasename =
         this.registry.getContext().repositories.find((r) => r.name === alias)?.local_path
           .split(/[\\/]/).pop() ?? alias;
-      run = findArchonRunForRepo(ctx.archonRuns, repoBasename, ['running', 'paused', 'completed']);
+      run = findRunForRepo(ctx.executorRuns, repoBasename, ['running', 'paused', 'completed']);
     }
     return run;
   }

@@ -139,12 +139,6 @@ export interface ExecutorConfig {
   lease_heartbeat_ms: number;
   /** A run whose lease is older than this is considered crashed and reclaimable. */
   lease_ttl_ms: number;
-
-  // ── legacy Archon fields; removed in phase 8 with the Archon executor ────
-  /** @deprecated */ command: string;
-  /** @deprecated */ api_url: string;
-  /** @deprecated */ poll_interval_ms: number;
-  /** @deprecated */ turn_timeout_ms: number;
 }
 
 export interface ClaudeConfig {
@@ -313,7 +307,7 @@ export type RunStatus =
   | 'PreparingWorkspace'
   | 'CloningRepository'
   | 'BuildingPrompt'
-  | 'LaunchingArchon'
+  | 'LaunchingRun'
   | 'StreamingWorkflow'
   | 'Finishing'
   | 'Succeeded'
@@ -343,16 +337,16 @@ export interface LiveSession {
   repo_target: RepoTarget;
   sub_issue_id: string | null;
   run_pid: number | null;
-  /** Archon DB run id captured from the `workflowRunId` log line at startup. */
+  /** Engine run id, known as soon as the run row is created. */
   run_id: string | null;
   workflow: string;
   last_event: string | null;
   last_event_at: string | null;
   last_message: string | null;
   /**
-   * Ring buffer of the most recent stdout/stderr lines from the Archon CLI
-   * subprocess (capped). Surfaced in the worker-exit log when a worker fails
-   * so the operator doesn't have to dig into Archon's own logs to see why.
+   * Ring buffer of the most recent node output lines (capped). Surfaced in
+   * the worker-exit log when a worker fails, so the operator sees why without
+   * querying the run's event trail.
    */
   recent_output: string[];
   claude_input_tokens: number;
@@ -362,7 +356,7 @@ export interface LiveSession {
   started_at: string;
   attempt: number | null;
   cancel?: () => void;
-  /** Stops the ArchonRunPoller when the session ends. */
+  /** Stops the RunPoller when the session ends. */
   stopPoller?: () => void;
 }
 
@@ -395,12 +389,12 @@ export interface SupervisedGateEntry {
 }
 
 /**
- * A sub-issue whose Archon process was found still running (or paused) at startup.
- * We cannot re-attach to its stdout/stderr, so we track it here and poll
- * `archon workflow status` periodically to detect completion.
+ * A sub-issue whose run was found still alive (or paused) at startup.
+ * Its events went to a process that no longer exists, so it is tracked here
+ * and followed by polling the store until it settles.
  */
 export interface DetachedRun {
-  /** Archon database run id (hex string from `archon workflow status --json`). */
+  /** Engine run id. */
   run_id: string;
   parent_issue: Issue;
   sub_issue_id: string | null;
@@ -423,7 +417,7 @@ export interface OrchestratorState {
   sibling_subissue_urls: Map<string, Map<string, string>>;
   subissue_snapshot: Map<string, { state: string; labels: string[]; refreshed_at: number }>;
   /**
-   * Sub-issues whose Archon process was found still alive at startup recovery.
+   * Sub-issues whose run was found still alive at startup recovery.
    * Keyed by workerKey (parentId__repoAlias). Polled each reconcile tick.
    */
   detached_runs: Map<string, DetachedRun>;

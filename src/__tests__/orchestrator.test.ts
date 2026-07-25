@@ -26,15 +26,31 @@ import type {
   ServiceConfig,
 } from '../domain/types.ts';
 import { writeRunEntry, writeRetryEntry } from '../registry/run-registry.ts';
-import { ArchonClient, type ArchonRunRecord } from '../executor/archon-client.ts';
+import { ExecutorClient, type RunRecord } from '../executor/client.ts';
+import { MemoryStore } from '../executor/store/memory.ts';
+import { GaggleExecutor } from '../executor/engine/index.ts';
 import { makeIssue, makeRegistryContext, makeServiceConfig, makeRepoTarget } from './helpers/fixtures.ts';
 
-/** Build a fake ArchonClient whose listRuns() delegates to the provided function. */
+
+/**
+ * The engine handle every Orchestrator needs. These tests drive the
+ * orchestrator's own logic — labels, gates, recovery — and never start a real
+ * workflow, so an executor over a MemoryStore is enough.
+ */
+function makeEngineDeps(): { executor: GaggleExecutor; store: MemoryStore } {
+  const store = new MemoryStore();
+  return {
+    store,
+    executor: new GaggleExecutor({ store, artifactsRoot: '/tmp/gaggle-test-artifacts' }),
+  };
+}
+
+/** Build a fake ExecutorClient whose listRuns() delegates to the provided function. */
 function makeFakeArchonClient(
-  listRunsFn: () => Promise<ArchonRunRecord[]> = () => Promise.resolve([]),
-): ArchonClient {
-  const client = Object.create(ArchonClient.prototype) as ArchonClient;
-  (client as unknown as { listRuns: () => Promise<ArchonRunRecord[]> }).listRuns = listRunsFn;
+  listRunsFn: () => Promise<RunRecord[]> = () => Promise.resolve([]),
+): ExecutorClient {
+  const client = Object.create(ExecutorClient.prototype) as ExecutorClient;
+  (client as unknown as { listRuns: () => Promise<RunRecord[]> }).listRuns = listRunsFn;
   (client as unknown as { getRunDetail: () => Promise<null> }).getRunDetail = () => Promise.resolve(null);
   (client as unknown as { approveRun: () => Promise<void> }).approveRun = () => Promise.resolve();
   (client as unknown as { rejectRun: () => Promise<void> }).rejectRun = () => Promise.resolve();
@@ -141,7 +157,7 @@ function makeFakeRegistry(initial?: RegistryContext) {
 function makeOrchestrator(extra: {
   tracker?: ReturnType<typeof makeFakeTracker>['tracker'];
   registry?: RegistryLoaderHandle;
-  archonStatus?: () => Promise<ArchonRunRecord[]>;
+  archonStatus?: () => Promise<RunRecord[]>;
   cfg?: ServiceConfig;
 } = {}) {
   const cfg = extra.cfg ?? makeServiceConfig();
@@ -156,7 +172,8 @@ function makeOrchestrator(extra: {
     workspace: {} as unknown as WorkspaceManager,
     registry,
     syncer: null,
-    archonClient: makeFakeArchonClient(extra.archonStatus),
+    ...makeEngineDeps(),
+    executorClient: makeFakeArchonClient(extra.archonStatus),
   });
   return { orchestrator, cfg, registry, tracker: trackerObj.tracker };
 }
@@ -184,6 +201,7 @@ describe('Orchestrator.start', () => {
       workspace: {} as unknown as WorkspaceManager,
       registry: reg.handle,
       syncer: null,
+    ...makeEngineDeps(),
     });
     orchestrators.push(o);
     await o.start();
@@ -206,6 +224,7 @@ describe('Orchestrator.start', () => {
       workspace: {} as unknown as WorkspaceManager,
       registry: reg.handle,
       syncer: null,
+    ...makeEngineDeps(),
     });
     orchestrators.push(o);
     await o.start();
@@ -240,6 +259,7 @@ describe('Orchestrator.recoverFromLinearLabels', () => {
       workspace: {} as unknown as WorkspaceManager,
       registry: reg.handle,
       syncer: null,
+    ...makeEngineDeps(),
     });
     orchestrators.push(o);
     await o.start();
@@ -273,6 +293,7 @@ describe('Orchestrator.recoverFromLinearLabels', () => {
       workspace: {} as unknown as WorkspaceManager,
       registry: reg.handle,
       syncer: null,
+    ...makeEngineDeps(),
     });
     orchestrators.push(o);
     await o.start();
@@ -298,6 +319,7 @@ describe('Orchestrator analysis-cache invalidation', () => {
       workspace: {} as unknown as WorkspaceManager,
       registry: reg.handle,
       syncer: null,
+    ...makeEngineDeps(),
     });
     orchestrators.push(o);
     // Pre-populate the analysis cache
@@ -326,6 +348,7 @@ describe('Orchestrator.stop', () => {
       workspace: {} as unknown as WorkspaceManager,
       registry: reg.handle,
       syncer: null,
+    ...makeEngineDeps(),
     });
     orchestrators.push(o);
 
@@ -377,7 +400,7 @@ describe('Orchestrator.getState', () => {
 function makeDispatchOrchestrator(candidates: Issue[], opts: {
   byLabel?: Record<string, Issue[]>;
   analyzerTargets?: import('../domain/types.ts').RepoTarget[];
-  archonStatus?: () => Promise<ArchonRunRecord[]>;
+  archonStatus?: () => Promise<RunRecord[]>;
   prLinksByIssue?: Record<string, string[]>;
 } = {}) {
   const cfg = makeServiceConfig();
@@ -420,7 +443,8 @@ function makeDispatchOrchestrator(candidates: Issue[], opts: {
     workspace: { cleanAuxiliaryWorkspace: () => {} } as unknown as WorkspaceManager,
     registry: reg.handle,
     syncer: null,
-    archonClient: makeFakeArchonClient(opts.archonStatus),
+    ...makeEngineDeps(),
+    executorClient: makeFakeArchonClient(opts.archonStatus),
   });
   orchestrators.push(o);
 
@@ -603,7 +627,8 @@ describe('emitTargetEvent populates target_machine_states', () => {
       } as unknown as WorkspaceManager,
       registry: reg.handle,
       syncer: null,
-      archonClient: makeFakeArchonClient(),
+    ...makeEngineDeps(),
+      executorClient: makeFakeArchonClient(),
     });
     orchestrators.push(o);
 
@@ -658,7 +683,8 @@ describe('emitTargetEvent populates target_machine_states', () => {
       } as unknown as WorkspaceManager,
       registry: reg.handle,
       syncer: null,
-      archonClient: makeFakeArchonClient(),
+    ...makeEngineDeps(),
+      executorClient: makeFakeArchonClient(),
     });
     orchestrators.push(o);
 
@@ -677,7 +703,7 @@ describe('emitTargetEvent populates target_machine_states', () => {
 
     await (o as unknown as {
       handleWorkerExit(i: typeof issue, t: ReturnType<typeof makeRepoTarget>, e: { type: string }, a: number | null): Promise<void>;
-    }).handleWorkerExit(issue, makeRepoTarget({ repo_alias: 'fe' }), { type: 'archon_succeeded' }, null);
+    }).handleWorkerExit(issue, makeRepoTarget({ repo_alias: 'fe' }), { type: 'run_succeeded' }, null);
 
     expect(o.getState().target_machine_states.get('p1__fe')).toBe('succeeded');
     expect(o.getState().parent_machine_states.get('p1')).toBe('done');
@@ -713,7 +739,8 @@ describe('emitTargetEvent populates target_machine_states', () => {
       workspace: { ensureAuxRoot: () => {}, cleanAuxiliaryWorkspace: () => {} } as unknown as WorkspaceManager,
       registry: reg.handle,
       syncer: null,
-      archonClient: makeFakeArchonClient(),
+    ...makeEngineDeps(),
+      executorClient: makeFakeArchonClient(),
     });
     orchestrators.push(o);
 
@@ -775,7 +802,8 @@ describe('emitTargetEvent populates target_machine_states', () => {
       workspace: { ensureAuxRoot: () => {}, cleanAuxiliaryWorkspace: () => {} } as unknown as WorkspaceManager,
       registry: reg.handle,
       syncer: null,
-      archonClient: makeFakeArchonClient(),
+    ...makeEngineDeps(),
+      executorClient: makeFakeArchonClient(),
     });
     orchestrators.push(o);
 
@@ -829,7 +857,8 @@ describe('emitTargetEvent populates target_machine_states', () => {
       workspace: { ensureAuxRoot: () => {}, cleanAuxiliaryWorkspace: () => {} } as unknown as WorkspaceManager,
       registry: reg.handle,
       syncer: null,
-      archonClient: makeFakeArchonClient(),
+    ...makeEngineDeps(),
+      executorClient: makeFakeArchonClient(),
     });
     orchestrators.push(o);
 
@@ -849,7 +878,7 @@ describe('emitTargetEvent populates target_machine_states', () => {
 
     await (o as unknown as {
       handleWorkerExit(i: typeof issue, t: ReturnType<typeof makeRepoTarget>, e: { type: string }, a: number | null): Promise<void>;
-    }).handleWorkerExit(issue, makeRepoTarget({ repo_alias: 'fe' }), { type: 'archon_succeeded' }, null);
+    }).handleWorkerExit(issue, makeRepoTarget({ repo_alias: 'fe' }), { type: 'run_succeeded' }, null);
 
     expect(o.getState().target_machine_states.get('p1__fe')).toBe('succeeded');
     // Parent must NOT have transitioned to done â€” 'be' target is still queued.
@@ -895,7 +924,8 @@ describe('hot path: handleGatePaused', () => {
       workspace: { ensureAuxRoot: () => {}, cleanAuxiliaryWorkspace: () => {} } as unknown as WorkspaceManager,
       registry: reg.handle,
       syncer: null,
-      archonClient: makeFakeArchonClient(),
+    ...makeEngineDeps(),
+      executorClient: makeFakeArchonClient(),
     });
     orchestrators.push(o);
 
@@ -959,7 +989,8 @@ describe('hot path: handleWorkerExit failure â†’ failed (no-auto-retry poli
       workspace: { ensureAuxRoot: () => {}, cleanAuxiliaryWorkspace: () => {} } as unknown as WorkspaceManager,
       registry: reg.handle,
       syncer: null,
-      archonClient: makeFakeArchonClient(),
+    ...makeEngineDeps(),
+      executorClient: makeFakeArchonClient(),
     });
     orchestrators.push(o);
 
@@ -981,7 +1012,7 @@ describe('hot path: handleWorkerExit failure â†’ failed (no-auto-retry poli
 
     await (o as unknown as {
       handleWorkerExit(i: typeof issue, t: ReturnType<typeof makeRepoTarget>, e: { type: string }, a: number | null): Promise<void>;
-    }).handleWorkerExit(issue, makeRepoTarget({ repo_alias: 'fe' }), { type: 'archon_failed' }, 0);
+    }).handleWorkerExit(issue, makeRepoTarget({ repo_alias: 'fe' }), { type: 'run_failed' }, 0);
 
     // Target parked in failed
     expect(o.getState().target_machine_states.get('p1__fe')).toBe('failed');
@@ -1032,7 +1063,8 @@ describe('hot path: pollSupervisedGates timeout', () => {
       workspace: { ensureAuxRoot: () => {}, cleanAuxiliaryWorkspace: () => {} } as unknown as WorkspaceManager,
       registry: reg.handle,
       syncer: null,
-      archonClient: archon,
+    ...makeEngineDeps(),
+      executorClient: archon,
     });
     orchestrators.push(o);
 
@@ -1048,7 +1080,7 @@ describe('hot path: pollSupervisedGates timeout', () => {
 
     await (o as unknown as { pollSupervisedGates(): Promise<void> }).pollSupervisedGates();
 
-    // Archon reject was called via the SM's archon_reject effect
+    // Archon reject was called via the SM's executor_reject effect
     expect(archonCalls.some((c) => c.startsWith('rejectRun(run-xyz,'))).toBe(true);
     // Target moves to failed (no-auto-retry policy); gate entry deleted
     expect(o.getState().target_machine_states.get('p1__fe')).toBe('failed');
@@ -1096,7 +1128,8 @@ describe('hot path: pollFailedTargets retry trigger', () => {
       workspace: { ensureAuxRoot: () => {}, cleanAuxiliaryWorkspace: () => {} } as unknown as WorkspaceManager,
       registry: reg.handle,
       syncer: null,
-      archonClient: makeFakeArchonClient(),
+    ...makeEngineDeps(),
+      executorClient: makeFakeArchonClient(),
     });
     orchestrators.push(o);
     return { o, calls, cfg };
@@ -1251,7 +1284,8 @@ describe('hot path: drainPendingTargets phase 3', () => {
       workspace: { ensureAuxRoot: () => {}, cleanAuxiliaryWorkspace: () => {} } as unknown as WorkspaceManager,
       registry: reg.handle,
       syncer: null,
-      archonClient: makeFakeArchonClient(),
+    ...makeEngineDeps(),
+      executorClient: makeFakeArchonClient(),
     });
     orchestrators.push(o);
 
@@ -1305,7 +1339,8 @@ describe('hot path: drainPendingTargets phase 3', () => {
       workspace: { ensureAuxRoot: () => {}, cleanAuxiliaryWorkspace: () => {} } as unknown as WorkspaceManager,
       registry: reg.handle,
       syncer: null,
-      archonClient: makeFakeArchonClient(),
+    ...makeEngineDeps(),
+      executorClient: makeFakeArchonClient(),
     });
     orchestrators.push(o);
 
@@ -1362,7 +1397,8 @@ describe('hot path: drainPendingTargets phase 3', () => {
       workspace: { ensureAuxRoot: () => {}, cleanAuxiliaryWorkspace: () => {} } as unknown as WorkspaceManager,
       registry: reg.handle,
       syncer: null,
-      archonClient: makeFakeArchonClient(),
+    ...makeEngineDeps(),
+      executorClient: makeFakeArchonClient(),
     });
     orchestrators.push(o);
 
@@ -1388,7 +1424,7 @@ describe('hot path: drainPendingTargets phase 3', () => {
 describe('crash recovery â€” recoverFromLinearLabels', () => {
   function makeRecoveryOrchestrator(
     byLabel: Record<string, Issue[]>,
-    opts: { archonStatus?: () => Promise<ArchonRunRecord[]>; baseFolder?: string } = {},
+    opts: { archonStatus?: () => Promise<RunRecord[]>; baseFolder?: string } = {},
   ) {
     const cfg = makeServiceConfig();
     cfg.polling.interval_ms = 86_400_000;
@@ -1426,7 +1462,8 @@ describe('crash recovery â€” recoverFromLinearLabels', () => {
       workspace: {} as unknown as WorkspaceManager,
       registry: reg.handle,
       syncer: null,
-      archonClient: makeFakeArchonClient(opts.archonStatus),
+    ...makeEngineDeps(),
+      executorClient: makeFakeArchonClient(opts.archonStatus),
     });
     orchestrators.push(o);
     return { o, calls, cfg };
@@ -2294,7 +2331,8 @@ describe('gray-zone state guards', () => {
       workspace: {} as unknown as WorkspaceManager,
       registry: reg.handle,
       syncer: null,
-      archonClient: makeFakeArchonClient(),
+    ...makeEngineDeps(),
+      executorClient: makeFakeArchonClient(),
     });
     orchestrators.push(o);
 
@@ -2354,7 +2392,8 @@ describe('gray-zone state guards', () => {
       workspace: {} as unknown as WorkspaceManager,
       registry: reg.handle,
       syncer: null,
-      archonClient: makeFakeArchonClient(),
+    ...makeEngineDeps(),
+      executorClient: makeFakeArchonClient(),
     });
     orchestrators.push(o);
 

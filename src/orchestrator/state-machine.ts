@@ -29,7 +29,7 @@
  */
 
 import type { Issue, RepoTarget, ServiceConfig } from '../domain/types.ts';
-import type { ArchonRunRecord } from '../executor/archon-client.ts';
+import type { RunRecord } from '../executor/client.ts';
 import { completedState } from '../config/service-config.ts';
 
 // ─── Identity ──────────────────────────────────────────────────────────────
@@ -218,15 +218,15 @@ export type Effect =
   // supervised_gates entry keyed by identity, and removes that gate entry as
   // an atomic part of the operation. This couples the Archon call with the
   // in-memory gate cleanup, matching the current orchestrator's semantics.
-  | { kind: 'archon_approve'; identity: TargetIdentity; message: string | null }
-  | { kind: 'archon_reject'; identity: TargetIdentity; reason: string }
-  // archon_approve_and_resume is distinct from archon_approve: rather than
+  | { kind: 'executor_approve'; identity: TargetIdentity; message: string | null }
+  | { kind: 'executor_reject'; identity: TargetIdentity; reason: string }
+  // executor_approve_and_resume is distinct from executor_approve: rather than
   // just storing the approval via the HTTP API, it spawns the
   // `archon workflow approve <run_id> <comment>` subprocess which records
   // the comment as the gate's output AND resumes the workflow. The applier
   // delegates to the approveAndResume hook (orchestrator-owned), which sets
   // up callbacks that thread back into handleWorkerExit / handleGatePaused.
-  | { kind: 'archon_approve_and_resume'; identity: TargetIdentity; message: string | null; attempt: number | null }
+  | { kind: 'executor_approve_and_resume'; identity: TargetIdentity; message: string | null; attempt: number | null }
 
   // Persistence (run-registry, extended to hold retry meta as well)
   | { kind: 'persist_run'; key: WorkerKey; run_id: string; meta: RunMeta }
@@ -321,7 +321,7 @@ export interface ParentClassification {
 /**
  * Inputs the target classifier reads to determine TargetState at startup.
  *
- *  - archon_run: matched via persisted run-registry entry first, falling back
+ *  - executor_run: matched via persisted run-registry entry first, falling back
  *    to a heuristic search of recent Archon runs by repo basename.
  *  - persisted_retry: pulled from the retry-registry (new), null if absent.
  */
@@ -329,7 +329,7 @@ export interface TargetRecoveryInputs {
   identity: TargetIdentity;
   target_labels: Set<TargetLabelKind>;
   linear_state: string;
-  archon_run: ArchonRunRecord | null;
+  executor_run: RunRecord | null;
   persisted_retry: RetryMeta | null;
 }
 
@@ -606,20 +606,20 @@ export const targetTransition: TargetTransitionFn = (state, event, ctx) => {
           { kind: 'remove_label', issue_id: tid, label: 'waiting_human' },
           { kind: 'apply_label', issue_id: tid, label: 'running' },
           // approve_and_resume spawns the subprocess that approves + resumes
-          // the workflow; the HTTP-only `archon_approve` would store the
+          // the workflow; the HTTP-only `executor_approve` would store the
           // approval but not restart the workflow.
-          { kind: 'archon_approve_and_resume', identity: ctx.identity, message: event.message, attempt: ctx.attempt },
+          { kind: 'executor_approve_and_resume', identity: ctx.identity, message: event.message, attempt: ctx.attempt },
         ],
       };
     }
     if (event.kind === 'gate_rejected') {
       return retryOrFail('gate_waiting', ctx, key, tid, 'waiting_human', `gate_rejected: ${event.message}`, [
-        { kind: 'archon_reject', identity: ctx.identity, reason: event.message },
+        { kind: 'executor_reject', identity: ctx.identity, reason: event.message },
       ]);
     }
     if (event.kind === 'gate_timed_out') {
       return retryOrFail('gate_waiting', ctx, key, tid, 'waiting_human', 'gate_timeout', [
-        { kind: 'archon_reject', identity: ctx.identity, reason: 'Gate timeout — no human response' },
+        { kind: 'executor_reject', identity: ctx.identity, reason: 'Gate timeout — no human response' },
       ]);
     }
     if (event.kind === 'gate_create_blocker') {
@@ -631,7 +631,7 @@ export const targetTransition: TargetTransitionFn = (state, event, ctx) => {
           { kind: 'remove_label', issue_id: tid, label: 'waiting_human' },
           { kind: 'apply_label', issue_id: tid, label: 'queued' },
           { kind: 'create_blocker_issue', spec: event.blocker, blocks_issue_id: tid },
-          { kind: 'archon_reject', identity: ctx.identity, reason: `Blocker created: ${event.blocker.title}` },
+          { kind: 'executor_reject', identity: ctx.identity, reason: `Blocker created: ${event.blocker.title}` },
           { kind: 'post_comment', issue_id: ctx.identity.parent_issue_id,
             body: `🔗 **Blocker created**: ${event.blocker.title}\n\nImplementation is paused until this issue is resolved. GaggleDispatch will restart automatically once the blocker reaches a satisfied state.` },
           { kind: 'delete_run', key },
@@ -726,7 +726,7 @@ export const classifyParentState: ParentClassifierFn = (inp) => {
  *   6. (no target-level labels)        → null
  */
 export const classifyTargetState: TargetClassifierFn = (inp) => {
-  const runId = inp.archon_run?.id ?? null;
+  const runId = inp.executor_run?.id ?? null;
   const recoveredAttempt = inp.persisted_retry?.attempt ?? 0;
 
   if (inp.target_labels.has('failed')) {
@@ -738,7 +738,7 @@ export const classifyTargetState: TargetClassifierFn = (inp) => {
   }
 
   if (inp.target_labels.has('running')) {
-    const archonStatus = inp.archon_run?.status ?? null;
+    const archonStatus = inp.executor_run?.status ?? null;
     if (archonStatus === 'paused') {
       return { identity: inp.identity, state: 'gate_waiting', run_id: runId, attempt: recoveredAttempt };
     }

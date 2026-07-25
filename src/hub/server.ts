@@ -13,7 +13,6 @@ import type { Server, ServerWebSocket } from 'bun';
 import type { HubConfig } from './config.ts';
 import { HubProcessManager } from './process-manager.ts';
 import { HistoryDb, defaultHistoryDbPath } from './history.ts';
-import type { ArchonSupervisor } from './archon-supervisor.ts';
 import { logger } from '../util/logger.ts';
 
 interface DashWsData {
@@ -46,7 +45,6 @@ const MIME: Record<string, string> = {
 export interface HubServerOptions {
   cfg: HubConfig;
   manager: HubProcessManager;
-  archon: ArchonSupervisor;
   dashboardDir: string;
 }
 
@@ -233,9 +231,6 @@ export function startHubServer(opts: HubServerOptions): HubServerHandle {
         const ok = srv.upgrade(req, { data: { id } });
         if (ok) return undefined;
         return new Response('upgrade failed', { status: 400 });
-      }
-      if (url.pathname === '/api/archon') {
-        return Response.json(opts.archon.getState());
       }
       if (url.pathname === '/api/gaggles') {
         const list = opts.manager.list().map((w) => ({

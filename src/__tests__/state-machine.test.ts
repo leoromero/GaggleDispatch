@@ -24,7 +24,7 @@ import {
   type TargetIdentity,
   type Effect,
 } from '../orchestrator/state-machine.ts';
-import type { ArchonRunRecord } from '../executor/archon-client.ts';
+import type { RunRecord } from '../executor/client.ts';
 import { makeIssue, makeRepoTarget, makeServiceConfig } from './helpers/fixtures.ts';
 
 // ─── fixtures ──────────────────────────────────────────────────────────────
@@ -256,16 +256,16 @@ describe('targetTransition: valid', () => {
     expect(hasEffect(t.effects, 'set_linear_state', (e) => e.kind === 'set_linear_state' && e.state === 'Awaiting Review')).toBe(true);
   });
 
-  test('gate_waiting + gate_approved → running (emits archon_approve_and_resume)', () => {
+  test('gate_waiting + gate_approved → running (emits executor_approve_and_resume)', () => {
     const t = targetTransition('gate_waiting', { kind: 'gate_approved', message: 'lgtm' }, tctx());
     expect(t.to).toBe('running');
-    expect(hasEffect(t.effects, 'archon_approve_and_resume')).toBe(true);
+    expect(hasEffect(t.effects, 'executor_approve_and_resume')).toBe(true);
   });
 
   test('gate_waiting + gate_rejected → failed (no-auto-retry: park for review)', () => {
     const t = targetTransition('gate_waiting', { kind: 'gate_rejected', message: 'no' }, tctx({ attempt: 0 }));
     expect(t.to).toBe('failed');
-    expect(hasEffect(t.effects, 'archon_reject')).toBe(true);
+    expect(hasEffect(t.effects, 'executor_reject')).toBe(true);
     expect(hasEffect(t.effects, 'apply_label', (e) => e.kind === 'apply_label' && e.label === 'failed')).toBe(true);
     expect(hasEffect(t.effects, 'schedule_retry_timer')).toBe(false);
   });
@@ -273,7 +273,7 @@ describe('targetTransition: valid', () => {
   test('gate_waiting + gate_timed_out → failed (no-auto-retry)', () => {
     const t = targetTransition('gate_waiting', { kind: 'gate_timed_out' }, tctx());
     expect(t.to).toBe('failed');
-    expect(hasEffect(t.effects, 'archon_reject', (e) => e.kind === 'archon_reject' && /timeout/i.test(e.reason))).toBe(true);
+    expect(hasEffect(t.effects, 'executor_reject', (e) => e.kind === 'executor_reject' && /timeout/i.test(e.reason))).toBe(true);
   });
 
   test('gate_waiting + gate_create_blocker → queued', () => {
@@ -283,7 +283,7 @@ describe('targetTransition: valid', () => {
     expect(t.to).toBe('queued');
     expect(hasEffect(t.effects, 'apply_label', (e) => e.kind === 'apply_label' && e.label === 'queued')).toBe(true);
     expect(hasEffect(t.effects, 'create_blocker_issue')).toBe(true);
-    expect(hasEffect(t.effects, 'archon_reject')).toBe(true);
+    expect(hasEffect(t.effects, 'executor_reject')).toBe(true);
     expect(hasEffect(t.effects, 'post_comment')).toBe(true);
   });
 
@@ -340,7 +340,7 @@ describe('targetTransition: parent_terminal universal handling', () => {
 
 // ─── Recovery classifiers ──────────────────────────────────────────────────
 
-function archonRun(status: ArchonRunRecord['status'], id = 'r1'): ArchonRunRecord {
+function archonRun(status: RunRecord['status'], id = 'r1'): RunRecord {
   return {
     id, status,
     workflow_name: 'gaggle/gaggle-fix-issue',
@@ -371,12 +371,12 @@ describe('classifyParentState', () => {
 describe('classifyTargetState', () => {
   const identity: TargetIdentity = { parent_issue_id: 'p1', repo_alias: 'a', target_issue_id: 'sub-a' };
 
-  function call(opts: { labels?: TargetLabelKind[]; archon?: ArchonRunRecord | null; retry?: { attempt: number; due_at_ms: number; reason: string | null } | null } = {}) {
+  function call(opts: { labels?: TargetLabelKind[]; archon?: RunRecord | null; retry?: { attempt: number; due_at_ms: number; reason: string | null } | null } = {}) {
     return classifyTargetState({
       identity,
       target_labels: new Set(opts.labels ?? []),
       linear_state: 'In Progress',
-      archon_run: opts.archon ?? null,
+      executor_run: opts.archon ?? null,
       persisted_retry: opts.retry ?? null,
     });
   }

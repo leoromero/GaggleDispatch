@@ -268,11 +268,6 @@ export function buildServiceConfig(def: WorkflowDefinition): ServiceConfig {
     database_url: resolveSecretOrLiteral(
       asOptionalString(execRaw.database_url, 'executor.database_url') ?? '$DATABASE_URL',
     ),
-    // ── legacy Archon fields; removed in phase 8 with the Archon executor ──
-    command: asString(execRaw.command, 'executor.command', 'archon workflow run'),
-    api_url: asString(execRaw.api_url, 'executor.api_url', 'http://localhost:3090'),
-    poll_interval_ms: asPositiveInt(execRaw.poll_interval_ms, 'executor.poll_interval_ms', 5_000),
-    turn_timeout_ms: asPositiveInt(execRaw.turn_timeout_ms, 'executor.turn_timeout_ms', 3_600_000),
     default_workflow: asString(execRaw.default_workflow, 'executor.default_workflow', 'gaggle/gaggle-fix-issue'),
     max_run_duration_ms: asPositiveInt(execRaw.max_run_duration_ms, 'executor.max_run_duration_ms', 3_600_000),
     node_idle_timeout_ms: asPositiveInt(execRaw.node_idle_timeout_ms, 'executor.node_idle_timeout_ms', 300_000),
@@ -393,7 +388,7 @@ export function defaultGateResumeState(cfg: ServiceConfig): string {
   return cfg.tracker.active_states[0] ?? 'In Progress';
 }
 
-/** State to move an issue/sub-issue to when Archon finishes successfully (PR created). */
+/** State to move an issue/sub-issue to when a run finishes successfully (PR created). */
 export function completedState(cfg: ServiceConfig): string {
   if (cfg.tracker.pr_ready_state) return cfg.tracker.pr_ready_state;
   return cfg.tracker.terminal_states[0] ?? 'Done';

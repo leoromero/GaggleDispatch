@@ -12,7 +12,7 @@ import type { Effect, TargetIdentity } from '../orchestrator/state-machine.ts';
 import { createInitialState } from '../orchestrator/state.ts';
 import { makeIssue, makeRepoTarget, makeServiceConfig } from './helpers/fixtures.ts';
 import type { LinearClient } from '../tracker/linear.ts';
-import type { ArchonClient } from '../executor/archon-client.ts';
+import type { ExecutorClient } from '../executor/client.ts';
 import type { WorkspaceManager } from '../workspace/workspace-manager.ts';
 
 interface Call { op: string; args: unknown[] }
@@ -50,7 +50,7 @@ function makeApplier(overrides: { archonShouldThrow?: boolean } = {}) {
   const archon = {
     approveRun: async (run_id: string, msg?: string) => { calls.push({ op: 'approveRun', args: [run_id, msg] }); if (overrides.archonShouldThrow) throw new Error('archon down'); },
     rejectRun: async (run_id: string, reason: string) => { calls.push({ op: 'rejectRun', args: [run_id, reason] }); },
-  } as unknown as ArchonClient;
+  } as unknown as ExecutorClient;
 
   const workspace = {
     cleanAuxiliaryWorkspace: (id: string) => { calls.push({ op: 'cleanAuxiliaryWorkspace', args: [id] }); },
@@ -59,7 +59,7 @@ function makeApplier(overrides: { archonShouldThrow?: boolean } = {}) {
   const deps: EffectApplierDeps = {
     cfg,
     tracker,
-    archon,
+    executorClient: archon,
     workspace,
     state,
     registryBaseFolder: baseFolder,
@@ -153,7 +153,7 @@ describe('EffectApplier: worker effects', () => {
 // ─── Archon effects with gate resolution ───────────────────────────────────
 
 describe('EffectApplier: Archon control plane', () => {
-  test('archon_approve looks up gate run_id and deletes the gate entry', async () => {
+  test('executor_approve looks up gate run_id and deletes the gate entry', async () => {
     const { applier, calls, state } = makeApplier();
     // Prime a supervised_gates entry
     state.supervised_gates.set('p1__trialmatch-be', {
@@ -169,12 +169,12 @@ describe('EffectApplier: Archon control plane', () => {
       gate_state_applied: false,
       attempt: null,
     });
-    await applier.apply({ kind: 'archon_approve', identity: IDENTITY, message: 'lgtm' });
+    await applier.apply({ kind: 'executor_approve', identity: IDENTITY, message: 'lgtm' });
     expect(hasCall(calls, 'approveRun', ['run-xyz', 'lgtm'])).toBe(true);
     expect(state.supervised_gates.has('p1__trialmatch-be')).toBe(false);
   });
 
-  test('archon_reject looks up gate run_id and deletes the gate entry', async () => {
+  test('executor_reject looks up gate run_id and deletes the gate entry', async () => {
     const { applier, calls, state } = makeApplier();
     state.supervised_gates.set('p1__trialmatch-be', {
       run_id: 'run-xyz',
@@ -189,18 +189,18 @@ describe('EffectApplier: Archon control plane', () => {
       gate_state_applied: false,
       attempt: null,
     });
-    await applier.apply({ kind: 'archon_reject', identity: IDENTITY, reason: 'no' });
+    await applier.apply({ kind: 'executor_reject', identity: IDENTITY, reason: 'no' });
     expect(hasCall(calls, 'rejectRun', ['run-xyz', 'no'])).toBe(true);
     expect(state.supervised_gates.has('p1__trialmatch-be')).toBe(false);
   });
 
-  test('archon_approve with no gate present → no Archon call, no throw', async () => {
+  test('executor_approve with no gate present → no Archon call, no throw', async () => {
     const { applier, calls } = makeApplier();
-    await applier.apply({ kind: 'archon_approve', identity: IDENTITY, message: null });
+    await applier.apply({ kind: 'executor_approve', identity: IDENTITY, message: null });
     expect(calls.some((c) => c.op === 'approveRun')).toBe(false);
   });
 
-  test('archon_approve_and_resume calls the approveAndResume hook and deletes the gate', async () => {
+  test('executor_approve_and_resume calls the approveAndResume hook and deletes the gate', async () => {
     const { applier, calls, state } = makeApplier();
     state.supervised_gates.set('p1__trialmatch-be', {
       run_id: 'run-xyz', issue_id: 'p1', issue: makeIssue({ id: 'p1' }),
@@ -208,7 +208,7 @@ describe('EffectApplier: Archon control plane', () => {
       sub_issue_id: 'sub-be', paused_at: Date.now(), gate_message: 'r',
       comment_id: null, gate_state_applied: false, attempt: null,
     });
-    await applier.apply({ kind: 'archon_approve_and_resume', identity: IDENTITY, message: 'lgtm', attempt: null });
+    await applier.apply({ kind: 'executor_approve_and_resume', identity: IDENTITY, message: 'lgtm', attempt: null });
     expect(hasCall(calls, 'approveAndResume', ['trialmatch-be', 'run-xyz', 'lgtm'])).toBe(true);
     expect(state.supervised_gates.has('p1__trialmatch-be')).toBe(false);
   });
@@ -222,7 +222,7 @@ describe('EffectApplier: Archon control plane', () => {
       comment_id: null, gate_state_applied: false, attempt: null,
     });
     // Should not throw
-    await applier.apply({ kind: 'archon_approve', identity: IDENTITY, message: 'lgtm' });
+    await applier.apply({ kind: 'executor_approve', identity: IDENTITY, message: 'lgtm' });
   });
 });
 

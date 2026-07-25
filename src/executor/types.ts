@@ -83,8 +83,9 @@ export interface RunRecord {
   status: RunStatus;
   /** Absolute path the workflow executed in — worktree or live checkout. */
   working_path: string | null;
-  repo_slug: string | null;
-  branch: string | null;
+  /** Informational: which registered repo and branch this run belongs to. */
+  repo_slug?: string | null;
+  branch?: string | null;
   started_at: string;
   completed_at: string | null;
   /** Bumped on every node transition. Drives stall detection. */

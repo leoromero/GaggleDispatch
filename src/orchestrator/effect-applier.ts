@@ -15,7 +15,7 @@
  *   - Effects that need machinery the applier does not own (worker spawn,
  *     timer scheduling, blocker creation) are dispatched through injected
  *     hooks so the orchestrator retains responsibility for that wiring.
- *   - `archon_approve` / `archon_reject` resolve their run_id from the live
+ *   - `executor_approve` / `executor_reject` resolve their run_id from the live
  *     `supervised_gates` entry keyed by identity, then delete that entry —
  *     coupling the Archon call with the in-memory cleanup so callers don't
  *     have to chase both.
@@ -23,7 +23,7 @@
 
 import type { Issue, OrchestratorState, RepoTarget, ServiceConfig } from '../domain/types.ts';
 import type { LinearClient } from '../tracker/linear.ts';
-import type { ArchonClient } from '../executor/archon-client.ts';
+import type { ExecutorClient } from '../executor/client.ts';
 import type { WorkspaceManager } from '../workspace/workspace-manager.ts';
 import { writeRunEntry, deleteRunEntry, writeRetryEntry, deleteRetryEntry } from '../registry/run-registry.ts';
 import { workerKey as makeWorkerKey } from './state.ts';
@@ -71,7 +71,7 @@ export interface ApproveAndResumeHook {
 export interface EffectApplierDeps {
   cfg: ServiceConfig;
   tracker: LinearClient;
-  archon: ArchonClient;
+  executorClient: ExecutorClient;
   workspace: WorkspaceManager;
   state: OrchestratorState;
   /** Used by persist_run / delete_run; gaggle-runs.json lives here. */
@@ -153,25 +153,25 @@ export class EffectApplier {
         return;
 
       // ─── Archon control plane (resolves run_id from gate, cleans up) ───
-      case 'archon_approve': {
+      case 'executor_approve': {
         const key = makeWorkerKey(effect.identity.parent_issue_id, effect.identity.repo_alias);
         const gate = this.deps.state.supervised_gates.get(key);
         if (gate?.run_id) {
-          await this.deps.archon.approveRun(gate.run_id, effect.message ?? undefined);
+          await this.deps.executorClient.approveRun(gate.run_id, effect.message ?? undefined);
         }
         this.deps.state.supervised_gates.delete(key);
         return;
       }
-      case 'archon_reject': {
+      case 'executor_reject': {
         const key = makeWorkerKey(effect.identity.parent_issue_id, effect.identity.repo_alias);
         const gate = this.deps.state.supervised_gates.get(key);
         if (gate?.run_id) {
-          await this.deps.archon.rejectRun(gate.run_id, effect.reason);
+          await this.deps.executorClient.rejectRun(gate.run_id, effect.reason);
         }
         this.deps.state.supervised_gates.delete(key);
         return;
       }
-      case 'archon_approve_and_resume': {
+      case 'executor_approve_and_resume': {
         const key = makeWorkerKey(effect.identity.parent_issue_id, effect.identity.repo_alias);
         const gate = this.deps.state.supervised_gates.get(key);
         if (gate?.run_id) {

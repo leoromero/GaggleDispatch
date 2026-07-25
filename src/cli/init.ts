@@ -126,7 +126,7 @@ export async function runInit(opts: { cwd?: string }): Promise<void> {
     break;
   }
 
-  const defaultWorkflow = await readLine('Default Archon workflow', 'gaggle/gaggle-fix-issue');
+  const defaultWorkflow = await readLine('Default workflow', 'gaggle/gaggle-fix-issue');
   const analyzerModel = await readLine('Claude analyzer model', 'claude-sonnet-4-5');
 
   // Linear auth mode. OAuth (actor=app) gives the gaggle a separate identity
@@ -176,11 +176,10 @@ export async function runInit(opts: { cwd?: string }): Promise<void> {
     polling: { interval_ms: 30_000 },
     workspace: { root: '~/gaggle_workspaces' },
     hooks: {
-      // `--merged` removes worktrees whose branches have been merged (safe
-      // per-run cleanup). Startup separately sweeps idle worktrees via
-      // `archon.startup_cleanup_age_days`; the hook only needs the
-      // merged-branch case.
-      after_run: 'archon isolation cleanup --merged --cwd . || true',
+      // Worktree cleanup is built in now: `gaggle start` sweeps idle worktrees
+      // on boot (executor.startup_cleanup_age_days), preserving any that back
+      // an open PR. Set a command here only for project-specific teardown.
+      after_run: null,
     },
     agent: {
       max_concurrent_agents: 8,

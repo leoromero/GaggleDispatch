@@ -125,11 +125,11 @@ repo
 
 repo
   .command('scaffold <url>')
-  .description('Generate a draft gaggle.md PR via Archon (blocking; --async to detach)')
+  .description('Generate a draft gaggle.md PR (blocking; --async to detach)')
   .option('--async', 'detach and return immediately')
   .option('--branch <name>', 'override the working branch')
-  .option('--message <text>', 'override the user message passed to Archon')
-  .option('--from-branch <name>', 'pass through to Archon as --from')
+  .option('--message <text>', 'override the user message passed to the workflow')
+  .option('--from-branch <name>', 'branch to cut the worktree from')
   .action(async (
     url: string,
     opts: { async?: boolean; branch?: string; message?: string; fromBranch?: string },

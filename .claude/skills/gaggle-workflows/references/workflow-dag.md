@@ -28,9 +28,9 @@ Top-level YAML fields on a workflow object. Per-node overrides (same name under 
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `name` | string (required) | Workflow identifier (used in `archon workflow run <name>`) |
+| `name` | string (required) | Workflow identifier (used in `gaggle workflow run <name>`) |
 | `description` | string (required) | Human-readable summary. Used for routing; see [Workflow Description Best Practices](https://archon.diy/guides/authoring-workflows/#workflow-description-best-practices) |
-| `provider` | string | AI provider (e.g. `claude`, `codex`, `pi`). Default: from `.archon/config.yaml` |
+| `provider` | string | AI provider (e.g. `claude`, `codex`, `pi`). Default: from `.gaggle/config.yaml` |
 | `model` | string | Model override. Claude: `sonnet` \| `opus` \| `haiku` \| `claude-*` \| `inherit`. Codex: any non-Claude model ID |
 | `interactive` | boolean | **Required for web UI** when the workflow has approval gates or `loop.interactive` nodes. Forces foreground execution so gate messages reach the user's chat. Default: `false` (background on web) |
 
@@ -40,7 +40,7 @@ Top-level YAML fields on a workflow object. Per-node overrides (same name under 
 |-------|------|-------------|
 | `worktree.enabled` | boolean | Pin isolation regardless of caller. `false` = always live checkout (CLI `--branch`/`--from` hard-error). `true` = always worktree (CLI `--no-worktree` hard-errors). Omit = caller decides. Use `false` for read-only workflows (triage, reporting) |
 
-Other worktree config (`baseBranch`, `copyFiles`, `initSubmodules`, `path`) lives in `.archon/config.yaml`, not the workflow YAML — see `references/repo-init.md`.
+Other worktree config (`baseBranch`, `copyFiles`, `initSubmodules`, `path`) lives in `.gaggle/config.yaml`, not the workflow YAML — see `references/repo-init.md`.
 
 ### Claude SDK Advanced Options
 
@@ -107,10 +107,10 @@ nodes:
 Each node must have exactly ONE of these fields: `command`, `prompt`, `bash`, `script`, `loop`, `approval`, or `cancel`.
 
 ### Command Node
-Runs a command file from `.archon/commands/`:
+Runs a command file from `.gaggle/commands/`:
 ```yaml
 - id: investigate
-  command: investigate-issue         # Loads .archon/commands/investigate-issue.md
+  command: investigate-issue         # Loads .gaggle/commands/investigate-issue.md
 ```
 
 ### Prompt Node
@@ -163,16 +163,16 @@ Runs TypeScript/JavaScript (via `bun`) or Python (via `uv`) without AI. Same std
   deps: ["httpx>=0.27"]             # Optional — 'uv run --with <dep>'. Ignored for bun.
 ```
 
-**Named script from `.archon/scripts/`:**
+**Named script from `.gaggle/scripts/`:**
 ```yaml
 - id: analyze
-  script: analyze-metrics           # Resolves .archon/scripts/analyze-metrics.py
+  script: analyze-metrics           # Resolves .gaggle/scripts/analyze-metrics.py
   runtime: uv                       # Must match file extension (.ts/.js → bun, .py → uv)
   deps: ["pandas>=2.0"]
 ```
 
 - **Inline vs named**: a `script` value is treated as inline code if it contains a newline or any shell metacharacter (space, or any of: `;` `(` `)` `{` `}` `&` `|` `<` `>` `$` `` ` `` `"` `'`). Otherwise it's a named-script lookup (bare identifier).
-- **Named script resolution**: `<cwd>/.archon/scripts/` (wins) → `~/.archon/scripts/`. 1-level subfolder grouping allowed. Extension determines runtime (`.ts`/`.js` → `bun`, `.py` → `uv`) and MUST match the declared `runtime:`
+- **Named script resolution**: `<cwd>/.gaggle/scripts/` (wins) → `~/.gaggle/scripts/`. 1-level subfolder grouping allowed. Extension determines runtime (`.ts`/`.js` → `bun`, `.py` → `uv`) and MUST match the declared `runtime:`
 - **Dispatch**:
   - `bun` + inline → `bun --no-env-file -e '<code>'`
   - `bun` + named → `bun --no-env-file run <path>`
@@ -362,7 +362,7 @@ Loop nodes accept `provider`/`model` without error but ignore them at runtime.
 When a workflow fails, already-completed nodes are skipped on the next run:
 
 ```bash
-archon workflow run my-workflow --resume
+gaggle workflow run my-workflow --resume
 ```
 
 ---
@@ -423,7 +423,7 @@ The flow:
 1. Iteration N runs. AI produces output.
 2. If AI signalled completion (`<promise>DONE</promise>`) or `until_bash` exited 0, loop ends.
 3. Otherwise: `gate_message` is sent to the user, workflow pauses (status = `paused`).
-4. User runs `archon workflow approve <run-id> "<their feedback>"` (or replies naturally in chat platforms).
+4. User runs `gaggle workflow approve <run-id> "<their feedback>"` (or replies naturally in chat platforms).
 5. Iteration N+1 runs with `$LOOP_USER_INPUT` substituted to the user's feedback — but **only on that first resumed iteration**. Subsequent iterations in the same resumed session see `$LOOP_USER_INPUT` as empty string.
 6. Repeat.
 
@@ -536,10 +536,10 @@ nodes:
 
 ```bash
 # From the CLI
-archon workflow approve <run-id>
-archon workflow approve <run-id> --comment "looks good"
-archon workflow reject <run-id>
-archon workflow reject <run-id> --reason "plan needs more test coverage"
+gaggle workflow approve <run-id>
+gaggle workflow approve <run-id> --comment "looks good"
+gaggle workflow reject <run-id>
+gaggle workflow reject <run-id> --reason "plan needs more test coverage"
 
 # Cross-platform (Slack / Telegram / Web / GitHub chat)
 /workflow approve <run-id> <optional comment>
@@ -634,7 +634,7 @@ Standard DAG fields (`id`, `depends_on`, `when`, `trigger_rule`, `idle_timeout`)
 Before declaring a workflow complete, validate it:
 
 ```bash
-archon validate workflows <name>
+gaggle validate workflows <name>
 ```
 
 Fix any errors and re-validate until the command returns clean. This checks:
@@ -644,7 +644,7 @@ Fix any errors and re-validate until the command returns clean. This checks:
 - All `mcp:` config files exist and contain valid JSON
 - All `skills:` directories exist
 
-Use `--json` for machine-readable output. Use `archon validate commands <name>` to validate individual command files.
+Use `--json` for machine-readable output. Use `gaggle validate commands <name>` to validate individual command files.
 
 ## Validation Rules (Load Time)
 
@@ -654,7 +654,7 @@ Use `--json` for machine-readable output. Use `archon validate commands <name>` 
 - `$nodeId.output` refs in `when:`, `prompt:`, `loop.prompt:` must point to known IDs
 - Exactly one of `command`, `prompt`, `bash`, `script`, `loop`, `approval`, `cancel` per node
 - Script nodes require `runtime: bun` or `runtime: uv`
-- Named scripts must exist in `.archon/scripts/` or `~/.archon/scripts/` with extension matching declared runtime
+- Named scripts must exist in `.gaggle/scripts/` or `~/.gaggle/scripts/` with extension matching declared runtime
 - `retry` on loop node = hard error
 - `approval.message` required and non-empty
 - `cancel` reason required and non-empty
