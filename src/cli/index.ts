@@ -17,6 +17,7 @@ import { runStatus, runPs } from './status.ts';
 import { runStart } from './start.ts';
 import { runTemplatesUpdate } from './templates-update.ts';
 import { runDbMigrate, runDoctor } from './doctor.ts';
+import { runWorkflowList, runWorkflowValidate } from './workflow.ts';
 import {
   runNestAdd,
   runNestInit,
@@ -49,6 +50,27 @@ program
   .description('Bootstrap a new GaggleDispatch deployment (creates WORKFLOW.md)')
   .action(async () => {
     await runInit({ cwd: program.opts().cwd });
+  });
+
+// ── workflow subcommands ────────────────────────────────────────────────
+const workflow = program.command('workflow').description('Inspect and validate workflow definitions');
+
+workflow
+  .command('list')
+  .description('List workflows discoverable from this directory')
+  .option('--dir <path>', 'additional directory to search')
+  .option('--json', 'machine-readable output')
+  .action(async (opts: { dir?: string; json?: boolean }) => {
+    await runWorkflowList({ cwd: program.opts().cwd, dir: opts.dir, json: opts.json });
+  });
+
+workflow
+  .command('validate [name]')
+  .description('Validate workflow YAML and DAG structure')
+  .option('--dir <path>', 'additional directory to search')
+  .option('--json', 'machine-readable output')
+  .action(async (name: string | undefined, opts: { dir?: string; json?: boolean }) => {
+    await runWorkflowValidate(name, { cwd: program.opts().cwd, dir: opts.dir, json: opts.json });
   });
 
 // ── doctor ─────────────────────────────────────────────────────────────

@@ -1087,7 +1087,7 @@ nodes:
       "Add gaggle.md (GaggleDispatch self-description)"
 `;
 
-const TEMPLATES: Record<string, string> = {
+export const TEMPLATES: Record<string, string> = {
   'gaggle-fix-issue.yaml': FIX_ISSUE,
   'gaggle-supervised.yaml': SUPERVISED,
   'gaggle-scaffold.yaml': SCAFFOLD,
