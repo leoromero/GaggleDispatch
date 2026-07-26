@@ -3,7 +3,7 @@
  * transitions and performs the side effects.
  *
  * The applier is the single owner of side effects: it makes Linear API calls,
- * Archon control-plane calls, run-registry writes, in-memory state mutations,
+ * executor control-plane calls, run-registry writes, in-memory state mutations,
  * worker spawn/cancel via injected hooks, and retry timer scheduling. Anything
  * that mutates the world goes through here.
  *
@@ -17,7 +17,7 @@
  *     hooks so the orchestrator retains responsibility for that wiring.
  *   - `executor_approve` / `executor_reject` resolve their run_id from the live
  *     `supervised_gates` entry keyed by identity, then delete that entry —
- *     coupling the Archon call with the in-memory cleanup so callers don't
+ *     coupling the executor call with the in-memory cleanup so callers don't
  *     have to chase both.
  */
 
@@ -152,7 +152,7 @@ export class EffectApplier {
         this.deps.workspace.cleanAuxiliaryWorkspace(effect.issue_identifier);
         return;
 
-      // ─── Archon control plane (resolves run_id from gate, cleans up) ───
+      // ─── executor control plane (resolves run_id from gate, cleans up) ───
       case 'executor_approve': {
         const key = makeWorkerKey(effect.identity.parent_issue_id, effect.identity.repo_alias);
         const gate = this.deps.state.supervised_gates.get(key);

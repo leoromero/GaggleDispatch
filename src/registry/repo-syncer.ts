@@ -105,7 +105,7 @@ function detectStack(localPath: string): 'node' | 'python' | 'rust' | 'go' | 'un
 
 const VALIDATE_SCRIPTS: Record<string, string> = {
   node: `#!/usr/bin/env bash
-# .gaggle/validate.sh — run by GaggleDispatch after each Archon implementation.
+# .gaggle/validate.sh — run by GaggleDispatch after each implementation pass.
 # Commit this file so all agents use the same validation commands.
 set -euo pipefail
 if [ -f bun.lockb ]; then runner=bun
@@ -118,7 +118,7 @@ $runner run lint 2>/dev/null || echo "[validate] no lint script, skipping"
 $runner test
 `,
   python: `#!/usr/bin/env bash
-# .gaggle/validate.sh — run by GaggleDispatch after each Archon implementation.
+# .gaggle/validate.sh — run by GaggleDispatch after each implementation pass.
 # Commit this file so all agents use the same validation commands.
 set -euo pipefail
 echo "[validate] running Python tests"
@@ -129,7 +129,7 @@ else
 fi
 `,
   rust: `#!/usr/bin/env bash
-# .gaggle/validate.sh — run by GaggleDispatch after each Archon implementation.
+# .gaggle/validate.sh — run by GaggleDispatch after each implementation pass.
 # Commit this file so all agents use the same validation commands.
 set -euo pipefail
 echo "[validate] running Rust checks"
@@ -137,7 +137,7 @@ cargo check
 cargo test
 `,
   go: `#!/usr/bin/env bash
-# .gaggle/validate.sh — run by GaggleDispatch after each Archon implementation.
+# .gaggle/validate.sh — run by GaggleDispatch after each implementation pass.
 # Commit this file so all agents use the same validation commands.
 set -euo pipefail
 echo "[validate] running Go tests"
@@ -145,7 +145,7 @@ go build ./...
 go test ./...
 `,
   unknown: `#!/usr/bin/env bash
-# .gaggle/validate.sh — run by GaggleDispatch after each Archon implementation.
+# .gaggle/validate.sh — run by GaggleDispatch after each implementation pass.
 # Commit this file and replace this placeholder with your actual test commands.
 set -euo pipefail
 echo "[validate] no stack detected — edit .gaggle/validate.sh with your test commands"

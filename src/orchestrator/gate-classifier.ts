@@ -3,7 +3,7 @@
  *
  * Replaces the rigid keyword regex for supervised-gate replies so that natural
  * answers to clarifying questions ("Use REST not GraphQL") are recognised as
- * approvals and forwarded to Archon as $LOOP_USER_INPUT, not dropped.
+ * approvals and forwarded to the run as $LOOP_USER_INPUT, not dropped.
  *
  * Falls back to the regex classifier when no API key is available (CI / tests).
  */
@@ -14,7 +14,7 @@ import { logger } from '../util/logger.ts';
 
 export interface GateClassification {
   intent: 'approve' | 'reject' | 'ambiguous' | 'create_blocker';
-  /** Message to forward to Archon (approve comment or reject reason). */
+  /** Message to forward to the run (approve comment or reject reason). */
   message: string;
   /** Populated when intent === 'create_blocker'. */
   blocker?: { title: string; description: string };
@@ -39,7 +39,7 @@ Classify the gate message or the LATEST human reply in the thread:
 - "create_blocker": the gate message starts with CREATE_BLOCKER (agent signalling it needs a dependency resolved in another repo). No human reply is needed — detect this from the gate message itself.
 
 For "create_blocker": extract blocker_title (first non-empty line after CREATE_BLOCKER) and blocker_description (remaining lines).
-For "message": include the full conversation thread so Archon has complete context for $LOOP_USER_INPUT.
+For "message": include the full conversation thread so the run has complete context for $LOOP_USER_INPUT.
 
 Respond with JSON only — no prose:
 {"intent": "approve"|"reject"|"ambiguous"|"create_blocker", "message": "<thread>", "blocker_title": "<title or null>", "blocker_description": "<description or null>"}`;

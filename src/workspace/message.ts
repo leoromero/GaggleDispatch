@@ -1,6 +1,6 @@
 /**
  * Issue message construction (Section 13.2).
- * Becomes `$USER_MESSAGE` inside Archon workflows.
+ * Becomes `$USER_MESSAGE` inside the workflow.
  */
 
 import type { Issue, IssueAnalysis, RepoTarget } from '../domain/types.ts';

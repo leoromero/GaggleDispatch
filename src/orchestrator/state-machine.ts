@@ -19,7 +19,7 @@
  *
  * Linear labels are the PROJECTION of state machine state, not the source of
  * truth. The state machine is authoritative; the EffectApplier reconciles
- * labels eventually. Recovery on startup reads labels + Archon status +
+ * labels eventually. Recovery on startup reads labels + run status +
  * persisted run/retry entries and classifies each parent and target into its
  * current state.
  *
@@ -114,13 +114,13 @@ export type ParentEvent =
  *               Labels:  `gaggle:dispatching`. Sub-second window; the label
  *               exists so a crash here is recoverable.
  *
- * running       Entered: Archon subprocess spawned (or detached run discovered
+ * running       Entered: workflow run started (or an adopted run discovered
  *                        at startup). run id may not be captured yet.
  *               Exited:  worker_succeeded → succeeded; worker_failed → retrying;
  *                        gate_paused → gate_waiting.
  *               Labels:  `gaggle:running`.
  *
- * gate_waiting  Entered: Archon paused at a supervised approval gate.
+ * gate_waiting  Entered: the run paused at a supervised approval gate.
  *               Exited:  gate_approved → running; gate_rejected/timed_out →
  *                        retrying; gate_create_blocker → queued (with a Linear
  *                        blocker relation created against a new blocker issue).
@@ -133,7 +133,7 @@ export type ParentEvent =
  *                        transition fn itself, transition resolves to `failed`).
  *               Labels:  `gaggle:retrying`.
  *
- * succeeded     Terminal. Archon completed; target_issue_id moved to Linear
+ * succeeded     Terminal. The run completed; target_issue_id moved to Linear
  *               terminal state. No labels. Emits `target_terminal` to parent.
  *
  * failed        Parked for human review under the no-auto-retry policy. The
@@ -177,7 +177,7 @@ export type TargetEvent =
 
 // ─── Effects ───────────────────────────────────────────────────────────────
 
-/** Metadata persisted alongside an Archon run id (extends current RunEntry). */
+/** Metadata persisted alongside a run id (extends current RunEntry). */
 export interface RunMeta {
   parent_issue_id: string;
   sub_issue_id: string | null;
@@ -194,7 +194,7 @@ export interface RetryMeta {
 
 /**
  * Side effects emitted by transition functions. The EffectApplier interprets
- * these into Linear API calls, Archon API calls, subprocess management, and
+ * these into Linear API calls, executor calls, worker management, and
  * in-memory state mutations. Describing effects as data keeps transitions
  * pure, makes them trivially unit-testable, and allows the applier to retry
  * idempotent ops without rewinding state.
@@ -214,15 +214,15 @@ export type Effect =
   | { kind: 'cancel_worker'; key: WorkerKey }
   | { kind: 'cleanup_workspace'; issue_identifier: string }
 
-  // Archon control plane. The applier resolves the run_id from the live
+  // Executor control plane. The applier resolves the run_id from the live
   // supervised_gates entry keyed by identity, and removes that gate entry as
-  // an atomic part of the operation. This couples the Archon call with the
+  // an atomic part of the operation. This couples the executor call with the
   // in-memory gate cleanup, matching the current orchestrator's semantics.
   | { kind: 'executor_approve'; identity: TargetIdentity; message: string | null }
   | { kind: 'executor_reject'; identity: TargetIdentity; reason: string }
   // executor_approve_and_resume is distinct from executor_approve: rather than
   // just storing the approval via the HTTP API, it spawns the
-  // `archon workflow approve <run_id> <comment>` subprocess which records
+  // executor call, which records the decision and resumes in one step,
   // the comment as the gate's output AND resumes the workflow. The applier
   // delegates to the approveAndResume hook (orchestrator-owned), which sets
   // up callbacks that thread back into handleWorkerExit / handleGatePaused.
@@ -322,7 +322,7 @@ export interface ParentClassification {
  * Inputs the target classifier reads to determine TargetState at startup.
  *
  *  - executor_run: matched via persisted run-registry entry first, falling back
- *    to a heuristic search of recent Archon runs by repo basename.
+ *    to a heuristic search of recent runs by repo basename.
  *  - persisted_retry: pulled from the retry-registry (new), null if absent.
  */
 export interface TargetRecoveryInputs {
@@ -336,7 +336,7 @@ export interface TargetRecoveryInputs {
 export interface TargetClassification {
   identity: TargetIdentity;
   state: TargetState;
-  /** Archon run id to thread into subsequent state (gate entries, detached runs). */
+  /** Run id to thread into subsequent state (gate entries, adopted runs). */
   run_id: string | null;
   /** Recovered attempt count: 0 = first run, ≥1 = retry attempt. */
   attempt: number;
@@ -702,18 +702,18 @@ export const classifyParentState: ParentClassifierFn = (inp) => {
 };
 
 /**
- * Pure classifier: target label set + Archon status → TargetState.
+ * Pure classifier: target label set + run status → TargetState.
  *
  * Resolution order (each branch returns; later branches don't run):
  *
  *   1. gaggle:waiting-human            → gate_waiting
- *      Gate is authoritative for this label; Archon status is informational.
+ *      Gate is authoritative for this label; run status is informational.
  *
- *   2. gaggle:running, reconciled with Archon status:
- *        Archon paused                 → gate_waiting   (label drift; gate is truth)
- *        Archon completed              → succeeded      (label drift; run finished)
- *        Archon running                → running        (live, possibly detached)
- *        Archon failed / not-found     → retrying       (the orchestrator will re-queue)
+ *   2. gaggle:running, reconciled with run status:
+ *        run paused                    → gate_waiting   (label drift; gate is truth)
+ *        run completed                 → succeeded      (label drift; run finished)
+ *        run running                   → running        (live, possibly adopted)
+ *        run failed / not-found        → retrying       (the orchestrator will re-queue)
  *
  *   3. gaggle:queued                   → queued
  *
@@ -738,14 +738,14 @@ export const classifyTargetState: TargetClassifierFn = (inp) => {
   }
 
   if (inp.target_labels.has('running')) {
-    const archonStatus = inp.executor_run?.status ?? null;
-    if (archonStatus === 'paused') {
+    const runStatus = inp.executor_run?.status ?? null;
+    if (runStatus === 'paused') {
       return { identity: inp.identity, state: 'gate_waiting', run_id: runId, attempt: recoveredAttempt };
     }
-    if (archonStatus === 'completed') {
+    if (runStatus === 'completed') {
       return { identity: inp.identity, state: 'succeeded', run_id: runId, attempt: recoveredAttempt };
     }
-    if (archonStatus === 'running') {
+    if (runStatus === 'running') {
       return { identity: inp.identity, state: 'running', run_id: runId, attempt: recoveredAttempt };
     }
     return { identity: inp.identity, state: 'retrying', run_id: null, attempt: recoveredAttempt };
@@ -771,7 +771,7 @@ export const classifyTargetState: TargetClassifierFn = (inp) => {
  * `gate_timed_out`. Under the no-auto-retry policy this always parks the
  * target in `failed` and posts a comment on the target issue so a human can
  * review and decide. `extraEffects` are prepended (used by gate-reject /
- * timeout to first reject the live Archon run).
+ * timeout to first reject the live run).
  *
  * The target stays in `failed` until human action — there is no automatic
  * recovery and no maximum-retries cap. The parent SM stays in `claimed`

@@ -2422,7 +2422,7 @@ export class Orchestrator {
       // Prefer title-derived alias (sub-issues), fall back to persisted run entry (parent issues).
       const aliasGuess = m ? m[1]! : (runAliasById.get(parentId) ?? null);
       if (!aliasGuess) continue;
-      // Reconstruct the supervised_gates entry, restoring the Archon run_id so that
+      // Reconstruct the supervised_gates entry, restoring the run_id so that
       // approve/reject can be forwarded even after the hub was restarted.
       const recoveredRunId = runIdById.get(parentId) ?? null;
       const key = workerKey(parentId, aliasGuess);
