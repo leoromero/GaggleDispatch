@@ -153,7 +153,14 @@ export const claudeRunner: AiRunner = async (req) => {
     cancelled = true;
     abort.abort();
   };
-  req.signal?.addEventListener('abort', onExternalAbort, { once: true });
+  // Check the current state as well as subscribing: a listener added to an
+  // already-aborted signal never fires, so a node dispatched after the run was
+  // cancelled would have started a fresh model call regardless.
+  if (req.signal?.aborted) {
+    onExternalAbort();
+  } else {
+    req.signal?.addEventListener('abort', onExternalAbort, { once: true });
+  }
 
   let text = '';
   let sessionId: string | null = null;
