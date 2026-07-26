@@ -6,14 +6,15 @@
  * The test is skipped automatically if `git` is not on PATH.
  */
 
-import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
+import { afterAll, beforeAll, beforeEach, describe, expect, test } from 'bun:test';
 import { existsSync, mkdirSync, readFileSync, writeFileSync, chmodSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
 import { mkdtempSync } from 'node:fs';
 import { applyNameCollisions, runSyncPass } from '../registry/repo-syncer.ts';
 import { commandExists, run, runOrThrow } from '../util/subprocess.ts';
-import { loadSyncedRegistry, syncedRegistryPath } from '../registry/synced-registry.ts';
+import { loadSyncedRegistry } from '../registry/synced-registry.ts';
+import { MemoryStore } from '../executor/store/memory.ts';
 import type { SyncedRegistryRepoEntry } from '../domain/types.ts';
 import { makeServiceConfig, makeSyncedEntry } from './helpers/fixtures.ts';
 
@@ -138,6 +139,9 @@ afterAll(() => {
   else delete process.env.GIT_CONFIG_VALUE_0;
 });
 
+let store: MemoryStore;
+beforeEach(() => { store = new MemoryStore(); });
+
 describe('Repo Syncer integration', () => {
   test('end-to-end: clones, parses gaggle.md, writes registry.synced.yaml', async () => {
     if (!gitOk || !nodeOk) {
@@ -167,7 +171,7 @@ describe('Repo Syncer integration', () => {
     process.env.GIT_CONFIG_KEY_0 = 'url.' + asUnixPath(bare) + '.insteadOf';
     process.env.GIT_CONFIG_VALUE_0 = 'https://github.com/test-org/test-repo';
 
-    const result = await runSyncPass(cfg, { quiet: true });
+    const result = await runSyncPass(cfg, { store, quiet: true });
     expect(result.ok).toBe(1);
     expect(result.errors).toBe(0);
     expect(result.missing).toBe(0);
@@ -178,9 +182,9 @@ describe('Repo Syncer integration', () => {
     expect(entry.frontmatter?.name).toBe('test-repo');
     expect(entry.frontmatter?.components[0]!.name).toBe('test-api');
 
-    const persisted = loadSyncedRegistry(baseFolder);
+    const persisted = await loadSyncedRegistry(store);
     expect(persisted!.repositories[0]!.frontmatter?.name).toBe('test-repo');
-    expect(existsSync(syncedRegistryPath(baseFolder))).toBe(true);
+    expect(persisted).not.toBeNull();
   }, 30_000);
 
   test('end-to-end: missing gaggle.md results in sync_status=missing_gaggle_md', async () => {
@@ -202,7 +206,7 @@ describe('Repo Syncer integration', () => {
     process.env.GIT_CONFIG_KEY_0 = 'url.' + asUnixPath(bare) + '.insteadOf';
     process.env.GIT_CONFIG_VALUE_0 = 'https://github.com/test-org/no-gaggle';
 
-    const result = await runSyncPass(cfg, { quiet: true });
+    const result = await runSyncPass(cfg, { store, quiet: true });
     expect(result.missing).toBe(1);
     expect(result.per_repo[0]!.sync_status).toBe('missing_gaggle_md');
     expect(result.per_repo[0]!.sync_error).toMatch(/No gaggle.md/i);
@@ -231,7 +235,7 @@ describe('Repo Syncer integration', () => {
     process.env.GIT_CONFIG_KEY_0 = 'url.' + asUnixPath(okBuild.bare) + '.insteadOf';
     process.env.GIT_CONFIG_VALUE_0 = 'https://github.com/test-org/test-repo';
 
-    const result = await runSyncPass(cfg, { quiet: true });
+    const result = await runSyncPass(cfg, { store, quiet: true });
     expect(result.ok).toBe(1);
     expect(result.errors).toBe(1);
     const errEntry = result.per_repo.find((r) => r.url.includes('missing-repo'))!;
@@ -251,7 +255,7 @@ describe('Repo Syncer integration', () => {
         { url: 'https://github.com/org-b/dup', default_branch: 'main' },
       ],
     });
-    await expect(runSyncPass(cfg, { quiet: true })).rejects.toThrow(/same slug/i);
+    await expect(runSyncPass(cfg, { store, quiet: true })).rejects.toThrow(/same slug/i);
   });
 });
 

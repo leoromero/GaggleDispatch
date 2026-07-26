@@ -2,19 +2,15 @@
  * Synced Registry I/O (Sections 6.5).
  *
  * Owned exclusively by the Repo Syncer. The Repo Registry Loader reads it.
- * File location: `<base_folder>/registry.synced.yaml`.
+ *
+ * Was `<base_folder>/registry.synced.yaml`. Moving it into Postgres removed a
+ * same-process round trip: the syncer wrote the file so that the loader — in
+ * the same process — could notice via a filesystem watcher and re-read it.
  */
 
-import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
-import * as YAML from 'yaml';
-import { SyncedRegistryParseError } from '../domain/errors.ts';
 import type { ServiceConfig, SyncedRegistry } from '../domain/types.ts';
-import { writeFileAtomic } from '../util/fs.ts';
-
-export function syncedRegistryPath(baseFolder: string): string {
-  return join(baseFolder, 'registry.synced.yaml');
-}
+import type { Store } from '../executor/store/types.ts';
 
 export function reposBaseDir(baseFolder: string): string {
   return join(baseFolder, 'repos');
@@ -28,36 +24,56 @@ export function resolveReposDir(cfg: ServiceConfig): string {
   return cfg.registry.repos_path ?? reposBaseDir(cfg.registry.base_folder);
 }
 
-export function loadSyncedRegistry(baseFolder: string): SyncedRegistry | null {
-  const path = syncedRegistryPath(baseFolder);
-  if (!existsSync(path)) return null;
-  const text = readFileSync(path, 'utf8');
-  let parsed: unknown;
-  try {
-    parsed = YAML.parse(text);
-  } catch (err) {
-    throw new SyncedRegistryParseError(`Failed to parse ${path}: ${(err as Error).message}`, err);
-  }
-  if (parsed === null || parsed === undefined) {
-    throw new SyncedRegistryParseError(`Synced registry at ${path} is empty`);
-  }
-  if (typeof parsed !== 'object') {
-    throw new SyncedRegistryParseError(`Synced registry at ${path} is not a YAML map`);
-  }
-  const obj = parsed as Record<string, unknown>;
-  const synced_at = typeof obj.synced_at === 'string' ? obj.synced_at : new Date(0).toISOString();
-  const repositories = Array.isArray(obj.repositories) ? obj.repositories : [];
+/**
+ * Load the registry the syncer last wrote.
+ *
+ * Returns null before the first sync, which callers treat as "not synced yet"
+ * rather than an error.
+ */
+export async function loadSyncedRegistry(store: Store): Promise<SyncedRegistry | null> {
+  const row = await store.loadSyncedRegistry();
+  if (!row) return null;
   return {
-    synced_at,
-    repositories: repositories as SyncedRegistry['repositories'],
+    synced_at: row.synced_at,
+    repositories: row.repositories.map((r) => ({
+      url: r.url,
+      slug: r.slug,
+      default_branch: r.default_branch,
+      local_path: r.local_path,
+      last_synced_at: r.last_synced_at,
+      last_commit_sha: r.last_commit_sha,
+      sync_status: r.sync_status as SyncedRegistry['repositories'][number]['sync_status'],
+      sync_error: r.sync_error,
+      frontmatter: (r.frontmatter ?? null) as SyncedRegistry['repositories'][number]['frontmatter'],
+      narrative: r.narrative,
+    })),
   };
 }
 
-export function writeSyncedRegistry(baseFolder: string, registry: SyncedRegistry): void {
-  const path = syncedRegistryPath(baseFolder);
-  const yaml = YAML.stringify(registry, { lineWidth: 0 });
-  const banner =
-    '# AUTO-GENERATED — do not hand-edit. Owned by the GaggleDispatch Repo Syncer.\n' +
-    '# Re-run `gaggle sync` (or restart the orchestrator) to refresh.\n';
-  writeFileAtomic(path, banner + yaml);
+/**
+ * Replace the registry wholesale.
+ *
+ * One transaction, so a reader never observes a partially-written registry —
+ * the atomic-file-write this replaced achieved the same thing by renaming a
+ * temp file into place.
+ */
+export async function writeSyncedRegistry(
+  store: Store,
+  registry: SyncedRegistry,
+): Promise<void> {
+  await store.replaceSyncedRegistry(
+    registry.synced_at,
+    registry.repositories.map((r) => ({
+      url: r.url,
+      slug: r.slug,
+      default_branch: r.default_branch,
+      local_path: r.local_path,
+      last_synced_at: r.last_synced_at,
+      last_commit_sha: r.last_commit_sha,
+      sync_status: r.sync_status,
+      sync_error: r.sync_error,
+      frontmatter: r.frontmatter ?? null,
+      narrative: r.narrative,
+    })),
+  );
 }

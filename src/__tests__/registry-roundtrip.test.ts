@@ -7,7 +7,6 @@ import { MemoryStore } from '../executor/store/memory.ts';
 import { describe, expect, test } from 'bun:test';
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { SyncedRegistryParseError } from '../domain/errors.ts';
 import {
   findScaffoldJob,
   loadScaffoldJobs,
@@ -17,21 +16,18 @@ import {
 import {
   loadSyncedRegistry,
   reposBaseDir,
-  syncedRegistryPath,
   writeSyncedRegistry,
 } from '../registry/synced-registry.ts';
 import type { ScaffoldJob, SyncedRegistry } from '../domain/types.ts';
 import { makeSyncedEntry, tmp } from './helpers/fixtures.ts';
 
 describe('synced-registry round-trip', () => {
-  test('returns null when file does not exist', () => {
-    const dir = tmp();
-    expect(loadSyncedRegistry(dir)).toBeNull();
+  test('returns null before the first sync', async () => {
+    expect(await loadSyncedRegistry(new MemoryStore())).toBeNull();
   });
 
-  test('write then load preserves repositories and synced_at', () => {
-    const dir = tmp();
-    mkdirSync(dir, { recursive: true });
+  test('write then load preserves repositories and synced_at', async () => {
+    const store = new MemoryStore();
     const registry: SyncedRegistry = {
       synced_at: '2026-05-09T12:34:56Z',
       repositories: [
@@ -39,47 +35,52 @@ describe('synced-registry round-trip', () => {
         makeSyncedEntry({ slug: 'b', url: 'https://github.com/o/b', sync_status: 'error', sync_error: 'boom' }),
       ],
     };
-    writeSyncedRegistry(dir, registry);
-    const loaded = loadSyncedRegistry(dir);
+    await writeSyncedRegistry(store, registry);
+
+    const loaded = await loadSyncedRegistry(store);
     expect(loaded).not.toBeNull();
     expect(loaded!.synced_at).toBe('2026-05-09T12:34:56Z');
-    expect(loaded!.repositories.length).toBe(2);
+    expect(loaded!.repositories).toHaveLength(2);
     expect(loaded!.repositories[1]!.sync_status).toBe('error');
     expect(loaded!.repositories[1]!.sync_error).toBe('boom');
   });
 
-  test('writes the AUTO-GENERATED banner', () => {
-    const dir = tmp();
-    writeSyncedRegistry(dir, { synced_at: 'now', repositories: [] });
-    const text = readFileSync(syncedRegistryPath(dir), 'utf8');
-    expect(text).toMatch(/AUTO-GENERATED/);
+  test('frontmatter survives the round trip with its components', async () => {
+    const store = new MemoryStore();
+    await writeSyncedRegistry(store, {
+      synced_at: 'now',
+      repositories: [
+        makeSyncedEntry({
+          slug: 'a',
+          frontmatter: {
+            name: 'a',
+            description: 'd',
+            default_workflow: 'gaggle/gaggle-fix-issue',
+            components: [{ name: 'api', description: 'the api' }],
+          },
+        }),
+      ],
+    });
+    const loaded = await loadSyncedRegistry(store);
+    expect(loaded!.repositories[0]!.frontmatter?.components[0]!.name).toBe('api');
   });
 
-  test('throws SyncedRegistryParseError on malformed YAML', () => {
-    const dir = tmp();
-    mkdirSync(dir, { recursive: true });
-    writeFileSync(syncedRegistryPath(dir), 'not: : valid: yaml: ::\n  - bad');
-    expect(() => loadSyncedRegistry(dir)).toThrow(SyncedRegistryParseError);
-  });
-
-  test('throws SyncedRegistryParseError on empty file', () => {
-    const dir = tmp();
-    mkdirSync(dir, { recursive: true });
-    writeFileSync(syncedRegistryPath(dir), '');
-    expect(() => loadSyncedRegistry(dir)).toThrow(SyncedRegistryParseError);
+  test('a write replaces the previous registry rather than merging', async () => {
+    const store = new MemoryStore();
+    await writeSyncedRegistry(store, {
+      synced_at: 'first',
+      repositories: [makeSyncedEntry({ slug: 'a' }), makeSyncedEntry({ slug: 'b', url: 'https://github.com/o/b' })],
+    });
+    await writeSyncedRegistry(store, {
+      synced_at: 'second',
+      repositories: [makeSyncedEntry({ slug: 'a' })],
+    });
+    const loaded = await loadSyncedRegistry(store);
+    expect(loaded!.repositories.map((r) => r.slug)).toEqual(['a']);
   });
 
   test('reposBaseDir returns base_folder/repos', () => {
     expect(reposBaseDir('/tmp/base').replace(/\\/g, '/')).toBe('/tmp/base/repos');
-  });
-
-  test('write is atomic (no temp files left behind)', () => {
-    const dir = tmp();
-    writeSyncedRegistry(dir, { synced_at: 'x', repositories: [] });
-    // The atomic writer should only leave the final file
-    const path = syncedRegistryPath(dir);
-    expect(existsSync(path)).toBe(true);
-    expect(existsSync(path + '.tmp')).toBe(false);
   });
 });
 

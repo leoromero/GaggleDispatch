@@ -80,7 +80,7 @@ export async function runRepoScaffold(args: ScaffoldArgs): Promise<void> {
   const checkout = join(resolveReposDir(cfg), slug);
   if (!existsSync(checkout)) {
     info(`Local checkout for ${slug} not found; syncing this repo first.`);
-    await runSyncPass(cfg, { onlySlug: slug, quiet: true });
+    await withStore(cfg, (st) => runSyncPass(cfg, { store: st, onlySlug: slug, quiet: true }));
     if (!existsSync(checkout)) fatal(`Sync did not produce a local checkout at ${checkout}.`);
   }
 

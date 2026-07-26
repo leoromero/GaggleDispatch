@@ -15,7 +15,11 @@ import type {
 } from '../domain/types.ts';
 import { logger } from '../util/logger.ts';
 import { watchFile, type WatchHandle } from '../config/watcher.ts';
-import { loadSyncedRegistry, resolveReposDir, syncedRegistryPath } from './synced-registry.ts';
+import { loadSyncedRegistry, resolveReposDir } from './synced-registry.ts';
+import type { Store } from '../executor/store/types.ts';
+
+/** How often to check whether another process ran a sync. */
+const REGISTRY_POLL_MS = 5_000;
 
 function buildContext(entries: SyncedRegistryRepoEntry[], synced_at: string, repos_dir: string): RegistryContext {
   const repositories: RegistryRepo[] = [];
@@ -62,18 +66,15 @@ export interface RegistryLoaderHandle {
   close: () => Promise<void>;
 }
 
-export function startRegistryLoader(cfg: ServiceConfig): RegistryLoaderHandle {
+export function startRegistryLoader(cfg: ServiceConfig, store: Store): RegistryLoaderHandle {
   let lastGood: RegistryContext = { repositories: [], components: [], last_synced_at: new Date(0).toISOString(), warnings: [], repos_dir: resolveReposDir(cfg) };
   const subscribers = new Set<(ctx: RegistryContext) => void>();
-  let watcher: WatchHandle | null = null;
 
-  const reload = () => {
+  const reload = async () => {
     try {
-      const data = loadSyncedRegistry(cfg.registry.base_folder);
+      const data = await loadSyncedRegistry(store);
       if (!data) {
-        logger.warn('Synced registry not found; keeping last-known-good context', {
-          path: syncedRegistryPath(cfg.registry.base_folder),
-        });
+        logger.warn('Synced registry is empty; keeping last-known-good context');
         return;
       }
       const ctx = buildContext(data.repositories, data.synced_at, resolveReposDir(cfg));
@@ -97,18 +98,39 @@ export function startRegistryLoader(cfg: ServiceConfig): RegistryLoaderHandle {
     }
   };
 
-  reload();
-  watcher = watchFile(syncedRegistryPath(cfg.registry.base_folder), reload, 250);
+  void reload();
+
+  // Poll the sync marker rather than watching a file.
+  //
+  // The watcher this replaced was mostly the process notifying itself: the
+  // syncer and this loader run in the same process, so a write here came back
+  // as a filesystem event 250 ms later. The case that genuinely needs
+  // noticing is a `gaggle sync` run in another process, and a single-row read
+  // on the existing pool covers that. (Bun's SQL driver has no LISTEN/NOTIFY,
+  // so a push channel would mean taking on another Postgres client.)
+  let lastSyncedAt: string | null = null;
+  const poll = async () => {
+    try {
+      const at = await store.registrySyncedAt();
+      if (at && at !== lastSyncedAt) {
+        lastSyncedAt = at;
+        await reload();
+      }
+    } catch (err) {
+      logger.debug('Registry sync poll failed', { error: (err as Error).message });
+    }
+  };
+  const timer = setInterval(() => void poll(), REGISTRY_POLL_MS);
 
   return {
     getContext: () => lastGood,
-    reload,
+    reload: () => void reload(),
     on: (cb) => {
       subscribers.add(cb);
       return () => subscribers.delete(cb);
     },
     close: async () => {
-      if (watcher) await watcher.close();
+      clearInterval(timer);
     },
   };
 }

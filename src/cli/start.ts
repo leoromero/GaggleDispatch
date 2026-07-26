@@ -71,21 +71,21 @@ export async function runStart(opts: {
     );
   }
 
+  // The engine owns its own persistence, and the registry now lives there
+  // too, so the schema has to be up before the first sync pass.
+  const store = new PostgresStore(cfg.executor.database_url);
+  await store.migrate();
+
   if (cfg.registry.sync_on_startup) {
     console.log(chalk.cyan('Running initial sync pass...'));
-    await runSyncPass(cfg, { quiet: false });
+    await runSyncPass(cfg, { store, quiet: false });
   }
 
-  const registry = startRegistryLoader(cfg);
+  const registry = startRegistryLoader(cfg, store);
   const ctx = registry.getContext();
   if (ctx.repositories.length === 0) {
     fatal('Registry context has no repositories with sync_status=ok. Add a gaggle.md to at least one registered repo.');
   }
-
-  // The engine owns its own persistence, so bring the schema up before
-  // anything can try to record a run.
-  const store = new PostgresStore(cfg.executor.database_url);
-  await store.migrate();
 
   const executor = new GaggleExecutor({
     store,
@@ -127,7 +127,7 @@ export async function runStart(opts: {
   const workspace = new WorkspaceManager(cfg);
   workspace.ensureAuxRoot();
 
-  const syncer = startPeriodicSyncer(cfg);
+  const syncer = startPeriodicSyncer(cfg, store);
 
   const orchestrator = new Orchestrator({
     cfg, tracker, analyzer, workspace, registry, syncer, executor, store,

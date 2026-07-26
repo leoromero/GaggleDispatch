@@ -10,7 +10,7 @@ import { LinearClient } from '../tracker/linear.ts';
 
 export async function runStatus(opts: { cwd?: string; json?: boolean }): Promise<void> {
   const cfg = loadConfig({ cwd: opts.cwd });
-  const synced = loadSyncedRegistry(cfg.registry.base_folder);
+  const synced = await withStore(cfg, (store) => loadSyncedRegistry(store));
   const jobs = await withStore(cfg, (store) => loadScaffoldJobs(store));
 
   if (opts.json) {

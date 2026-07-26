@@ -11,6 +11,7 @@ import { existsSync, mkdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { chmodSync } from 'node:fs';
 import { RepoSyncError } from '../domain/errors.ts';
+import type { Store } from '../executor/store/types.ts';
 import type {
   ServiceConfig,
   SourceRegistryEntry,
@@ -25,6 +26,8 @@ import { loadSyncedRegistry, reposBaseDir, resolveReposDir, writeSyncedRegistry 
 import { withLock } from '../util/lock.ts';
 
 export interface SyncOptions {
+  /** Where the synced registry is written. */
+  store: Store;
   /** Sync only the given slug (others are left as-is). */
   onlySlug?: string;
   /** Quiet mode for CLI: suppress per-repo info logs. */
@@ -335,12 +338,13 @@ export function applyNameCollisions(entries: SyncedRegistryRepoEntry[]): SyncedR
 }
 
 /** Run a single Repo Syncer pass. Holds the file lock for the write step. */
-export async function runSyncPass(cfg: ServiceConfig, opts: SyncOptions = {}): Promise<SyncResult> {
+export async function runSyncPass(cfg: ServiceConfig, opts: SyncOptions): Promise<SyncResult> {
   await ensureGhAvailable();
   mkdirSync(cfg.registry.base_folder, { recursive: true });
   mkdirSync(resolveReposDir(cfg), { recursive: true });
 
-  const prior = loadSyncedRegistry(cfg.registry.base_folder);
+  const store = opts.store;
+  const prior = await loadSyncedRegistry(store);
   const priorBySlug = new Map<string, SyncedRegistryRepoEntry>();
   if (prior) for (const r of prior.repositories) priorBySlug.set(r.slug, r);
 
@@ -390,7 +394,7 @@ export async function runSyncPass(cfg: ServiceConfig, opts: SyncOptions = {}): P
   };
 
   await withLock(join(cfg.registry.base_folder, '.gaggle.lock'), 'gaggle sync', async () => {
-    writeSyncedRegistry(cfg.registry.base_folder, registry);
+    await writeSyncedRegistry(store, registry);
   });
 
   const ok = finalEntries.filter((e) => e.sync_status === 'ok').length;
@@ -410,7 +414,7 @@ export interface SyncerHandle {
   triggerNow: () => Promise<SyncResult | null>;
 }
 
-export function startPeriodicSyncer(cfg: ServiceConfig): SyncerHandle {
+export function startPeriodicSyncer(cfg: ServiceConfig, store: Store): SyncerHandle {
   let stopped = false;
   let timer: ReturnType<typeof setTimeout> | null = null;
   let inFlight: Promise<SyncResult | null> | null = null;
@@ -419,7 +423,7 @@ export function startPeriodicSyncer(cfg: ServiceConfig): SyncerHandle {
     if (inFlight) return inFlight;
     inFlight = (async () => {
       try {
-        return await runSyncPass(cfg, { quiet: true });
+        return await runSyncPass(cfg, { store, quiet: true });
       } catch (err) {
         logger.error('Periodic sync pass failed', { error: (err as Error).message });
         return null;

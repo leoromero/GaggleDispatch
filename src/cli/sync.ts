@@ -16,7 +16,9 @@ export async function runSync(opts: { cwd?: string; repo?: string; quiet?: boole
     console.log(chalk.yellow('No repositories registered. Use `gaggle repo add <url>` to add some.'));
     return;
   }
-  const result = await runSyncPass(cfg, { onlySlug: opts.repo, quiet: opts.quiet });
+  const result = await withStore(cfg, (store) =>
+    runSyncPass(cfg, { store, onlySlug: opts.repo, quiet: opts.quiet }),
+  );
 
   // Auto-cleanup of scaffold jobs whose repo now has sync_status: ok (Section 21.7.1)
   const okSlugs = new Set(result.per_repo.filter((r) => r.sync_status === 'ok').map((r) => r.slug));
