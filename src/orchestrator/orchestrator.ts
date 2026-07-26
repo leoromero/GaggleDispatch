@@ -45,7 +45,6 @@ import { defaultGateResumeState, completedState } from '../config/service-config
 import type { RegistryLoaderHandle } from '../registry/loader.ts';
 import type { SyncerHandle } from '../registry/repo-syncer.ts';
 import { writeRunEntry, deleteRunEntry, allRunEntries, allRetryEntries, deleteRetryEntry } from '../registry/run-registry.ts';
-import { saveAnalysis, getAnalysis, deleteAnalysis } from '../registry/analysis-registry.ts';
 import { classifyGateReply, type GateClassification } from './gate-classifier.ts';
 import {
   classifyTargetState,
@@ -104,6 +103,7 @@ export class Orchestrator {
   private registry: RegistryLoaderHandle;
   private syncer: SyncerHandle | null;
   private executor: GaggleExecutor;
+  private store: Store;
   private executorClient: ExecutorClient;
   private effectApplier: EffectApplier;
   private tickTimer: ReturnType<typeof setTimeout> | null = null;
@@ -118,6 +118,7 @@ export class Orchestrator {
     this.registry = deps.registry;
     this.syncer = deps.syncer;
     this.executor = deps.executor;
+    this.store = deps.store;
     this.executorClient = deps.executorClient ?? new ExecutorClient(deps.executor, deps.store);
     this.state = createInitialState(this.cfg);
 
@@ -539,7 +540,7 @@ export class Orchestrator {
       repo_target: target,
       analysis: analysisOverride
         ?? this.state.analysis_cache.get(parentIssue.id)?.analysis
-        ?? getAnalysis(this.cfg.registry.base_folder, parentIssue.id)
+        ?? ((await this.store.getAnalysis(parentIssue.id)) as IssueAnalysis | null)
         ?? { issue_id: parentIssue.id, analysis_summary: '', repo_targets: [target] },
       attempt,
       source_branch: branch,
@@ -732,7 +733,7 @@ export class Orchestrator {
       }
       const analysis = await this.analyzer.analyze(issue, ctx);
       this.state.analysis_cache.set(issue.id, { analysis, cached_at: Date.now() });
-      saveAnalysis(this.cfg.registry.base_folder, issue.id, analysis);
+      await this.store.saveAnalysis(issue.id, analysis);
       logger.info('Issue analyzed', {
         issue_id: issue.id,
         issue_identifier: issue.identifier,
@@ -1337,7 +1338,7 @@ export class Orchestrator {
     await this.effectApplier.applyAll(transition.effects);
     this.state.parent_machine_states.set(ctx.parent_issue.id, transition.to);
     if (transition.to === 'done' || transition.to === 'cancelled') {
-      deleteAnalysis(this.cfg.registry.base_folder, ctx.parent_issue.id);
+      await this.store.deleteAnalysis(ctx.parent_issue.id);
       for (const key of this.state.failed_targets.keys()) {
         if (key.startsWith(ctx.parent_issue.id + '__')) {
           this.state.failed_targets.delete(key);
