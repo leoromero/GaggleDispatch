@@ -5,13 +5,18 @@
 import chalk from 'chalk';
 import { existsSync, mkdirSync } from 'node:fs';
 import { join, resolve as resolvePath } from 'node:path';
-import { loadConfig, fatal, info, success } from './common.ts';
+import { loadConfig, fatal, info, success, withStore } from './common.ts';
 import { withLock } from '../util/lock.ts';
 import { run } from '../util/subprocess.ts';
 import { deriveRepoSlug, parseGithubOwnerRepo } from '../util/paths.ts';
 import { runSyncPass } from '../registry/repo-syncer.ts';
 import { resolveReposDir } from '../registry/synced-registry.ts';
-import { loadScaffoldJobs, removeJobBySlug, upsertJob, writeScaffoldJobs } from '../registry/scaffold-jobs.ts';
+import {
+  findScaffoldJob,
+  loadScaffoldJobs,
+  removeScaffoldJob,
+  saveScaffoldJob,
+} from '../registry/scaffold-jobs.ts';
 import type { ScaffoldJob } from '../domain/types.ts';
 import { PostgresStore } from '../executor/store/postgres.ts';
 import { GaggleExecutor } from '../executor/engine/index.ts';
@@ -80,7 +85,7 @@ export async function runRepoScaffold(args: ScaffoldArgs): Promise<void> {
   }
 
   // Check for in-flight job.
-  const jobsBefore = loadScaffoldJobs(cfg.registry.base_folder);
+  const jobsBefore = await withStore(cfg, (st) => loadScaffoldJobs(st));
   const existing = jobsBefore.jobs.find((j) => j.slug === slug);
   if (args.async && existing && (existing.last_status === 'running' || existing.last_status === 'paused' || existing.last_status === 'pending')) {
     fatal(
@@ -140,10 +145,9 @@ export async function runRepoScaffold(args: ScaffoldArgs): Promise<void> {
     // be reconciled later by matching working paths and start times.
     job.run_id = handle.run_id;
     job.last_status = 'running';
-    await withLock(join(cfg.registry.base_folder, '.gaggle.lock'), 'gaggle repo scaffold', async () => {
-      const jobs = loadScaffoldJobs(cfg.registry.base_folder);
-      writeScaffoldJobs(cfg.registry.base_folder, upsertJob(jobs, job));
-    });
+    // A single upsert — no lock needed now that this is not a whole-file
+    // read-modify-write.
+    await saveScaffoldJob(store, job);
 
     if (args.async) {
       success(`Launched scaffold for ${slug} (run ${handle.run_id.slice(0, 8)}, branch ${branch}).`);
@@ -172,7 +176,7 @@ export async function runRepoScaffold(args: ScaffoldArgs): Promise<void> {
 export async function runScaffoldStatus(opts: { cwd?: string; json?: boolean; refreshPr?: boolean }): Promise<void> {
   const cfg = loadConfig({ cwd: opts.cwd });
   const baseFolder = cfg.registry.base_folder;
-  let jobs = loadScaffoldJobs(baseFolder);
+  let jobs = await withStore(cfg, (st) => loadScaffoldJobs(st));
   if (jobs.jobs.length === 0) {
     if (!opts.json) console.log(chalk.gray('No scaffold jobs.'));
     else console.log('[]');
@@ -187,8 +191,12 @@ export async function runScaffoldStatus(opts: { cwd?: string; json?: boolean; re
     artifactsRoot: join(baseFolder, 'artifacts'),
   });
 
-  await withLock(join(baseFolder, '.gaggle.lock'), 'gaggle scaffold status', async () => {
-    const fresh = loadScaffoldJobs(baseFolder);
+  await withStore(cfg, async (store) => {
+    const executor = new GaggleExecutor({
+      store,
+      artifactsRoot: join(baseFolder, 'artifacts'),
+    });
+    const fresh = await loadScaffoldJobs(store);
     const updated: typeof fresh.jobs = [];
 
     for (const job of fresh.jobs) {
@@ -223,7 +231,7 @@ export async function runScaffoldStatus(opts: { cwd?: string; json?: boolean; re
 
       updated.push(next);
     }
-    writeScaffoldJobs(baseFolder, { jobs: updated });
+    for (const j of updated) await saveScaffoldJob(store, j);
     jobs = { jobs: updated };
   });
 
@@ -244,27 +252,21 @@ export async function runScaffoldCancel(args: { slug: string; cwd?: string }): P
   const cfg = loadConfig({ cwd: args.cwd });
   const baseFolder = cfg.registry.base_folder;
 
-  await withLock(join(baseFolder, '.gaggle.lock'), 'gaggle scaffold cancel', async () => {
-    const jobs = loadScaffoldJobs(baseFolder);
-    const job = jobs.jobs.find((j) => j.slug === args.slug);
+  await withStore(cfg, async (store) => {
+    const job = await findScaffoldJob(store, args.slug);
     if (!job) fatal(`No scaffold job for slug '${args.slug}'.`);
     if (job!.run_id) {
       try {
-        const store = new PostgresStore(cfg.executor.database_url, { maxConnections: 2 });
-        try {
-          await new GaggleExecutor({
-            store,
-            artifactsRoot: join(cfg.registry.base_folder, 'artifacts'),
-          }).abandon(job!.run_id);
-          info(`Abandoned run ${job!.run_id}.`);
-        } finally {
-          await store.close();
-        }
+        await new GaggleExecutor({
+          store,
+          artifactsRoot: join(cfg.registry.base_folder, 'artifacts'),
+        }).abandon(job!.run_id);
+        info(`Abandoned run ${job!.run_id}.`);
       } catch (err) {
         console.log(chalk.yellow(`  Could not abandon run: ${(err as Error).message}`));
       }
     }
-    writeScaffoldJobs(baseFolder, removeJobBySlug(jobs, args.slug));
+    await removeScaffoldJob(store, args.slug);
     success(`Removed scaffold job '${args.slug}'.`);
   });
 }

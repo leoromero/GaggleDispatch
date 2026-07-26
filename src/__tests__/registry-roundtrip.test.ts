@@ -3,16 +3,16 @@
  * (`registry.synced.yaml` and `scaffold_jobs.yaml`).
  */
 
+import { MemoryStore } from '../executor/store/memory.ts';
 import { describe, expect, test } from 'bun:test';
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { SyncedRegistryParseError } from '../domain/errors.ts';
 import {
+  findScaffoldJob,
   loadScaffoldJobs,
-  removeJobBySlug,
-  scaffoldJobsPath,
-  upsertJob,
-  writeScaffoldJobs,
+  removeScaffoldJob,
+  saveScaffoldJob,
 } from '../registry/scaffold-jobs.ts';
 import {
   loadSyncedRegistry,
@@ -101,57 +101,46 @@ describe('scaffold-jobs round-trip', () => {
     };
   }
 
-  test('returns empty {jobs: []} when file is absent', () => {
-    const dir = tmp();
-    expect(loadScaffoldJobs(dir)).toEqual({ jobs: [] });
+  test('returns an empty list before any job is recorded', async () => {
+    expect(await loadScaffoldJobs(new MemoryStore())).toEqual({ jobs: [] });
   });
 
-  test('write then load preserves all fields', () => {
-    const dir = tmp();
-    mkdirSync(dir, { recursive: true });
+  test('save then load preserves every field', async () => {
+    const store = new MemoryStore();
     const j = job({ last_status: 'completed', run_id: 'r-1', pr_url: 'https://github.com/x/y/pull/1' });
-    writeScaffoldJobs(dir, { jobs: [j] });
-    const loaded = loadScaffoldJobs(dir);
-    expect(loaded.jobs.length).toBe(1);
+    await saveScaffoldJob(store, j);
+    const loaded = await loadScaffoldJobs(store);
+    expect(loaded.jobs).toHaveLength(1);
     expect(loaded.jobs[0]!.run_id).toBe('r-1');
     expect(loaded.jobs[0]!.last_status).toBe('completed');
     expect(loaded.jobs[0]!.pr_url).toBe('https://github.com/x/y/pull/1');
   });
 
-  test('writes a banner', () => {
-    const dir = tmp();
-    writeScaffoldJobs(dir, { jobs: [] });
-    const text = readFileSync(scaffoldJobsPath(dir), 'utf8');
-    expect(text).toMatch(/AUTO-GENERATED/);
+  test('saving inserts a new job and replaces an existing one by slug', async () => {
+    const store = new MemoryStore();
+    await saveScaffoldJob(store, job({ slug: 'a' }));
+    await saveScaffoldJob(store, job({ slug: 'b' }));
+    expect((await loadScaffoldJobs(store)).jobs).toHaveLength(2);
+
+    await saveScaffoldJob(store, job({ slug: 'a', last_status: 'completed' }));
+    const loaded = await loadScaffoldJobs(store);
+    expect(loaded.jobs).toHaveLength(2);
+    expect(loaded.jobs.find((j) => j.slug === 'a')!.last_status).toBe('completed');
   });
 
-  test('upsertJob inserts new + replaces by slug', () => {
-    const file = { jobs: [job({ slug: 'a' })] };
-    const after1 = upsertJob(file, job({ slug: 'b' }));
-    expect(after1.jobs.length).toBe(2);
-    const after2 = upsertJob(after1, job({ slug: 'a', last_status: 'completed' }));
-    expect(after2.jobs.length).toBe(2);
-    expect(after2.jobs.find((j) => j.slug === 'a')!.last_status).toBe('completed');
+  test('removing drops only the named slug', async () => {
+    const store = new MemoryStore();
+    await saveScaffoldJob(store, job({ slug: 'a' }));
+    await saveScaffoldJob(store, job({ slug: 'b' }));
+    await removeScaffoldJob(store, 'a');
+    const loaded = await loadScaffoldJobs(store);
+    expect(loaded.jobs.map((j) => j.slug)).toEqual(['b']);
   });
 
-  test('removeJobBySlug filters out matching slug', () => {
-    const file = { jobs: [job({ slug: 'a' }), job({ slug: 'b' })] };
-    const after = removeJobBySlug(file, 'a');
-    expect(after.jobs.length).toBe(1);
-    expect(after.jobs[0]!.slug).toBe('b');
-  });
-
-  test('upsertJob is pure (does not mutate input)', () => {
-    const original = { jobs: [job({ slug: 'a' })] };
-    upsertJob(original, job({ slug: 'b' }));
-    expect(original.jobs.length).toBe(1);
-  });
-
-  test('handles malformed YAML gracefully (returns empty)', () => {
-    const dir = tmp();
-    mkdirSync(dir, { recursive: true });
-    writeFileSync(join(dir, 'scaffold_jobs.yaml'), 'jobs: not-an-array\nfoo: 123\n');
-    const loaded = loadScaffoldJobs(dir);
-    expect(loaded.jobs).toEqual([]);
+  test('findScaffoldJob returns null for an unknown slug', async () => {
+    const store = new MemoryStore();
+    await saveScaffoldJob(store, job({ slug: 'a' }));
+    expect(await findScaffoldJob(store, 'a')).not.toBeNull();
+    expect(await findScaffoldJob(store, 'nope')).toBeNull();
   });
 });

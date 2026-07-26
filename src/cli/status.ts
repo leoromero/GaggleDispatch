@@ -3,7 +3,7 @@
  */
 
 import chalk from 'chalk';
-import { loadConfig } from './common.ts';
+import { loadConfig, withStore } from './common.ts';
 import { loadSyncedRegistry } from '../registry/synced-registry.ts';
 import { loadScaffoldJobs } from '../registry/scaffold-jobs.ts';
 import { LinearClient } from '../tracker/linear.ts';
@@ -11,7 +11,7 @@ import { LinearClient } from '../tracker/linear.ts';
 export async function runStatus(opts: { cwd?: string; json?: boolean }): Promise<void> {
   const cfg = loadConfig({ cwd: opts.cwd });
   const synced = loadSyncedRegistry(cfg.registry.base_folder);
-  const jobs = loadScaffoldJobs(cfg.registry.base_folder);
+  const jobs = await withStore(cfg, (store) => loadScaffoldJobs(store));
 
   if (opts.json) {
     console.log(

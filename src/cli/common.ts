@@ -9,6 +9,7 @@ import { loadWorkflowDefinition, resolveWorkflowPath } from '../config/loader.ts
 import { buildServiceConfig } from '../config/service-config.ts';
 import { GaggleError } from '../domain/errors.ts';
 import type { ServiceConfig } from '../domain/types.ts';
+import { PostgresStore } from '../executor/store/postgres.ts';
 
 export interface GlobalOptions {
   cwd?: string;
@@ -42,4 +43,24 @@ export function success(message: string): void {
 
 export function info(message: string): void {
   console.log(chalk.cyan(`• ${message}`));
+}
+
+/**
+ * Open a store for a one-shot CLI command.
+ *
+ * Small pool and an explicit close: these are short-lived processes, and a
+ * lingering connection keeps the process alive after the command has printed
+ * its output.
+ */
+export async function withStore<T>(
+  cfg: ServiceConfig,
+  fn: (store: PostgresStore) => Promise<T>,
+): Promise<T> {
+  const store = new PostgresStore(cfg.executor.database_url, { maxConnections: 3 });
+  try {
+    await store.migrate();
+    return await fn(store);
+  } finally {
+    await store.close();
+  }
 }
