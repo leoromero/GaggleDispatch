@@ -7,7 +7,7 @@
  * confirmation that the real driver agrees.
  *
  *   docker compose up -d
- *   TEST_DATABASE_URL=postgres://gaggle:gaggle@localhost:5433/gaggle_test bun test store-conformance
+ *   TEST_DATABASE_URL=postgres://gaggle:gaggle@localhost:5433/gaggle_exec_test bun test store-conformance
  */
 
 import { describe, expect, test, beforeEach, afterAll } from 'bun:test';
@@ -326,6 +326,195 @@ function suite(name: string, getStore: () => Promise<Store>) {
       expect(await store.incrementReworkAttempts(id)).toBe(2);
     });
 
+    // ── external key lookup ─────────────────────────────────────────────────
+
+    test('a run can be found by the key its caller stamped on it', async () => {
+      const a = runInput({ external_key: 'ISS-1__api' });
+      const b = runInput({ external_key: 'ISS-2__web' });
+      await store.createRun(a);
+      await store.createRun(b);
+
+      expect((await store.findRunByExternalKey('ISS-1__api'))?.id).toBe(a.id);
+      expect(await store.findRunByExternalKey('nope')).toBeNull();
+    });
+
+    test('the newest run wins when a key is reused across retries', async () => {
+      const first = runInput({ external_key: 'ISS-1__api' });
+      await store.createRun(first);
+      await tick();
+      const second = runInput({ external_key: 'ISS-1__api' });
+      await store.createRun(second);
+      expect((await store.findRunByExternalKey('ISS-1__api'))?.id).toBe(second.id);
+    });
+
+    test('runs without an external key are never matched', async () => {
+      await store.createRun(runInput());
+      expect(await store.findRunByExternalKey('')).toBeNull();
+    });
+
+    // ── retry schedule ──────────────────────────────────────────────────────
+
+    const retry = (over: Record<string, unknown> = {}) => ({
+      worker_key: 'ISS-1__api',
+      parent_issue_id: 'ISS-1',
+      sub_issue_id: null,
+      repo_alias: 'api',
+      attempt: 2,
+      due_at: new Date(Date.now() + 60_000).toISOString(),
+      reason: 'transient failure',
+      ...over,
+    });
+
+    test('a retry round-trips and upserts in place', async () => {
+      await store.upsertRetry(retry());
+      const got = await store.getRetry('ISS-1__api');
+      expect(got?.attempt).toBe(2);
+      expect(got?.reason).toBe('transient failure');
+
+      await store.upsertRetry(retry({ attempt: 3, reason: 'still failing' }));
+      expect((await store.listRetries())).toHaveLength(1);
+      expect((await store.getRetry('ISS-1__api'))?.attempt).toBe(3);
+    });
+
+    test('retries list in due order', async () => {
+      await store.upsertRetry(retry({ worker_key: 'later', due_at: new Date(Date.now() + 90_000).toISOString() }));
+      await store.upsertRetry(retry({ worker_key: 'sooner', due_at: new Date(Date.now() + 10_000).toISOString() }));
+      expect((await store.listRetries()).map((r) => r.worker_key)).toEqual(['sooner', 'later']);
+    });
+
+    test('a retry can be deleted, and deleting an absent one is a no-op', async () => {
+      await store.upsertRetry(retry());
+      await store.deleteRetry('ISS-1__api');
+      expect(await store.getRetry('ISS-1__api')).toBeNull();
+      await store.deleteRetry('never-existed');
+    });
+
+    // ── analysis cache ──────────────────────────────────────────────────────
+
+    test('an analysis round-trips as a structured value', async () => {
+      const analysis = { issue_id: 'ISS-1', analysis_summary: 'do the thing', repo_targets: [{ repo_alias: 'api' }] };
+      await store.saveAnalysis('ISS-1', analysis);
+      expect(await store.getAnalysis('ISS-1')).toEqual(analysis);
+    });
+
+    test('saving an analysis twice overwrites rather than duplicating', async () => {
+      await store.saveAnalysis('ISS-1', { v: 1 });
+      await store.saveAnalysis('ISS-1', { v: 2 });
+      expect(await store.getAnalysis('ISS-1')).toEqual({ v: 2 });
+    });
+
+    test('an unknown or deleted analysis reads back null', async () => {
+      expect(await store.getAnalysis('nope')).toBeNull();
+      await store.saveAnalysis('ISS-1', { v: 1 });
+      await store.deleteAnalysis('ISS-1');
+      expect(await store.getAnalysis('ISS-1')).toBeNull();
+    });
+
+    // ── scaffold jobs ───────────────────────────────────────────────────────
+
+    const job = (over: Record<string, unknown> = {}) => ({
+      slug: 'acme-api',
+      url: 'https://github.com/acme/api',
+      checkout_path: '/repos/acme-api',
+      run_id: null,
+      workflow_name: 'gaggle/gaggle-scaffold',
+      branch: 'gaggle/scaffold-1',
+      started_at: new Date().toISOString(),
+      last_polled_at: null,
+      last_status: 'pending',
+      pr_url: null,
+      last_error: null,
+      ...over,
+    });
+
+    test('a scaffold job round-trips and upserts by slug', async () => {
+      await store.upsertScaffoldJob(job());
+      await store.upsertScaffoldJob(job({ last_status: 'completed', pr_url: 'https://pr/1' }));
+      const jobs = await store.listScaffoldJobs();
+      expect(jobs).toHaveLength(1);
+      expect(jobs[0]!.last_status).toBe('completed');
+      expect(jobs[0]!.pr_url).toBe('https://pr/1');
+    });
+
+    test('a scaffold job carries its run id', async () => {
+      const runId = randomUUID();
+      const r = runInput({ id: runId });
+      await store.createRun(r);
+      await store.upsertScaffoldJob(job({ run_id: runId }));
+      expect((await store.listScaffoldJobs())[0]!.run_id).toBe(runId);
+    });
+
+    test('a scaffold job can be deleted', async () => {
+      await store.upsertScaffoldJob(job());
+      await store.deleteScaffoldJob('acme-api');
+      expect(await store.listScaffoldJobs()).toEqual([]);
+    });
+
+    // ── synced registry ─────────────────────────────────────────────────────
+
+    const repo = (over: Record<string, unknown> = {}) => ({
+      url: 'https://github.com/acme/api',
+      slug: 'acme-api',
+      default_branch: 'main',
+      local_path: '/repos/acme-api',
+      last_synced_at: new Date().toISOString(),
+      last_commit_sha: 'abc123',
+      sync_status: 'ok',
+      sync_error: null,
+      frontmatter: { name: 'acme-api', components: [{ name: 'api' }] },
+      narrative: 'The API.',
+      ...over,
+    });
+
+    test('the registry reads back null before the first sync', async () => {
+      expect(await store.loadSyncedRegistry()).toBeNull();
+      expect(await store.registrySyncedAt()).toBeNull();
+    });
+
+    test('a registry round-trips with nested frontmatter intact', async () => {
+      const at = new Date().toISOString();
+      await store.replaceSyncedRegistry(at, [repo()]);
+      const loaded = await store.loadSyncedRegistry();
+      expect(Date.parse(loaded!.synced_at)).toBe(Date.parse(at));
+      expect(loaded!.repositories).toHaveLength(1);
+      expect(loaded!.repositories[0]!.frontmatter).toEqual({
+        name: 'acme-api',
+        components: [{ name: 'api' }],
+      });
+    });
+
+    test('replacing the registry removes repos that are no longer registered', async () => {
+      await store.replaceSyncedRegistry(new Date().toISOString(), [
+        repo(),
+        repo({ url: 'https://github.com/acme/web', slug: 'acme-web' }),
+      ]);
+      expect((await store.loadSyncedRegistry())!.repositories).toHaveLength(2);
+
+      await store.replaceSyncedRegistry(new Date().toISOString(), [repo()]);
+      const after = await store.loadSyncedRegistry();
+      expect(after!.repositories.map((r) => r.slug)).toEqual(['acme-api']);
+    });
+
+    test('the sync marker advances so another process can notice', async () => {
+      const first = new Date(Date.now() - 60_000).toISOString();
+      await store.replaceSyncedRegistry(first, [repo()]);
+      const seen = await store.registrySyncedAt();
+
+      const second = new Date().toISOString();
+      await store.replaceSyncedRegistry(second, [repo()]);
+      expect(Date.parse((await store.registrySyncedAt())!)).toBeGreaterThan(Date.parse(seen!));
+    });
+
+    test('a repo that failed to sync keeps its error', async () => {
+      await store.replaceSyncedRegistry(new Date().toISOString(), [
+        repo({ sync_status: 'error', sync_error: 'clone failed', frontmatter: null, narrative: null }),
+      ]);
+      const r = (await store.loadSyncedRegistry())!.repositories[0]!;
+      expect(r.sync_status).toBe('error');
+      expect(r.sync_error).toBe('clone failed');
+      expect(r.frontmatter).toBeNull();
+    });
+
     // ── worktrees ───────────────────────────────────────────────────────────
 
     test('worktrees are unique per repo+branch and upsert in place', async () => {
@@ -387,8 +576,20 @@ if (PG_URL) {
     // blocks behind any other pooled connection, turning a flake into a hang.
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const sql = (pg as any).sql;
-    await sql.unsafe('DELETE FROM worktrees');
-    await sql.unsafe('DELETE FROM workflow_runs'); // children cascade
+    // The registry tables are not children of workflow_runs, so cascading from
+    // there is not enough — they have to be wiped explicitly or state leaks
+    // between tests.
+    for (const table of [
+      'worktrees',
+      'retry_schedule',
+      'issue_analyses',
+      'scaffold_jobs',
+      'synced_repos',
+      'registry_meta',
+      'workflow_runs', // nodes, events, approvals, iterations cascade from here
+    ]) {
+      await sql.unsafe(`DELETE FROM ${table}`);
+    }
     return pg;
   });
   afterAll(async () => {

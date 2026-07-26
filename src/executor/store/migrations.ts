@@ -121,6 +121,144 @@ CREATE TABLE worktrees (
 );
 `;
 
-export const MIGRATIONS: Migration[] = [{ version: 1, name: 'init', sql: M001_INIT }];
+/**
+ * Everything the daemon mutates that was still living in files.
+ *
+ * `external_key` on workflow_runs is what lets the run registry's lookup half
+ * disappear: the orchestrator stamps the run with its worker key at launch, so
+ * "which run belongs to this issue+repo" becomes a query instead of a JSON
+ * sidecar that has to be kept in sync with reality.
+ */
+const M002_REGISTRIES = `
+ALTER TABLE workflow_runs ADD COLUMN external_key TEXT;
+CREATE INDEX idx_runs_external_key ON workflow_runs (external_key, started_at DESC);
+
+-- Retry back-off survives a restart so attempt counts do not reset to zero.
+CREATE TABLE retry_schedule (
+  worker_key      TEXT PRIMARY KEY,
+  parent_issue_id TEXT NOT NULL,
+  sub_issue_id    TEXT,
+  repo_alias      TEXT NOT NULL,
+  attempt         INT  NOT NULL,
+  due_at          TIMESTAMPTZ NOT NULL,
+  reason          TEXT,
+  updated_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX idx_retry_due ON retry_schedule (due_at);
+
+-- Analysis is an expensive Claude call, so it is cached until the parent issue
+-- reaches a terminal state.
+CREATE TABLE issue_analyses (
+  issue_id TEXT PRIMARY KEY,
+  analysis JSONB NOT NULL,
+  saved_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE scaffold_jobs (
+  slug           TEXT PRIMARY KEY,
+  url            TEXT NOT NULL,
+  checkout_path  TEXT NOT NULL,
+  run_id         UUID,
+  workflow_name  TEXT NOT NULL,
+  branch         TEXT NOT NULL,
+  started_at     TIMESTAMPTZ NOT NULL,
+  last_polled_at TIMESTAMPTZ,
+  last_status    TEXT NOT NULL,
+  pr_url         TEXT,
+  last_error     TEXT
+);
+
+-- The repo syncer's materialized view of every registered repository.
+-- frontmatter stays JSONB rather than being shredded into columns: the loader
+-- rebuilds a whole RegistryContext from it, and jsonb operators still allow
+-- querying components without a second table to keep consistent.
+CREATE TABLE synced_repos (
+  url             TEXT PRIMARY KEY,
+  slug            TEXT NOT NULL,
+  default_branch  TEXT NOT NULL,
+  local_path      TEXT NOT NULL,
+  last_synced_at  TIMESTAMPTZ,
+  last_commit_sha TEXT,
+  sync_status     TEXT NOT NULL,
+  sync_error      TEXT,
+  frontmatter     JSONB,
+  narrative       TEXT
+);
+
+-- Single row. Bumped on every sync pass; the loader polls it to notice a sync
+-- that happened in another process (an operator running \`gaggle sync\`).
+CREATE TABLE registry_meta (
+  only_row  BOOLEAN PRIMARY KEY DEFAULT true CHECK (only_row),
+  synced_at TIMESTAMPTZ NOT NULL
+);
+`;
+
+/** Hub history, moved off its own SQLite file so there is one database. */
+const M003_HUB_HISTORY = `
+CREATE TABLE hub_workspaces (
+  id            BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  name          TEXT NOT NULL UNIQUE,
+  path          TEXT NOT NULL,
+  color         TEXT,
+  registered_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE hub_runs (
+  id                BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  workspace_id      BIGINT NOT NULL REFERENCES hub_workspaces(id) ON DELETE CASCADE,
+  issue_id          TEXT NOT NULL,
+  issue_identifier  TEXT NOT NULL,
+  repo_alias        TEXT NOT NULL,
+  session_id        TEXT,
+  run_id            TEXT,
+  started_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
+  ended_at          TIMESTAMPTZ,
+  status            TEXT NOT NULL,
+  tokens_in         INT NOT NULL DEFAULT 0,
+  tokens_out        INT NOT NULL DEFAULT 0,
+  turn_count        INT NOT NULL DEFAULT 0
+);
+CREATE INDEX idx_hub_runs_ws ON hub_runs (workspace_id, started_at DESC);
+
+CREATE TABLE hub_logs (
+  id           BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  workspace_id BIGINT NOT NULL REFERENCES hub_workspaces(id) ON DELETE CASCADE,
+  ts           TIMESTAMPTZ NOT NULL DEFAULT now(),
+  level        TEXT NOT NULL,
+  message      TEXT NOT NULL,
+  session_id   TEXT,
+  issue_id     TEXT,
+  repo_alias   TEXT,
+  fields       JSONB
+);
+CREATE INDEX idx_hub_logs_ws_ts ON hub_logs (workspace_id, ts DESC);
+CREATE INDEX idx_hub_logs_ts ON hub_logs (ts);
+
+CREATE TABLE hub_gate_events (
+  id           BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  workspace_id BIGINT NOT NULL REFERENCES hub_workspaces(id) ON DELETE CASCADE,
+  issue_id     TEXT NOT NULL,
+  repo_alias   TEXT NOT NULL,
+  run_id       TEXT,
+  action       TEXT NOT NULL CHECK (action IN ('paused','approved','rejected','timed_out')),
+  message      TEXT,
+  ts           TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX idx_hub_gates_ws ON hub_gate_events (workspace_id, ts DESC);
+
+CREATE TABLE hub_token_daily (
+  workspace_id BIGINT NOT NULL REFERENCES hub_workspaces(id) ON DELETE CASCADE,
+  day          DATE NOT NULL,
+  tokens_in    BIGINT NOT NULL DEFAULT 0,
+  tokens_out   BIGINT NOT NULL DEFAULT 0,
+  PRIMARY KEY (workspace_id, day)
+);
+`;
+
+export const MIGRATIONS: Migration[] = [
+  { version: 1, name: 'init', sql: M001_INIT },
+  { version: 2, name: 'registries', sql: M002_REGISTRIES },
+  { version: 3, name: 'hub_history', sql: M003_HUB_HISTORY },
+];
 
 export const LATEST_VERSION = MIGRATIONS.reduce((m, x) => Math.max(m, x.version), 0);

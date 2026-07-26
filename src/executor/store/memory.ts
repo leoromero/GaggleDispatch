@@ -20,9 +20,12 @@ import type {
   EventRow,
   LoopIterationRow,
   NodeRow,
+  RetryRow,
   RunQuery,
   RunRow,
+  ScaffoldJobRow,
   Store,
+  SyncedRepoRow,
   UpsertNodeInput,
   WorktreeRow,
 } from './types.ts';
@@ -47,6 +50,11 @@ export class MemoryStore implements Store {
   private events: EventRow[] = [];
   private approvals = new Map<string, ApprovalRow>();
   private worktrees = new Map<string, WorktreeRow>(); // key(repo_slug, branch)
+  private retries = new Map<string, RetryRow>();
+  private analyses = new Map<string, unknown>();
+  private scaffolds = new Map<string, ScaffoldJobRow>();
+  private syncedRepos: SyncedRepoRow[] = [];
+  private syncedAt: string | null = null;
   private eventSeq = 0;
   /** Preserves insertion order when started_at timestamps collide. */
   private runSeq = new Map<string, number>();
@@ -74,6 +82,7 @@ export class MemoryStore implements Store {
       base_branch: input.base_branch ?? null,
       branch: input.branch ?? null,
       artifacts_dir: input.artifacts_dir ?? null,
+      external_key: input.external_key ?? null,
       env: clone(input.env ?? {}),
       metadata: clone(input.metadata ?? {}),
       started_at: nowIso(),
@@ -315,6 +324,89 @@ export class MemoryStore implements Store {
     if (!a) return 0;
     a.rework_attempts += 1;
     return a.rework_attempts;
+  }
+
+  // -- run lookup by caller identity ----------------------------------------
+
+  async findRunByExternalKey(externalKey: string): Promise<RunRow | null> {
+    const hits = [...this.runs.values()]
+      .filter((r) => r.external_key === externalKey)
+      .sort((a, b) => {
+        const d = Date.parse(b.started_at) - Date.parse(a.started_at);
+        return d !== 0 ? d : (this.runSeq.get(b.id) ?? 0) - (this.runSeq.get(a.id) ?? 0);
+      });
+    return hits[0] ? clone(hits[0]) : null;
+  }
+
+  // -- retry schedule --------------------------------------------------------
+
+  async upsertRetry(row: Omit<RetryRow, 'updated_at'>): Promise<void> {
+    this.retries.set(row.worker_key, { ...clone(row), updated_at: nowIso() });
+  }
+
+  async getRetry(workerKey: string): Promise<RetryRow | null> {
+    const r = this.retries.get(workerKey);
+    return r ? clone(r) : null;
+  }
+
+  async deleteRetry(workerKey: string): Promise<void> {
+    this.retries.delete(workerKey);
+  }
+
+  async listRetries(): Promise<RetryRow[]> {
+    return [...this.retries.values()]
+      .sort((a, b) => Date.parse(a.due_at) - Date.parse(b.due_at))
+      .map(clone);
+  }
+
+  // -- analysis cache --------------------------------------------------------
+
+  async saveAnalysis(issueId: string, analysis: unknown): Promise<void> {
+    this.analyses.set(issueId, clone(analysis));
+  }
+
+  async getAnalysis(issueId: string): Promise<unknown | null> {
+    const a = this.analyses.get(issueId);
+    return a === undefined ? null : clone(a);
+  }
+
+  async deleteAnalysis(issueId: string): Promise<void> {
+    this.analyses.delete(issueId);
+  }
+
+  // -- scaffold jobs ---------------------------------------------------------
+
+  async upsertScaffoldJob(row: ScaffoldJobRow): Promise<void> {
+    this.scaffolds.set(row.slug, clone(row));
+  }
+
+  async listScaffoldJobs(): Promise<ScaffoldJobRow[]> {
+    return [...this.scaffolds.values()]
+      .sort((a, b) => Date.parse(a.started_at) - Date.parse(b.started_at))
+      .map(clone);
+  }
+
+  async deleteScaffoldJob(slug: string): Promise<void> {
+    this.scaffolds.delete(slug);
+  }
+
+  // -- synced registry -------------------------------------------------------
+
+  async replaceSyncedRegistry(syncedAt: string, repos: SyncedRepoRow[]): Promise<void> {
+    this.syncedRepos = clone(repos);
+    this.syncedAt = syncedAt;
+  }
+
+  async loadSyncedRegistry(): Promise<{ synced_at: string; repositories: SyncedRepoRow[] } | null> {
+    if (this.syncedAt === null) return null;
+    return {
+      synced_at: this.syncedAt,
+      repositories: [...this.syncedRepos].sort((a, b) => a.slug.localeCompare(b.slug)).map(clone),
+    };
+  }
+
+  async registrySyncedAt(): Promise<string | null> {
+    return this.syncedAt;
   }
 
   // ── worktrees ─────────────────────────────────────────────────────────────

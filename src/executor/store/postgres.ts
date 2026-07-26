@@ -17,9 +17,12 @@ import type {
   EventRow,
   LoopIterationRow,
   NodeRow,
+  RetryRow,
   RunQuery,
   RunRow,
+  ScaffoldJobRow,
   Store,
+  SyncedRepoRow,
   UpsertNodeInput,
   WorktreeRow,
 } from './types.ts';
@@ -74,6 +77,7 @@ function mapRun(r: Row): RunRow {
     base_branch: (r.base_branch as string) ?? null,
     branch: (r.branch as string) ?? null,
     artifacts_dir: (r.artifacts_dir as string) ?? null,
+    external_key: (r.external_key as string) ?? null,
     env: asRecord(r.env) as Record<string, string>,
     metadata: asRecord(r.metadata),
     started_at: isoRequired(r.started_at),
@@ -131,6 +135,50 @@ function mapWorktree(r: Row): WorktreeRow {
   };
 }
 
+function mapRetry(r: Row): RetryRow {
+  return {
+    worker_key: String(r.worker_key),
+    parent_issue_id: String(r.parent_issue_id),
+    sub_issue_id: (r.sub_issue_id as string) ?? null,
+    repo_alias: String(r.repo_alias),
+    attempt: Number(r.attempt ?? 0),
+    due_at: isoRequired(r.due_at),
+    reason: (r.reason as string) ?? null,
+    updated_at: isoRequired(r.updated_at),
+  };
+}
+
+function mapScaffold(r: Row): ScaffoldJobRow {
+  return {
+    slug: String(r.slug),
+    url: String(r.url),
+    checkout_path: String(r.checkout_path),
+    run_id: (r.run_id as string) ?? null,
+    workflow_name: String(r.workflow_name),
+    branch: String(r.branch),
+    started_at: isoRequired(r.started_at),
+    last_polled_at: iso(r.last_polled_at),
+    last_status: String(r.last_status),
+    pr_url: (r.pr_url as string) ?? null,
+    last_error: (r.last_error as string) ?? null,
+  };
+}
+
+function mapSyncedRepo(r: Row): SyncedRepoRow {
+  return {
+    url: String(r.url),
+    slug: String(r.slug),
+    default_branch: String(r.default_branch),
+    local_path: String(r.local_path),
+    last_synced_at: iso(r.last_synced_at),
+    last_commit_sha: (r.last_commit_sha as string) ?? null,
+    sync_status: String(r.sync_status),
+    sync_error: (r.sync_error as string) ?? null,
+    frontmatter: parseJson(r.frontmatter),
+    narrative: (r.narrative as string) ?? null,
+  };
+}
+
 export class PostgresStore implements Store {
   private readonly sql: SQL;
 
@@ -182,12 +230,13 @@ export class PostgresStore implements Store {
       INSERT INTO workflow_runs (
         id, workflow_name, workflow_source, workflow_hash, user_message, status,
         repo_slug, working_path, base_branch, branch, artifacts_dir,
-        env, metadata, dry_run, last_activity_at
+        external_key, env, metadata, dry_run, last_activity_at
       ) VALUES (
         ${input.id}, ${input.workflow_name}, ${input.workflow_source}, ${input.workflow_hash},
         ${input.user_message}, 'pending',
         ${input.repo_slug ?? null}, ${input.working_path ?? null}, ${input.base_branch ?? null},
         ${input.branch ?? null}, ${input.artifacts_dir ?? null},
+        ${input.external_key ?? null},
         ${input.env ?? {}},
         ${input.metadata ?? {}},
         ${input.dry_run ?? false}, now()
@@ -462,6 +511,128 @@ export class PostgresStore implements Store {
       UPDATE workflow_approvals SET rework_attempts = rework_attempts + 1
        WHERE id = ${id} RETURNING rework_attempts`) as Row[];
     return Number(rows[0]?.rework_attempts ?? 0);
+  }
+
+  // -- run lookup by caller identity ----------------------------------------
+
+  async findRunByExternalKey(externalKey: string): Promise<RunRow | null> {
+    const rows = (await this.sql`
+      SELECT * FROM workflow_runs WHERE external_key = ${externalKey}
+       ORDER BY started_at DESC LIMIT 1`) as Row[];
+    return rows[0] ? mapRun(rows[0]) : null;
+  }
+
+  // -- retry schedule --------------------------------------------------------
+
+  async upsertRetry(row: Omit<RetryRow, 'updated_at'>): Promise<void> {
+    await this.sql`
+      INSERT INTO retry_schedule
+        (worker_key, parent_issue_id, sub_issue_id, repo_alias, attempt, due_at, reason)
+      VALUES (${row.worker_key}, ${row.parent_issue_id}, ${row.sub_issue_id},
+              ${row.repo_alias}, ${row.attempt}, ${row.due_at}, ${row.reason})
+      ON CONFLICT (worker_key) DO UPDATE SET
+        parent_issue_id = excluded.parent_issue_id,
+        sub_issue_id    = excluded.sub_issue_id,
+        repo_alias      = excluded.repo_alias,
+        attempt         = excluded.attempt,
+        due_at          = excluded.due_at,
+        reason          = excluded.reason,
+        updated_at      = now()`;
+  }
+
+  async getRetry(workerKey: string): Promise<RetryRow | null> {
+    const rows = (await this.sql`
+      SELECT * FROM retry_schedule WHERE worker_key = ${workerKey}`) as Row[];
+    return rows[0] ? mapRetry(rows[0]) : null;
+  }
+
+  async deleteRetry(workerKey: string): Promise<void> {
+    await this.sql`DELETE FROM retry_schedule WHERE worker_key = ${workerKey}`;
+  }
+
+  async listRetries(): Promise<RetryRow[]> {
+    const rows = (await this.sql`SELECT * FROM retry_schedule ORDER BY due_at`) as Row[];
+    return rows.map(mapRetry);
+  }
+
+  // -- analysis cache --------------------------------------------------------
+
+  async saveAnalysis(issueId: string, analysis: unknown): Promise<void> {
+    await this.sql`
+      INSERT INTO issue_analyses (issue_id, analysis, saved_at)
+      VALUES (${issueId}, ${analysis as never}, now())
+      ON CONFLICT (issue_id) DO UPDATE SET
+        analysis = excluded.analysis, saved_at = now()`;
+  }
+
+  async getAnalysis(issueId: string): Promise<unknown | null> {
+    const rows = (await this.sql`
+      SELECT analysis FROM issue_analyses WHERE issue_id = ${issueId}`) as Row[];
+    return rows[0] ? parseJson(rows[0].analysis) : null;
+  }
+
+  async deleteAnalysis(issueId: string): Promise<void> {
+    await this.sql`DELETE FROM issue_analyses WHERE issue_id = ${issueId}`;
+  }
+
+  // -- scaffold jobs ---------------------------------------------------------
+
+  async upsertScaffoldJob(row: ScaffoldJobRow): Promise<void> {
+    await this.sql`
+      INSERT INTO scaffold_jobs
+        (slug, url, checkout_path, run_id, workflow_name, branch, started_at,
+         last_polled_at, last_status, pr_url, last_error)
+      VALUES (${row.slug}, ${row.url}, ${row.checkout_path}, ${row.run_id},
+              ${row.workflow_name}, ${row.branch}, ${row.started_at},
+              ${row.last_polled_at}, ${row.last_status}, ${row.pr_url}, ${row.last_error})
+      ON CONFLICT (slug) DO UPDATE SET
+        url = excluded.url, checkout_path = excluded.checkout_path,
+        run_id = excluded.run_id, workflow_name = excluded.workflow_name,
+        branch = excluded.branch, started_at = excluded.started_at,
+        last_polled_at = excluded.last_polled_at, last_status = excluded.last_status,
+        pr_url = excluded.pr_url, last_error = excluded.last_error`;
+  }
+
+  async listScaffoldJobs(): Promise<ScaffoldJobRow[]> {
+    const rows = (await this.sql`SELECT * FROM scaffold_jobs ORDER BY started_at`) as Row[];
+    return rows.map(mapScaffold);
+  }
+
+  async deleteScaffoldJob(slug: string): Promise<void> {
+    await this.sql`DELETE FROM scaffold_jobs WHERE slug = ${slug}`;
+  }
+
+  // -- synced registry -------------------------------------------------------
+
+  async replaceSyncedRegistry(syncedAt: string, repos: SyncedRepoRow[]): Promise<void> {
+    // One transaction: a reader must never observe a half-written registry.
+    await this.sql.begin(async (tx: SQL) => {
+      await tx`DELETE FROM synced_repos`;
+      for (const r of repos) {
+        await tx`
+          INSERT INTO synced_repos
+            (url, slug, default_branch, local_path, last_synced_at,
+             last_commit_sha, sync_status, sync_error, frontmatter, narrative)
+          VALUES (${r.url}, ${r.slug}, ${r.default_branch}, ${r.local_path},
+                  ${r.last_synced_at}, ${r.last_commit_sha}, ${r.sync_status},
+                  ${r.sync_error}, ${(r.frontmatter ?? null) as never}, ${r.narrative})`;
+      }
+      await tx`
+        INSERT INTO registry_meta (only_row, synced_at) VALUES (true, ${syncedAt})
+        ON CONFLICT (only_row) DO UPDATE SET synced_at = excluded.synced_at`;
+    });
+  }
+
+  async loadSyncedRegistry(): Promise<{ synced_at: string; repositories: SyncedRepoRow[] } | null> {
+    const meta = (await this.sql`SELECT synced_at FROM registry_meta`) as Row[];
+    if (!meta[0]) return null;
+    const rows = (await this.sql`SELECT * FROM synced_repos ORDER BY slug`) as Row[];
+    return { synced_at: isoRequired(meta[0].synced_at), repositories: rows.map(mapSyncedRepo) };
+  }
+
+  async registrySyncedAt(): Promise<string | null> {
+    const rows = (await this.sql`SELECT synced_at FROM registry_meta`) as Row[];
+    return rows[0] ? isoRequired(rows[0].synced_at) : null;
   }
 
   // ── worktrees ─────────────────────────────────────────────────────────────

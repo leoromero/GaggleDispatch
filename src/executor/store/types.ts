@@ -35,6 +35,12 @@ export interface RunRow {
   base_branch: string | null;
   branch: string | null;
   artifacts_dir: string | null;
+  /**
+   * Caller-supplied identity for this run — the orchestrator stamps its
+   * worker key here. Turns "which run belongs to this issue+repo" into a
+   * query, which is what let the run-registry sidecar go away.
+   */
+  external_key: string | null;
   env: Record<string, string>;
   metadata: RunMetadata;
   started_at: string;
@@ -122,9 +128,50 @@ export interface CreateRunInput {
   base_branch?: string | null;
   branch?: string | null;
   artifacts_dir?: string | null;
+  external_key?: string | null;
   env?: Record<string, string>;
   metadata?: RunMetadata;
   dry_run?: boolean;
+}
+
+// ─── Registry rows ──────────────────────────────────────────────────────────
+
+export interface RetryRow {
+  worker_key: string;
+  parent_issue_id: string;
+  sub_issue_id: string | null;
+  repo_alias: string;
+  attempt: number;
+  due_at: string;
+  reason: string | null;
+  updated_at: string;
+}
+
+export interface ScaffoldJobRow {
+  slug: string;
+  url: string;
+  checkout_path: string;
+  run_id: string | null;
+  workflow_name: string;
+  branch: string;
+  started_at: string;
+  last_polled_at: string | null;
+  last_status: string;
+  pr_url: string | null;
+  last_error: string | null;
+}
+
+export interface SyncedRepoRow {
+  url: string;
+  slug: string;
+  default_branch: string;
+  local_path: string;
+  last_synced_at: string | null;
+  last_commit_sha: string | null;
+  sync_status: string;
+  sync_error: string | null;
+  frontmatter: unknown | null;
+  narrative: string | null;
 }
 
 export interface RunQuery {
@@ -233,6 +280,33 @@ export interface Store {
     comment: string | null,
   ): Promise<ApprovalRow | null>;
   incrementReworkAttempts(id: string): Promise<number>;
+
+  // run lookup by caller identity
+  /** Most recent run stamped with this external key, whatever its status. */
+  findRunByExternalKey(externalKey: string): Promise<RunRow | null>;
+
+  // retry schedule
+  upsertRetry(row: Omit<RetryRow, 'updated_at'>): Promise<void>;
+  getRetry(workerKey: string): Promise<RetryRow | null>;
+  deleteRetry(workerKey: string): Promise<void>;
+  listRetries(): Promise<RetryRow[]>;
+
+  // analysis cache
+  saveAnalysis(issueId: string, analysis: unknown): Promise<void>;
+  getAnalysis(issueId: string): Promise<unknown | null>;
+  deleteAnalysis(issueId: string): Promise<void>;
+
+  // scaffold jobs
+  upsertScaffoldJob(row: ScaffoldJobRow): Promise<void>;
+  listScaffoldJobs(): Promise<ScaffoldJobRow[]>;
+  deleteScaffoldJob(slug: string): Promise<void>;
+
+  // synced registry
+  /** Replace the whole registry atomically and bump the sync marker. */
+  replaceSyncedRegistry(syncedAt: string, repos: SyncedRepoRow[]): Promise<void>;
+  loadSyncedRegistry(): Promise<{ synced_at: string; repositories: SyncedRepoRow[] } | null>;
+  /** The sync marker alone. Polled to notice a sync from another process. */
+  registrySyncedAt(): Promise<string | null>;
 
   // worktrees
   upsertWorktree(row: Omit<WorktreeRow, 'created_at' | 'last_activity_at'>): Promise<WorktreeRow>;
