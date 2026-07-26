@@ -201,13 +201,21 @@ export interface EventRepo {
 
 export interface OutboxRepo {
   enqueueOutbox(input: EnqueueOutboxInput): Promise<void>;
-  /** Oldest unsent rows, oldest first. */
-  claimOutbox(limit: number): Promise<OutboxRow[]>;
+  /**
+   * Claim unsent rows for sending, oldest first.
+   *
+   * `workspace` is required, not optional: a drainer sends through *its own*
+   * tracker client with its own state names, so draining another workspace's rows
+   * would write the wrong thing to the wrong tracker. Rows are locked with
+   * `FOR UPDATE SKIP LOCKED` for the caller's transaction, so two drainers cannot
+   * both send the same comment.
+   */
+  claimOutbox(workspace: string, limit: number): Promise<OutboxRow[]>;
   markOutboxSent(id: number): Promise<void>;
   /** Records the failure and bumps `attempts`. */
   markOutboxFailed(id: number, error: string): Promise<void>;
-  /** Drops rows that exceeded the attempt ceiling. Returns how many. */
-  discardExhaustedOutbox(maxAttempts: number): Promise<number>;
+  /** Drops this workspace's rows that exceeded the attempt ceiling. Returns how many. */
+  discardExhaustedOutbox(workspace: string, maxAttempts: number): Promise<number>;
 }
 
 export interface ScaffoldJobRepo {

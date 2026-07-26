@@ -13,10 +13,12 @@
 
 import { logger } from '../util/logger.ts';
 import type { TrackerWritePort } from './ports.ts';
-import type { OutboxRepo } from './store/types.ts';
+import type { ControlStore } from './store/types.ts';
 import type { OutboxRow } from './types.ts';
 
 export interface OutboxDrainerConfig {
+  /** Whose rows to drain. A drainer must never send another workspace's writes. */
+  workspace: string;
   /** How many rows to attempt per pass. */
   batch_size: number;
   /** Attempts before a row is discarded. */
@@ -31,43 +33,53 @@ export interface OutboxDrainResult {
 
 export class OutboxDrainer {
   constructor(
-    private readonly store: OutboxRepo,
+    private readonly store: ControlStore,
     private readonly tracker: TrackerWritePort,
     private readonly cfg: OutboxDrainerConfig,
   ) {}
 
-  /** Send one batch. Safe to call on every tick. */
+  /** Send one batch. Safe to call on every tick, and safe to run concurrently. */
   async drain(): Promise<OutboxDrainResult> {
-    const discarded = await this.store.discardExhaustedOutbox(this.cfg.max_attempts);
+    const discarded = await this.store.discardExhaustedOutbox(
+      this.cfg.workspace,
+      this.cfg.max_attempts,
+    );
     if (discarded > 0) {
       logger.error('Discarded tracker writes that exhausted their retries', {
+        workspace: this.cfg.workspace,
         count: discarded,
         max_attempts: this.cfg.max_attempts,
       });
     }
 
-    const rows = await this.store.claimOutbox(this.cfg.batch_size);
     let sent = 0;
     let failed = 0;
 
-    for (const row of rows) {
-      try {
-        await this.send(row);
-        await this.store.markOutboxSent(row.id);
-        sent++;
-      } catch (err) {
-        const message = (err as Error).message;
-        await this.store.markOutboxFailed(row.id, message);
-        failed++;
-        logger.warn('Tracker write failed; will retry', {
-          outbox_id: row.id,
-          op: row.op,
-          external_id: row.external_id,
-          attempts: row.attempts + 1,
-          error: message,
-        });
+    // The whole batch runs in one transaction so `claimOutbox`'s row locks are
+    // still held while each row is being sent. Without that, a second drainer
+    // could claim and re-send rows this one is mid-flight on, posting every
+    // comment twice.
+    await this.store.tx(async (tr) => {
+      const rows = await tr.claimOutbox(this.cfg.workspace, this.cfg.batch_size);
+      for (const row of rows) {
+        try {
+          await this.send(row);
+          await tr.markOutboxSent(row.id);
+          sent++;
+        } catch (err) {
+          const message = (err as Error).message;
+          await tr.markOutboxFailed(row.id, message);
+          failed++;
+          logger.warn('Tracker write failed; will retry', {
+            outbox_id: row.id,
+            op: row.op,
+            external_id: row.external_id,
+            attempts: row.attempts + 1,
+            error: message,
+          });
+        }
       }
-    }
+    });
 
     return { sent, failed, discarded };
   }

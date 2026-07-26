@@ -60,13 +60,6 @@ function formatAgo(iso) {
   return `${Math.floor(ms / 86_400_000)}d ago`;
 }
 
-function formatAgoMs(ms) {
-  const d = Date.now() - ms;
-  if (d < 60_000) return `${Math.floor(d / 1000)}s`;
-  if (d < 3_600_000) return `${Math.floor(d / 60_000)}m`;
-  return `${Math.floor(d / 3_600_000)}h`;
-}
-
 // ─── Connection ─────────────────────────────────────────────────────────────
 let ws = null;
 
@@ -784,6 +777,21 @@ function renderGates() {
             controlPost(`/gates/${g.target_id}/reject`, { reason: input.value });
           },
         }, 'Reject'),
+        // The third answer to a gate: this work is blocked on a change somewhere
+        // else. Files a blocker issue in the tracker and parks the target until it
+        // is resolved. The whole path existed server-side with nothing to trigger it.
+        el('button', {
+          class: 'nest-btn',
+          title: 'File a blocker and park this target until it is resolved',
+          onclick: () => {
+            const title = prompt('What is blocking this? (becomes the blocker issue title)');
+            if (!title || !title.trim()) return;
+            controlPost(`/gates/${g.target_id}/create-blocker`, {
+              title: title.trim(),
+              description: input.value || '',
+            });
+          },
+        }, 'Blocked by…'),
       ]),
     ]));
   }
@@ -828,5 +836,5 @@ setInterval(() => {
   renderGates();
 }, 5000);
 
+// bootstrap() ends in renderAll(), which refreshes the board — no second call.
 bootstrap();
-void refreshBoard();

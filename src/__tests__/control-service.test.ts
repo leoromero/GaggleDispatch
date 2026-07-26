@@ -207,7 +207,7 @@ describe('ControlService — Start and dispatch', () => {
     await h.service.claimAndDispatch(10);
     const target = (await h.store.listTargets(ticket.id))[0]!;
     expect(target.status).toBe('running');
-    expect(target.run_id).toBe('11111111-1111-4111-8111-111111111111');
+    expect(target.run_id).toBe(h.executor.lastRunId);
     expect(target.dispatched_at).toBeTruthy();
   });
 
@@ -235,7 +235,7 @@ describe('ControlService — Start and dispatch', () => {
     const target = (await h.store.listTargets(ticket.id))[0]!;
     expect(target.status).toBe('failed');
     expect(target.failure_reason).toBe('no worktree available');
-    const outbox = await h.store.claimOutbox(20);
+    const outbox = await h.store.claimOutbox(WS, 20);
     expect(outbox.some((o) => o.op === 'post_comment' && String(o.payload.body).includes('no worktree available'))).toBe(true);
   });
 
@@ -266,7 +266,7 @@ describe('ControlService — completion', () => {
     const after = await h.store.getTicket(ticket.id);
     expect(after!.status).toBe('done');
     expect(after!.completed_at).toBeTruthy();
-    const outbox = await h.store.claimOutbox(20);
+    const outbox = await h.store.claimOutbox(WS, 20);
     expect(outbox.some((o) => o.op === 'set_state' && o.payload.state === 'Done')).toBe(true);
   });
 
@@ -362,7 +362,7 @@ describe('ControlService — gates', () => {
     expect(gates[0]!.approval_id).toBe('appr-1');
     expect(gates[0]!.identifier).toBe('GAG-1');
 
-    const outbox = await h.store.claimOutbox(20);
+    const outbox = await h.store.claimOutbox(WS, 20);
     const comment = outbox.find((o) => o.op === 'post_comment');
     expect(String(comment!.payload.body)).toContain('Approve the plan?');
     expect(String(comment!.payload.body)).toMatch(/no effect/i);
@@ -454,7 +454,7 @@ describe('ControlService — gates', () => {
     await h.service.gateOpened(target.id, 'a', 'ok?');
     await h.service.approveGate(target.id, null);
 
-    const states = (await h.store.claimOutbox(50))
+    const states = (await h.store.claimOutbox(WS, 50))
       .filter((o) => o.op === 'set_state')
       .map((o) => o.payload.state);
     expect(states).toEqual(['Blocked', 'In Progress']);
@@ -597,7 +597,7 @@ describe('ControlService — workflow override and errors', () => {
     const after = await h.store.getTicket(ticket.id);
     expect(after).toEqual(before);
     expect(await h.store.listEvents(ticket.id)).toHaveLength(0);
-    expect(await h.store.claimOutbox(10)).toHaveLength(0);
+    expect(await h.store.claimOutbox(WS, 10)).toHaveLength(0);
   });
 });
 
@@ -606,7 +606,7 @@ describe('ControlService — label mirroring', () => {
     const h = await harness({ mirror_labels: false });
     const ticket = await startedTicket(h);
     await h.service.claimAndDispatch(10);
-    const ops = (await h.store.claimOutbox(50)).map((o) => o.op);
+    const ops = (await h.store.claimOutbox(WS, 50)).map((o) => o.op);
     expect(ops).not.toContain('apply_label');
     expect(ops).not.toContain('remove_label');
   });
@@ -615,7 +615,7 @@ describe('ControlService — label mirroring', () => {
     const h = await harness({ mirror_labels: true });
     const ticket = await startedTicket(h);
     await h.service.claimAndDispatch(10);
-    const outbox = await h.store.claimOutbox(50);
+    const outbox = await h.store.claimOutbox(WS, 50);
     const applied = outbox.filter((o) => o.op === 'apply_label').map((o) => o.payload.label);
     expect(applied).toContain('gaggle:analyzing');
     expect(applied).toContain('gaggle:claimed');
@@ -631,13 +631,13 @@ describe('OutboxDrainer', () => {
     await h.service.runSucceeded(target.id);
 
     const writes = new FakeTrackerWrites();
-    const drainer = new OutboxDrainer(h.store, writes, { batch_size: 50, max_attempts: 5 });
+    const drainer = new OutboxDrainer(h.store, writes, { workspace: WS, batch_size: 50, max_attempts: 5 });
     const result = await drainer.drain();
 
     expect(result.sent).toBeGreaterThan(0);
     expect(result.failed).toBe(0);
     expect(writes.states).toEqual([{ id: 'lin-1', state: 'Done' }]);
-    expect(await h.store.claimOutbox(50)).toHaveLength(0);
+    expect(await h.store.claimOutbox(WS, 50)).toHaveLength(0);
   });
 
   test('a tracker outage delays a write instead of losing it', async () => {
@@ -647,7 +647,7 @@ describe('OutboxDrainer', () => {
     await h.service.runSucceeded((await h.store.listTargets(ticket.id))[0]!.id);
 
     const writes = new FakeTrackerWrites();
-    const drainer = new OutboxDrainer(h.store, writes, { batch_size: 50, max_attempts: 5 });
+    const drainer = new OutboxDrainer(h.store, writes, { workspace: WS, batch_size: 50, max_attempts: 5 });
 
     writes.failNext = 1;
     const first = await drainer.drain();
@@ -664,7 +664,7 @@ describe('OutboxDrainer', () => {
     await h.store.enqueueOutbox({ workspace: WS, external_id: 'lin-1', op: 'set_state', payload: { state: 'Done' } });
 
     const writes = new FakeTrackerWrites();
-    const drainer = new OutboxDrainer(h.store, writes, { batch_size: 50, max_attempts: 2 });
+    const drainer = new OutboxDrainer(h.store, writes, { workspace: WS, batch_size: 50, max_attempts: 2 });
 
     writes.failNext = 10;
     await drainer.drain();
@@ -672,7 +672,7 @@ describe('OutboxDrainer', () => {
     const third = await drainer.drain();
 
     expect(third.discarded).toBe(1);
-    expect(await h.store.claimOutbox(50)).toHaveLength(0);
+    expect(await h.store.claimOutbox(WS, 50)).toHaveLength(0);
   });
 
   test('a malformed payload does not wedge the queue', async () => {
@@ -681,7 +681,7 @@ describe('OutboxDrainer', () => {
     await h.store.enqueueOutbox({ workspace: WS, external_id: 'lin-2', op: 'post_comment', payload: { body: 'fine' } });
 
     const writes = new FakeTrackerWrites();
-    const drainer = new OutboxDrainer(h.store, writes, { batch_size: 50, max_attempts: 5 });
+    const drainer = new OutboxDrainer(h.store, writes, { workspace: WS, batch_size: 50, max_attempts: 5 });
     const result = await drainer.drain();
 
     expect(result.sent).toBe(1);

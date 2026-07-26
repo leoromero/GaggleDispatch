@@ -281,7 +281,10 @@ describe('ArchonExecutorAdapter — exit translation', () => {
     expect(sink.kinds()).toContain('runFailed');
   });
 
-  test('when the status cannot be verified, the exit code is trusted', async () => {
+  test('an unverifiable clean exit decides nothing and leaves it to the reconciler', async () => {
+    // `succeeded` is terminal: guessing it here would close the tracker issue,
+    // leave a possibly-still-paused Archon run holding its worktree, and leave the
+    // operator with no button — the reconciler cannot correct a terminal status.
     const sink = new RecordingSink();
     let onExit!: (e: { type: string }) => void;
     const a = new ArchonExecutorAdapter({
@@ -299,8 +302,33 @@ describe('ArchonExecutorAdapter — exit translation', () => {
 
     onExit({ type: 'archon_succeeded' });
     await Bun.sleep(5);
-    // The reconciler corrects this next tick if the run was really paused.
-    expect(sink.kinds()).toContain('runSucceeded');
+
+    expect(sink.kinds()).toEqual([]);
+  });
+
+  test('a clean exit on a run that is still going decides nothing either', async () => {
+    // The process is gone but Archon says the run is not finished. Same reasoning:
+    // stay in the recoverable direction.
+    for (const st of ['running', 'pending'] as const) {
+      const sink = new RecordingSink();
+      let onExit!: (e: { type: string }) => void;
+      const a = new ArchonExecutorAdapter({
+        cfg: makeServiceConfig(),
+        client: fakeClient({ detail: detail(st) }) as never,
+        launch: async (args) => {
+          onExit = args.callbacks.onExit;
+          args.callbacks.onRunId('run-1');
+          return { cancel: () => {} };
+        },
+        sink: () => sink,
+      });
+      await a.spawnRun(ctx());
+      sink.calls = [];
+
+      onExit({ type: 'archon_succeeded' });
+      await Bun.sleep(5);
+      expect(sink.kinds()).toEqual([]);
+    }
   });
 
   test('a non-zero exit fails the target with the event name as the reason', async () => {

@@ -107,6 +107,7 @@ export async function openControlPlane(opts: OpenControlPlaneOptions): Promise<C
       workspace: opts.workspace,
       gate_timeout_ms: opts.cfg.archon.gate_timeout_ms,
       outbox: {
+        workspace: opts.workspace,
         batch_size: 50,
         max_attempts: opts.cfg.tracker.outbox_max_attempts,
       },
@@ -155,9 +156,10 @@ export async function openControlReadPlane(opts: {
 
   const service = new ControlService({
     store,
-    // The workspace is per-ticket on the read side: every action addresses a
-    // ticket by id, and the row carries its own workspace. The value here is only
-    // used to stamp outbox rows, which take it from the ticket in practice.
+    // No workspace of its own, and it does not need one: every action addresses a
+    // ticket by id, and `applyEffects` stamps outbox rows from that ticket's
+    // `workspace` column. The only thing that reads `cfg.workspace` is
+    // `claimAnalysisWork` / `claimAndDispatch`, which the hub never calls.
     cfg: serviceConfigFrom(opts.cfg, ''),
     executor: unreachable<ExecutorPort>('executor'),
     tracker: unreachable<TrackerStructurePort>('tracker structure'),

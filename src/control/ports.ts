@@ -123,9 +123,17 @@ export interface AnalysisResult {
  * How many more runs may start right now.
  *
  * The reconciler counts live targets from the store and passes the number in, so
- * the ceiling holds across a restart and across two daemons sharing a database —
- * a port that counted its own in-memory sessions would forget everything on
- * restart and let concurrency drift.
+ * the ceiling holds **across a restart** — a port counting its own in-memory
+ * sessions would forget everything and let concurrency drift upward every time the
+ * daemon bounced.
+ *
+ * It does *not* bound the total across two daemons sharing a workspace: the count
+ * and the claim are separate statements, so two processes can both see the same
+ * free slots and each fill them. Row-level exclusivity still holds — no target is
+ * ever dispatched twice — so the failure mode is "more concurrent runs than
+ * configured", not corruption. One daemon per workspace is the supported
+ * configuration, and `process-manager` enforces it via the pid sidecar; making the
+ * ceiling atomic would mean computing it inside the claim statement.
  */
 export interface SlotPort {
   /** @param liveCount targets the store reports as dispatching, running, or gate_waiting */

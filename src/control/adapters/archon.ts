@@ -232,27 +232,47 @@ export class ArchonExecutorAdapter implements ExecutorPort {
         await sink.runFailed(targetId, 'archon exited 0 without starting a workflow');
         return;
       }
+
+      let status: string | undefined;
       try {
         const detail = await this.deps.client.getRunDetail(id);
-        const status = detail?.run?.status;
+        status = detail?.run?.status;
         if (status === 'paused') {
           const message = detail?.run?.metadata?.approval?.message ?? 'Awaiting approval';
           await this.onGatePaused(targetId, id, message);
           return;
         }
-        if (status === 'failed' || status === 'cancelled') {
-          await sink.runFailed(targetId, `archon run ${status}`);
-          return;
-        }
       } catch (err) {
-        // Cannot verify. Trusting the exit code is the lesser risk: the
-        // reconciler will correct it on the next tick if the run is really paused.
-        logger.warn('Could not verify a clean exit against the run status', {
+        // Cannot verify, so do not decide. `succeeded` is terminal: guessing it
+        // here would close the tracker issue, leave a still-paused Archon run
+        // holding its worktree, and leave the operator with no button — the
+        // reconciler cannot correct a terminal status. Leaving the target
+        // `running` means the reconciler retries this same question every tick,
+        // which is the recoverable direction to be wrong in.
+        logger.warn('Could not verify a clean exit; leaving the target running for the reconciler', {
           run_id: id,
+          target_id: targetId,
           error: (err as Error).message,
         });
+        return;
       }
-      await sink.runSucceeded(targetId);
+
+      if (status === 'completed') {
+        await sink.runSucceeded(targetId);
+        return;
+      }
+      if (status === 'failed' || status === 'cancelled') {
+        await sink.runFailed(targetId, `archon run ${status}`);
+        return;
+      }
+      // `running`, `pending`, or a status this build does not know: the process
+      // is gone but the run is not finished. Same reasoning as above — let the
+      // reconciler settle it rather than committing to a terminal status.
+      logger.info('Worker exited cleanly but its run is not finished; leaving it to the reconciler', {
+        run_id: id,
+        target_id: targetId,
+        run_status: status ?? 'unknown',
+      });
       return;
     }
 

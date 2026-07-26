@@ -10,7 +10,6 @@
 import { describe, expect, test } from 'bun:test';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { Script } from 'node:vm';
 
 const DASHBOARD = join(import.meta.dir, '..', '..', 'dashboard');
 const read = (f: string) => readFileSync(join(DASHBOARD, f), 'utf8');
@@ -18,10 +17,12 @@ const read = (f: string) => readFileSync(join(DASHBOARD, f), 'utf8');
 describe('dashboard/app.js', () => {
   const source = read('app.js');
 
-  test('parses as an ES module', () => {
-    // `new Script` with sourceType module semantics: Bun's transpiler throws on a
-    // syntax error, which is exactly the failure mode being guarded.
-    expect(() => new Script(source, { filename: 'app.js' })).not.toThrow();
+  test('parses', () => {
+    // Bun's transpiler, not `new vm.Script`. `new Script` does not eagerly parse
+    // in Bun — it accepts `function f( {` without complaint — so the earlier
+    // version of this test was green while the real file was unloadable, which is
+    // precisely the failure it was written to catch.
+    expect(() => new Bun.Transpiler({ loader: 'js' }).scan(source)).not.toThrow();
   });
 
   test('has no half-substituted template literals or empty expressions', () => {

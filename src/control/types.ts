@@ -317,7 +317,10 @@ export function isSettled(status: TargetStatus): boolean {
  */
 export function settleTicketStatus(targets: readonly TargetRow[]): 'done' | 'running' | null {
   const live = participating(targets);
-  if (live.length === 0) return null;
+  // Nothing left to run. `start_requested` refuses an all-excluded fan-out, but a
+  // target can be excluded after the ticket started, and returning null here
+  // would leave the ticket in `running` with nothing running and no way out.
+  if (live.length === 0) return targets.length === 0 ? null : 'done';
   if (!live.every((t) => isSettled(t.status))) return 'running';
   return live.every((t) => t.status === 'succeeded') ? 'done' : 'running';
 }

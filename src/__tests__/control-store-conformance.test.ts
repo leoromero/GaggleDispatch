@@ -566,7 +566,7 @@ function suite(name: string, makeStore: () => Promise<ControlStore>, cleanup?: (
       expect(await store.latestEventId('other')).toBe(0);
     });
 
-    test('deleting a ticket cascades to its targets and events', async () => {
+    test('an event records the target it concerns', async () => {
       const t = await store.upsertTicket(ticketInput());
       const [target] = await store.replaceTargets(t.id, [targetSpec()]);
       await store.appendEvent({
@@ -580,13 +580,36 @@ function suite(name: string, makeStore: () => Promise<ControlStore>, cleanup?: (
       expect(events[0]!.target_id).toBe(target!.id);
     });
 
+    test('replacing the fan-out keeps the audit trail', async () => {
+      // Re-analysing must not erase the record of what the previous targets did.
+      // The events survive with their target reference cleared.
+      const t = await store.upsertTicket(ticketInput());
+      const [target] = await store.replaceTargets(t.id, [targetSpec()]);
+      await store.appendEvent({
+        ticket_id: t.id,
+        target_id: target!.id,
+        event_kind: 'run_failed',
+        to_status: 'failed',
+        actor: 'daemon',
+        detail: { reason: 'tests failed' },
+      });
+
+      await store.replaceTargets(t.id, [targetSpec({ repo_alias: 'worker' })]);
+
+      const events = await store.listEvents(t.id);
+      expect(events).toHaveLength(1);
+      expect(events[0]!.event_kind).toBe('run_failed');
+      expect(events[0]!.detail).toEqual({ reason: 'tests failed' });
+      expect(events[0]!.target_id).toBeNull();
+    });
+
     // ── outbox ────────────────────────────────────────────────────────────
 
     test('claimOutbox returns unsent rows oldest first', async () => {
       await store.enqueueOutbox({ workspace: WS, external_id: 'lin-1', op: 'post_comment', payload: { body: 'first' } });
       await tick();
       await store.enqueueOutbox({ workspace: WS, external_id: 'lin-1', op: 'set_state', payload: { state: 'Done' } });
-      const rows = await store.claimOutbox(10);
+      const rows = await store.claimOutbox(WS, 10);
       expect(rows.map((r) => r.op)).toEqual(['post_comment', 'set_state']);
       expect(rows[0]!.payload).toEqual({ body: 'first' });
       expect(rows[0]!.attempts).toBe(0);
@@ -595,16 +618,16 @@ function suite(name: string, makeStore: () => Promise<ControlStore>, cleanup?: (
 
     test('markOutboxSent removes a row from future claims', async () => {
       await store.enqueueOutbox({ workspace: WS, external_id: 'lin-1', op: 'set_state' });
-      const [row] = await store.claimOutbox(10);
+      const [row] = await store.claimOutbox(WS, 10);
       await store.markOutboxSent(row!.id);
-      expect(await store.claimOutbox(10)).toHaveLength(0);
+      expect(await store.claimOutbox(WS, 10)).toHaveLength(0);
     });
 
     test('markOutboxFailed bumps attempts and keeps the row claimable', async () => {
       await store.enqueueOutbox({ workspace: WS, external_id: 'lin-1', op: 'set_state' });
-      const [row] = await store.claimOutbox(10);
+      const [row] = await store.claimOutbox(WS, 10);
       await store.markOutboxFailed(row!.id, 'network down');
-      const again = await store.claimOutbox(10);
+      const again = await store.claimOutbox(WS, 10);
       expect(again).toHaveLength(1);
       expect(again[0]!.attempts).toBe(1);
       expect(again[0]!.last_error).toBe('network down');
@@ -613,10 +636,10 @@ function suite(name: string, makeStore: () => Promise<ControlStore>, cleanup?: (
     test('discardExhaustedOutbox drops rows at or past the attempt ceiling', async () => {
       await store.enqueueOutbox({ workspace: WS, external_id: 'lin-1', op: 'set_state' });
       await store.enqueueOutbox({ workspace: WS, external_id: 'lin-2', op: 'set_state' });
-      const rows = await store.claimOutbox(10);
+      const rows = await store.claimOutbox(WS, 10);
       for (let i = 0; i < 3; i++) await store.markOutboxFailed(rows[0]!.id, 'nope');
-      expect(await store.discardExhaustedOutbox(3)).toBe(1);
-      const left = await store.claimOutbox(10);
+      expect(await store.discardExhaustedOutbox(WS, 3)).toBe(1);
+      const left = await store.claimOutbox(WS, 10);
       expect(left).toHaveLength(1);
       expect(left[0]!.external_id).toBe('lin-2');
     });
@@ -625,7 +648,7 @@ function suite(name: string, makeStore: () => Promise<ControlStore>, cleanup?: (
       for (let i = 0; i < 4; i++) {
         await store.enqueueOutbox({ workspace: WS, external_id: `lin-${i}`, op: 'set_state' });
       }
-      expect(await store.claimOutbox(2)).toHaveLength(2);
+      expect(await store.claimOutbox(WS, 2)).toHaveLength(2);
     });
 
     // ── scaffold jobs ─────────────────────────────────────────────────────

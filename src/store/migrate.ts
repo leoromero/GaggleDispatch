@@ -31,34 +31,63 @@ const BOOTSTRAP = `
   )`;
 
 /**
- * Apply every pending migration in ascending version order, each in its own
- * transaction — a partially-applied migration is worse than an unapplied one.
- * Safe to call repeatedly and safe to call concurrently from two processes:
- * the `INSERT` into `schema_migrations` is what serializes them, and the loser
- * of a race fails on the primary key and retries the read.
+ * A lock id for the migration runner, so two processes cannot apply the same
+ * schema concurrently. Arbitrary but fixed — any other holder of this exact key
+ * would have to have chosen it deliberately.
+ */
+const MIGRATION_LOCK_KEY = 0x6167_676c; // "aggl"
+
+/**
+ * Apply every pending migration in ascending version order.
  *
- * Returns the versions actually applied by this call.
+ * Safe to call repeatedly, and safe to call concurrently: the run happens inside
+ * one transaction holding a **transaction-scoped** advisory lock. `gaggle nest
+ * start` launches every daemon and then the hub, each of which migrates, so on a
+ * virgin database that race is the normal case rather than an edge one — and
+ * without the lock the loser does not fail politely on a duplicate key, it dies
+ * inside `CREATE TABLE` with "duplicate key value violates unique constraint
+ * pg_type_typname_nsp_index".
+ *
+ * Two details that are easy to get wrong:
+ *
+ *   - The lock must be `pg_advisory_xact_lock`, not the session-level
+ *     `pg_advisory_lock`. Over a connection *pool* there is no guarantee the
+ *     matching `pg_advisory_unlock` runs on the same connection, and unlocking
+ *     from another session silently returns false — leaving the lock held for the
+ *     life of the process and every later migration run hanging on it.
+ *   - The applied set is read *inside* the lock. Reading it outside would let a
+ *     process that waited act on a list that is already stale.
+ *
+ * All pending migrations share the transaction, which is strictly safer than one
+ * transaction each: a failure part-way through rolls the whole schema back rather
+ * than leaving it half-migrated.
+ *
+ * Returns the versions actually applied by this call — empty for the caller that
+ * waited and found the work already done.
  */
 export async function applyMigrations(sql: Sql, migrations: readonly Migration[]): Promise<number[]> {
   assertUniqueVersions(migrations);
   await sql.unsafe(BOOTSTRAP);
 
-  const applied = (await sql`SELECT version FROM schema_migrations`) as Row[];
-  const have = new Set(applied.map((r) => Number(r.version)));
+  return (await sql.begin(async (tx: Sql) => {
+    await tx`SELECT pg_advisory_xact_lock(${MIGRATION_LOCK_KEY})`;
 
-  const pending = [...migrations].filter((m) => !have.has(m.version)).sort((a, b) => a.version - b.version);
-  const done: number[] = [];
+    const applied = (await tx`SELECT version FROM schema_migrations`) as Row[];
+    const have = new Set(applied.map((r) => Number(r.version)));
 
-  for (const m of pending) {
-    logger.info('Applying migration', { version: m.version, name: m.name });
-    await sql.begin(async (tx: Sql) => {
+    const pending = [...migrations]
+      .filter((m) => !have.has(m.version))
+      .sort((a, b) => a.version - b.version);
+
+    const done: number[] = [];
+    for (const m of pending) {
+      logger.info('Applying migration', { version: m.version, name: m.name });
       await tx.unsafe(m.sql);
       await tx`INSERT INTO schema_migrations (version, name) VALUES (${m.version}, ${m.name})`;
-    });
-    done.push(m.version);
-  }
-
-  return done;
+      done.push(m.version);
+    }
+    return done;
+  })) as number[];
 }
 
 /** The highest version currently recorded, or 0 on a virgin database. */

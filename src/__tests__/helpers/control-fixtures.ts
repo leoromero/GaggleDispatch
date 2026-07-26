@@ -84,8 +84,16 @@ export class FakeExecutor implements ExecutorPort {
   rejected: Array<{ approval_id: string | null; reason: string; alias: string }> = [];
   /** Set to make the next spawn throw. */
   spawnError: string | null = null;
-  /** Run id handed back by spawnRun. Null models an executor that reports late. */
-  nextRunId: string | null = '11111111-1111-4111-8111-111111111111';
+  /**
+   * Set to null to model an executor that reports its run id asynchronously.
+   * Otherwise each spawn gets a *distinct* id — a shared one silently collides
+   * when a test keys per-run observations by run id, which made a two-target
+   * failure look like a success.
+   */
+  nextRunId: string | null | undefined = undefined;
+  /** The id handed out by the most recent spawn, for assertions. */
+  lastRunId: string | null = null;
+  private runSeq = 0;
 
   async spawnRun(ctx: DispatchContext): Promise<SpawnResult> {
     if (this.spawnError) {
@@ -94,7 +102,12 @@ export class FakeExecutor implements ExecutorPort {
       throw new Error(message);
     }
     this.spawned.push(ctx);
-    return { run_id: this.nextRunId };
+    const runId =
+      this.nextRunId === undefined
+        ? `${++this.runSeq}`.padStart(8, '0') + '-1111-4111-8111-111111111111'
+        : this.nextRunId;
+    this.lastRunId = runId;
+    return { run_id: runId };
   }
 
   async killRun(runId: string | null, ctx: DispatchContext): Promise<void> {

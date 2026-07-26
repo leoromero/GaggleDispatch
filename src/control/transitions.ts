@@ -333,6 +333,14 @@ export function ticketTransition(
 
   if (from === 'analyzed') {
     if (event.kind === 'start_requested') {
+      // Starting with nothing to run would park the ticket in `running` forever:
+      // `targets_settled` cannot complete a ticket with no participating targets,
+      // and `running` accepts no operator action except Cancel.
+      if (participating(ctx.targets).length === 0) {
+        throw new ControlConflictError(
+          `Cannot start ${ctx.ticket.identifier}: every target is excluded, so there is nothing to run.`,
+        );
+      }
       return done('running', { started_at: nowIso() }, [
         { kind: 'evaluate_target_readiness' },
         ...applyLabel(ctx, 'claimed'),
@@ -443,16 +451,36 @@ export function targetTransition(
 
     case 'redispatch_requested': {
       if (from !== 'failed' && from !== 'cancelled') return reject();
-      return done('ready', {
-        attempt: ctx.target.attempt + 1,
-        failure_reason: null,
-        run_id: null,
-        cancel_requested: false,
-        completed_at: null,
-        gate_approval_id: null,
-        gate_message: null,
-        gate_opened_at: null,
-      });
+      // A terminal ticket must not be able to start work. Without this,
+      // re-dispatching a target of a cancelled ticket spawns a run the operator
+      // explicitly cancelled, and the ticket can never settle again because
+      // `cancelled` accepts no events.
+      if (ctx.ticket.status !== 'running') {
+        throw new ControlConflictError(
+          `Cannot re-dispatch ${ctx.target.repo_alias}: ${ctx.ticket.identifier} is ${ctx.ticket.status}, not running.`,
+        );
+      }
+      // To `blocked`, not straight to `ready`: `ready` would bypass the ticket's
+      // tracker blockers and this target's `depends_on`. The readiness effect then
+      // promotes it in the same operation when they are satisfied, so an operator
+      // still sees `ready` immediately — exactly as Start behaves.
+      return done(
+        'blocked',
+        {
+          attempt: ctx.target.attempt + 1,
+          failure_reason: null,
+          run_id: null,
+          cancel_requested: false,
+          completed_at: null,
+          gate_approval_id: null,
+          gate_message: null,
+          gate_opened_at: null,
+          // A fresh attempt gets a fresh rework budget; carrying the old count
+          // would fail the first rejected gate of the new run.
+          gate_rework_attempts: 0,
+        },
+        [{ kind: 'evaluate_target_readiness' }],
+      );
     }
   }
 
@@ -518,9 +546,27 @@ export function targetTransition(
       gate_message: null,
       gate_opened_at: null,
     };
-    const resume: ControlEffect[] = ctx.gate_resume_state
-      ? [{ kind: 'tracker_set_state', external_id: trackerId, state: ctx.gate_resume_state }]
-      : [];
+
+    // A run can end while its gate is still open: the executor crashed, timed
+    // out on its own, or was cancelled outside the control plane. Without these
+    // the reconciler throws every tick and stops reconciling the whole
+    // workspace, so the outcome has to be accepted from here too.
+    if (event.kind === 'run_succeeded') {
+      return done(
+        'succeeded',
+        { ...clearGate, completed_at: nowIso(), failure_reason: null },
+        [...resumeState(ctx, trackerId), ...clearTargetLabels(ctx, trackerId)],
+      );
+    }
+    if (event.kind === 'run_failed') {
+      const failed = failTarget(from, ctx, trackerId, event.reason, actor);
+      return {
+        ...failed,
+        patch: { ...failed.patch, ...clearGate },
+        effects: [...resumeState(ctx, trackerId), ...failed.effects],
+      };
+    }
+    const resume = resumeState(ctx, trackerId);
 
     if (event.kind === 'gate_approved') {
       return done('running', clearGate, [
@@ -658,6 +704,13 @@ function gateComment(message: string): string {
 
 function isLive(status: TargetStatus): boolean {
   return status === 'dispatching' || status === 'running' || status === 'gate_waiting';
+}
+
+/** Restore the tracker state a gate moved away from, when one is configured. */
+function resumeState(ctx: TargetTransitionContext, trackerId: string): ControlEffect[] {
+  return ctx.gate_resume_state
+    ? [{ kind: 'tracker_set_state', external_id: trackerId, state: ctx.gate_resume_state }]
+    : [];
 }
 
 // ─── label mirroring ────────────────────────────────────────────────────────

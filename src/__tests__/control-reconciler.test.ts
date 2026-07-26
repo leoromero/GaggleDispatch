@@ -43,7 +43,11 @@ function reconcilerConfig(over: Partial<ReconcilerConfig> = {}): ReconcilerConfi
   return {
     workspace: WS,
     gate_timeout_ms: 0,
-    outbox: { batch_size: 50, max_attempts: 5 },
+    // Zero by default so tests exercise the logic rather than waiting out a window.
+    // The grace-window behaviour has its own tests, which set these explicitly.
+    gate_reopen_grace_ms: 0,
+    stranded_claim_grace_ms: 0,
+    outbox: { workspace: WS, batch_size: 50, max_attempts: 5 },
     ...over,
   };
 }
@@ -279,7 +283,12 @@ describe('Reconciler — run observation', () => {
     expect((await h.store.getTarget(target.id))!.status).toBe('running');
   });
 
-  test('a gate the executor resumed on its own is reconciled back to running', async () => {
+  test('a gate whose run reports running is left for a human, not auto-approved', async () => {
+    // The reconciler used to approve on the operator's behalf here. That made an
+    // approval we had just applied — which leaves the target `running` while
+    // Archon still says `paused` — come back round as a second approval on the
+    // next tick, spawning a second resume subprocess. A desynced gate is safer
+    // left visible than resolved by a guess.
     const { h, runs, reconciler } = await rig();
     const ticket = await startedTicket(h);
     await reconciler.tick();
@@ -289,8 +298,74 @@ describe('Reconciler — run observation', () => {
     runs.observations.set(target.run_id!, { status: 'running' });
     await reconciler.tick();
 
+    expect((await h.store.getTarget(target.id))!.status).toBe('gate_waiting');
+    expect(await h.store.listPendingGates(WS)).toHaveLength(1);
+    expect(h.executor.approved).toEqual([]);
+  });
+
+  test('an approved gate is not re-opened while the executor is still resuming', async () => {
+    const { h, runs, writes, reconciler } = await rig({ gate_reopen_grace_ms: 60_000 });
+    const ticket = await startedTicket(h);
+    await reconciler.tick();
+    const target = (await h.store.listTargets(ticket.id))[0]!;
+    await h.service.gateOpened(target.id, 'appr-1', 'ok?');
+    await h.service.approveGate(target.id, 'looks good');
+
+    // Archon keeps reporting the old gate for a moment after being resumed.
+    runs.observations.set(target.run_id!, {
+      status: 'paused',
+      approval: { id: 'appr-1', message: 'ok?' },
+    });
+    await reconciler.tick();
+    await reconciler.tick();
+
     expect((await h.store.getTarget(target.id))!.status).toBe('running');
     expect(await h.store.listPendingGates(WS)).toHaveLength(0);
+    // One approval, and one gate comment — not two of each.
+    expect(h.executor.approved).toHaveLength(1);
+    // The tick drains the outbox, so assert on what actually reached the tracker.
+    expect(writes.comments).toHaveLength(1);
+  });
+
+  test('a run that ends while its gate is open still settles the target', async () => {
+    // Without a `run_failed` exit from `gate_waiting` the transition throws every
+    // tick, and — before per-target isolation — took every other target in the
+    // workspace down with it.
+    const { h, runs, reconciler } = await rig();
+    const ticket = await startedTicket(h, [
+      targetSpec({ repo_alias: 'api' }),
+      targetSpec({ repo_alias: 'web' }),
+    ]);
+    await reconciler.tick();
+    const targets = await h.store.listTargets(ticket.id);
+    const [api, web] = targets as [typeof targets[0], typeof targets[0]];
+    await h.service.gateOpened(api.id, 'appr-1', 'ok?');
+
+    runs.observations.set(api.run_id!, { status: 'failed', error: 'archon crashed' });
+    runs.observations.set(web.run_id!, { status: 'completed' });
+    await reconciler.tick();
+
+    const after = Object.fromEntries(
+      (await h.store.listTargets(ticket.id)).map((t) => [t.repo_alias, t]),
+    );
+    expect(after.api!.status).toBe('failed');
+    expect(after.api!.failure_reason).toBe('archon crashed');
+    // The sibling was reconciled in the same pass rather than being blocked by it.
+    expect(after.web!.status).toBe('succeeded');
+  });
+
+  test('a run that completes while its gate is open succeeds the target', async () => {
+    const { h, runs, reconciler } = await rig();
+    const ticket = await startedTicket(h);
+    await reconciler.tick();
+    const target = (await h.store.listTargets(ticket.id))[0]!;
+    await h.service.gateOpened(target.id, 'appr-1', 'ok?');
+
+    runs.observations.set(target.run_id!, { status: 'completed' });
+    await reconciler.tick();
+
+    expect((await h.store.getTarget(target.id))!.status).toBe('succeeded');
+    expect((await h.store.getTicket(ticket.id))!.status).toBe('done');
   });
 
   test('an executor that cannot be reached leaves state untouched', async () => {
@@ -416,6 +491,7 @@ describe('Reconciler — startup recovery', () => {
     // Simulate a crash between the claim commit and the spawn.
     const claimed = await h.store.claimReadyTargets(WS, 10);
     expect(claimed[0]!.status).toBe('dispatching');
+    await Bun.sleep(5); // let the claim age past the zero grace window
 
     const recovery = await reconciler.recoverOnStartup();
 
@@ -427,16 +503,60 @@ describe('Reconciler — startup recovery', () => {
     expect(kinds).toContain('requeued_after_restart');
   });
 
+  test('a claim made moments ago is left alone — it may belong to a live peer', async () => {
+    // `dispatching` cannot distinguish "our crash" from "a peer mid-spawn right
+    // now". Requeueing the latter spawns a second run on the same worktree, and
+    // the peer's run id is never recorded so it can never be cancelled.
+    const { h, reconciler } = await rig({ stranded_claim_grace_ms: 120_000 });
+    const ticket = await startedTicket(h);
+    await h.store.claimReadyTargets(WS, 10);
+
+    const recovery = await reconciler.recoverOnStartup();
+
+    expect(recovery.requeued).toBe(0);
+    expect((await h.store.listTargets(ticket.id))[0]!.status).toBe('dispatching');
+  });
+
   test('a requeued target is dispatched on the next tick', async () => {
     const { h, reconciler } = await rig();
     const ticket = await startedTicket(h);
     await h.store.claimReadyTargets(WS, 10);
+    await Bun.sleep(5);
     await reconciler.recoverOnStartup();
 
     await reconciler.tick();
 
     expect(h.executor.spawned).toHaveLength(1);
     expect((await h.store.listTargets(ticket.id))[0]!.status).toBe('running');
+  });
+
+  test('a ticket left mid-analysis by a crash is returned to the queue', async () => {
+    // Only `analysis_requested` is claimable and the dashboard offers no action
+    // from `analyzing`, so without this the ticket needs manual SQL to recover.
+    const { h, reconciler } = await rig();
+    const ticket = await h.store.upsertTicket(ticketInput());
+    await h.service.requestAnalysis(ticket.id);
+    await h.service.claimAnalysisWork(10);
+    expect((await h.store.getTicket(ticket.id))!.status).toBe('analyzing');
+    await Bun.sleep(5);
+
+    const recovery = await reconciler.recoverOnStartup();
+
+    expect(recovery.reopened).toBe(1);
+    expect((await h.store.getTicket(ticket.id))!.status).toBe('analysis_requested');
+    // And the next tick actually analyses it.
+    await reconciler.tick();
+    expect((await h.store.getTicket(ticket.id))!.status).toBe('analyzed');
+  });
+
+  test('a ticket only just claimed for analysis is left alone', async () => {
+    const { h, reconciler } = await rig({ stranded_claim_grace_ms: 120_000 });
+    const ticket = await h.store.upsertTicket(ticketInput());
+    await h.service.requestAnalysis(ticket.id);
+    await h.service.claimAnalysisWork(10);
+
+    expect((await reconciler.recoverOnStartup()).reopened).toBe(0);
+    expect((await h.store.getTicket(ticket.id))!.status).toBe('analyzing');
   });
 
   test('running targets are adopted rather than requeued', async () => {
@@ -466,7 +586,7 @@ describe('Reconciler — startup recovery', () => {
 
   test('recovery on an empty database is a no-op', async () => {
     const { reconciler } = await rig();
-    expect(await reconciler.recoverOnStartup()).toEqual({ requeued: 0, adopted: 0 });
+    expect(await reconciler.recoverOnStartup()).toEqual({ requeued: 0, adopted: 0, reopened: 0 });
   });
 });
 

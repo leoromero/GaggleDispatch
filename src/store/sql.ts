@@ -18,9 +18,9 @@
  *     through (`${obj}`), but `JSON.stringify` + `::jsonb` double-encodes into a
  *     jsonb *string*. Pass values directly; never pre-stringify.
  *   - A JS array in an array context (`= ANY($1::text[])`) serializes to `a,b`,
- *     which Postgres rejects. Use `IN ${sql(values)}` instead — Bun expands that
- *     to a value list. {@link inList} guards the empty case, which would
- *     otherwise produce `IN ()` and a syntax error.
+ *     which Postgres rejects. {@link csvParam} encodes the set as a delimited
+ *     string for `string_to_array` to rebuild server-side, and returns null for an
+ *     empty input so callers can distinguish "no filter" from "match nothing".
  */
 
 import { SQL } from 'bun';
@@ -134,25 +134,6 @@ export function oneOfOrNull<T extends string>(v: unknown, allowed: readonly T[])
 // ─── query fragments ────────────────────────────────────────────────────────
 
 /**
- * Bind a set of values for an `= ANY(...)` test.
- *
- * Bun serializes a JS array in an array context to `a,b`, which Postgres's
- * array parser rejects outright. Passing a delimiter-joined string and
- * rebuilding the array server-side sidesteps that while staying fully
- * parameterized:
- *
- *   WHERE (${csvParam(statuses)}::text IS NULL
- *          OR status = ANY(string_to_array(${csvParam(statuses)}, ',')))
- *
- * Returning null for an empty input is what lets the `IS NULL` half of that
- * expression mean "no filter" — distinct from "filter matching nothing", which
- * callers handle by short-circuiting before they build the query.
- *
- * Only safe for values that cannot contain a comma. Every current caller passes
- * status literals or UUIDs, both of which qualify; anything else needs a
- * different encoding.
- */
-/**
  * Reduce a patch to the columns actually being written, for Bun's
  * `UPDATE … SET ${sql(obj)}` helper.
  *
@@ -181,6 +162,25 @@ export function patchObject<T extends object>(
   return any ? out : null;
 }
 
+/**
+ * Bind a set of values for an `= ANY(...)` test.
+ *
+ * Bun serializes a JS array in an array context to `a,b`, which Postgres's
+ * array parser rejects outright. Passing a delimiter-joined string and
+ * rebuilding the array server-side sidesteps that while staying fully
+ * parameterized:
+ *
+ *   WHERE (${csvParam(statuses)}::text IS NULL
+ *          OR status = ANY(string_to_array(${csvParam(statuses)}, ',')))
+ *
+ * Returning null for an empty input is what lets the `IS NULL` half of that
+ * expression mean "no filter" — distinct from "filter matching nothing", which
+ * callers handle by short-circuiting before they build the query.
+ *
+ * Only safe for values that cannot contain a comma. Every current caller passes
+ * status literals or UUIDs, both of which qualify; anything else needs a
+ * different encoding.
+ */
 export function csvParam(values?: readonly string[]): string | null {
   if (!values || values.length === 0) return null;
   for (const v of values) {

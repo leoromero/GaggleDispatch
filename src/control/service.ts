@@ -187,17 +187,21 @@ export class ControlService {
    * the claim exclusive. The event row follows.
    */
   async claimAnalysisWork(limit: number): Promise<TicketRow[]> {
-    const claimed = await this.deps.store.claimTicketsForAnalysis(this.deps.cfg.workspace, limit);
-    for (const ticket of claimed) {
-      await this.deps.store.appendEvent({
-        ticket_id: ticket.id,
-        event_kind: 'analysis_claimed',
-        from_status: 'analysis_requested',
-        to_status: 'analyzing',
-        actor: 'daemon',
-      });
-    }
-    return claimed;
+    // One transaction so the claim and its audit row commit together — a crash
+    // between them would leave a status change with no record of who made it.
+    return this.deps.store.tx(async (tr) => {
+      const claimed = await tr.claimTicketsForAnalysis(this.deps.cfg.workspace, limit);
+      for (const ticket of claimed) {
+        await tr.appendEvent({
+          ticket_id: ticket.id,
+          event_kind: 'analysis_claimed',
+          from_status: 'analysis_requested',
+          to_status: 'analyzing',
+          actor: 'daemon',
+        });
+      }
+      return claimed;
+    });
   }
 
   /**
@@ -242,20 +246,38 @@ export class ControlService {
    * `control_events` row is written straight after.
    */
   async claimAndDispatch(limit: number): Promise<TargetRow[]> {
-    const claimed = await this.deps.store.claimReadyTargets(this.deps.cfg.workspace, limit);
+    // Claim and audit together, then spawn outside the transaction. Spawning
+    // inside would hold row locks across a subprocess launch.
+    const claimed = await this.deps.store.tx(async (tr) => {
+      const rows = await tr.claimReadyTargets(this.deps.cfg.workspace, limit);
+      for (const target of rows) {
+        await tr.appendEvent({
+          ticket_id: target.ticket_id,
+          target_id: target.id,
+          event_kind: 'dispatch_claimed',
+          from_status: 'ready',
+          to_status: 'dispatching',
+          actor: 'daemon',
+          detail: { attempt: target.attempt, workflow: target.workflow },
+        });
+      }
+      return rows;
+    });
+
     for (const target of claimed) {
-      await this.deps.store.appendEvent({
-        ticket_id: target.ticket_id,
-        target_id: target.id,
-        event_kind: 'dispatch_claimed',
-        from_status: 'ready',
-        to_status: 'dispatching',
-        actor: 'daemon',
-        detail: { attempt: target.attempt, workflow: target.workflow },
-      });
-    }
-    for (const target of claimed) {
-      await this.dispatch(target);
+      // Per-target isolation: one target whose spawn or transition is refused must
+      // not leave its siblings claimed-but-never-spawned. Those would be invisible
+      // to `reconcileRuns` (it only looks at running/gate_waiting), swept only at
+      // startup, and counted against the concurrency ceiling in the meantime.
+      try {
+        await this.dispatch(target);
+      } catch (err) {
+        logger.error('Dispatch failed irrecoverably; the startup sweep will requeue it', {
+          target_id: target.id,
+          repo_alias: target.repo_alias,
+          error: (err as Error).message,
+        });
+      }
     }
     return claimed;
   }
@@ -466,7 +488,10 @@ export class ControlService {
     scope: { ticket: TicketRow; target: TargetRow | null },
   ): Promise<ControlEffect[]> {
     const deferred: ControlEffect[] = [];
-    const workspace = this.deps.cfg.workspace;
+    // From the ticket, not from config. The hub runs a service with no workspace of
+    // its own — every action it takes addresses a ticket by id — so stamping rows
+    // from config would file them under '' and no drainer would ever claim them.
+    const workspace = scope.ticket.workspace;
 
     for (const effect of effects) {
       switch (effect.kind) {

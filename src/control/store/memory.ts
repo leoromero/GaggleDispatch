@@ -60,12 +60,21 @@ function emptyTables(): Tables {
   };
 }
 
-/** Monotonic clock so `status_changed_at` comparisons are strict even when the
- *  wall clock does not tick between two writes. */
-let clockSkew = 0;
+/**
+ * The wall clock, and deliberately nothing cleverer.
+ *
+ * An earlier version added a growing offset so two writes in the same
+ * millisecond would order strictly. That put every timestamp in the *future*, so
+ * code asking "how long ago did this change?" got a negative answer and every age
+ * guard silently inverted — the gate re-open window and the stranded-claim window
+ * both stopped working, and the tests that should have caught it were the ones
+ * being fooled.
+ *
+ * Ordering that genuinely needs to be strict is enforced by the tests that care,
+ * which sleep between writes exactly as they do against Postgres.
+ */
 function now(): string {
-  clockSkew += 1;
-  return new Date(Date.now() + clockSkew).toISOString();
+  return new Date().toISOString();
 }
 
 export class MemoryControlStore implements ControlStore {
@@ -258,7 +267,13 @@ export class MemoryControlStore implements ControlStore {
 
   async replaceTargets(ticketId: string, specs: readonly TargetSpec[]): Promise<TargetRow[]> {
     for (const [id, target] of [...this.t.targets]) {
-      if (target.ticket_id === ticketId) this.t.targets.delete(id);
+      if (target.ticket_id !== ticketId) continue;
+      this.t.targets.delete(id);
+      // Mirrors `ON DELETE SET NULL` on control_events.target_id: the audit trail
+      // outlives the fan-out it describes.
+      for (const event of this.t.events) {
+        if (event.target_id === id) event.target_id = null;
+      }
     }
     const out: TargetRow[] = [];
     for (const s of specs) {
@@ -490,10 +505,10 @@ export class MemoryControlStore implements ControlStore {
     });
   }
 
-  async claimOutbox(limit: number): Promise<OutboxRow[]> {
+  async claimOutbox(workspace: string, limit: number): Promise<OutboxRow[]> {
     if (limit <= 0) return [];
     return this.t.outbox
-      .filter((o) => o.sent_at === null)
+      .filter((o) => o.sent_at === null && o.workspace === workspace)
       .sort((a, b) => a.id - b.id)
       .slice(0, limit)
       .map((o) => ({ ...o }));
@@ -512,9 +527,11 @@ export class MemoryControlStore implements ControlStore {
     }
   }
 
-  async discardExhaustedOutbox(maxAttempts: number): Promise<number> {
+  async discardExhaustedOutbox(workspace: string, maxAttempts: number): Promise<number> {
     const before = this.t.outbox.length;
-    this.t.outbox = this.t.outbox.filter((o) => o.sent_at !== null || o.attempts < maxAttempts);
+    this.t.outbox = this.t.outbox.filter(
+      (o) => o.sent_at !== null || o.workspace !== workspace || o.attempts < maxAttempts,
+    );
     return before - this.t.outbox.length;
   }
 

@@ -577,7 +577,12 @@ describe('Orchestrator — sync and recovery', () => {
     expect(r.cancels).toEqual([]);
   });
 
-  test('a target stranded in dispatching by a crash is re-dispatched after a restart', async () => {
+  test('recovery is wired in, and a claim younger than the grace window is left alone', async () => {
+    // The requeue *policy* — including the age guard that stops a live peer's
+    // claim being stolen — is covered in control-reconciler.test.ts, where the
+    // grace window is configurable. What matters here is that the orchestrator
+    // actually runs recovery against the store rather than reconstructing state
+    // from tracker labels, and that a just-made claim is not disturbed.
     const r = await rig();
     r.tracker.candidates = [issue()];
     await r.tick();
@@ -588,22 +593,24 @@ describe('Orchestrator — sync and recovery', () => {
     await api.handle({ method: 'POST', path: `/tickets/${ticket.id}/start` });
 
     // Simulate the crash window: the claim committed, the spawn never happened.
-    // `dispatching` means exactly that, which is why this case is unambiguous.
     await r.store.claimReadyTargets('acme', 10);
     expect((await targetsOf(r, ticket.id))[0]!.status).toBe('dispatching');
 
-    // Recovery is a query over the store, not a reconstruction from tracker
-    // labels — so replaying it against the same store is the restart.
     const recovered = await (
       r.orchestrator as unknown as {
-        control: { reconciler: { recoverOnStartup(): Promise<{ requeued: number }> } };
+        control: {
+          reconciler: {
+            recoverOnStartup(): Promise<{ requeued: number; adopted: number; reopened: number }>;
+          };
+        };
       }
     ).control.reconciler.recoverOnStartup();
-    expect(recovered.requeued).toBe(1);
 
+    expect(recovered.requeued).toBe(0);
+    expect((await targetsOf(r, ticket.id))[0]!.status).toBe('dispatching');
+    // And critically: no second run is started for it.
     await r.tick();
-    expect(r.spawns).toHaveLength(1);
-    expect((await targetsOf(r, ticket.id))[0]!.status).toBe('running');
+    expect(r.spawns).toHaveLength(0);
   });
 
   test('mirroring off keeps labels off the tracker entirely', async () => {

@@ -520,10 +520,16 @@ export class PostgresControlStore implements ControlStore {
       VALUES (${input.workspace}, ${input.external_id}, ${input.op}, ${input.payload ?? {}})`;
   }
 
-  async claimOutbox(limit: number): Promise<OutboxRow[]> {
+  async claimOutbox(workspace: string, limit: number): Promise<OutboxRow[]> {
     if (limit <= 0) return [];
+    // SKIP LOCKED so two drainers never take the same row. The lock lives for the
+    // caller's transaction; `OutboxDrainer` opens one per batch.
     const rows = (await this.sql`
-      SELECT * FROM tracker_outbox WHERE sent_at IS NULL ORDER BY id LIMIT ${limit}`) as Row[];
+      SELECT * FROM tracker_outbox
+       WHERE sent_at IS NULL AND workspace = ${workspace}
+       ORDER BY id
+       FOR UPDATE SKIP LOCKED
+       LIMIT ${limit}`) as Row[];
     return rows.map(mapOutbox);
   }
 
@@ -536,10 +542,10 @@ export class PostgresControlStore implements ControlStore {
       UPDATE tracker_outbox SET attempts = attempts + 1, last_error = ${error} WHERE id = ${id}`;
   }
 
-  async discardExhaustedOutbox(maxAttempts: number): Promise<number> {
+  async discardExhaustedOutbox(workspace: string, maxAttempts: number): Promise<number> {
     const rows = (await this.sql`
       DELETE FROM tracker_outbox
-       WHERE sent_at IS NULL AND attempts >= ${maxAttempts}
+       WHERE sent_at IS NULL AND workspace = ${workspace} AND attempts >= ${maxAttempts}
       RETURNING id`) as Row[];
     return rows.length;
   }

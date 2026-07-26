@@ -24,6 +24,9 @@ import type { ControlService } from './service.ts';
 import type { ControlStore } from './store/types.ts';
 import { TARGET_LIVE_STATUSES, isSettled, type TargetRow } from './types.ts';
 
+export const DEFAULT_GATE_REOPEN_GRACE_MS = 60_000;
+export const DEFAULT_STRANDED_CLAIM_GRACE_MS = 120_000;
+
 export interface ReconcilerConfig {
   workspace: string;
   /**
@@ -32,6 +35,25 @@ export interface ReconcilerConfig {
    * control: a gate that waits is a gate doing its job.
    */
   gate_timeout_ms: number;
+  /**
+   * How long an approved gate may keep reporting `paused` before the reconciler
+   * believes a *new* gate has opened.
+   *
+   * The executor takes a moment to resume, during which it still reports the old
+   * gate. Re-opening inside that window posts a second comment and, on the
+   * following tick, approves a second time. Defaults to
+   * {@link DEFAULT_GATE_REOPEN_GRACE_MS}.
+   */
+  gate_reopen_grace_ms?: number;
+  /**
+   * How recent a `dispatching` claim, or an `analyzing` ticket, has to be for
+   * startup recovery to leave it alone.
+   *
+   * Anything newer might belong to a peer process that is alive right now;
+   * anything older cannot. Defaults to
+   * {@link DEFAULT_STRANDED_CLAIM_GRACE_MS}.
+   */
+  stranded_claim_grace_ms?: number;
   outbox: OutboxDrainerConfig;
 }
 
@@ -163,57 +185,66 @@ export class Reconciler {
 
     for (const target of live) {
       if (!target.run_id) continue;
-      let observed;
+      // Per-target isolation. One target whose transition is refused must not
+      // stop every other target in the workspace from being reconciled — that
+      // turns a single stuck row into a workspace-wide outage that only shows up
+      // as one log line per tick.
       try {
-        observed = await this.deps.runs.observeRun(target.run_id);
+        if (await this.reconcileOne(target)) changed++;
       } catch (err) {
-        logger.warn('Could not observe run', {
-          run_id: target.run_id,
+        logger.error('Could not reconcile a run', {
+          target_id: target.id,
           repo_alias: target.repo_alias,
+          run_id: target.run_id,
+          status: target.status,
           error: (err as Error).message,
         });
-        continue;
-      }
-
-      switch (observed.status) {
-        case 'completed':
-          if (target.status !== 'succeeded') {
-            await this.deps.service.runSucceeded(target.id);
-            changed++;
-          }
-          break;
-        case 'failed':
-          await this.deps.service.runFailed(target.id, observed.error ?? 'run failed');
-          changed++;
-          break;
-        case 'cancelled':
-          await this.deps.service.confirmCancel(target.id);
-          changed++;
-          break;
-        case 'paused':
-          if (target.status === 'running' && observed.approval) {
-            await this.deps.service.gateOpened(
-              target.id,
-              observed.approval.id,
-              observed.approval.message,
-            );
-            changed++;
-          }
-          break;
-        case 'running':
-          // A gate the executor has resumed without telling us: the control plane
-          // thinks a gate is open but the run is moving again. Trust the executor.
-          if (target.status === 'gate_waiting') {
-            await this.deps.service.approveGate(target.id, null);
-            changed++;
-          }
-          break;
-        case 'pending':
-        case 'unknown':
-          break;
       }
     }
     return changed;
+  }
+
+  /** Returns true when the target moved. */
+  private async reconcileOne(target: TargetRow): Promise<boolean> {
+    const observed = await this.deps.runs.observeRun(target.run_id!);
+
+    switch (observed.status) {
+      case 'completed':
+        await this.deps.service.runSucceeded(target.id);
+        return true;
+      case 'failed':
+        await this.deps.service.runFailed(target.id, observed.error ?? 'run failed');
+        return true;
+      case 'cancelled':
+        await this.deps.service.confirmCancel(target.id);
+        return true;
+      case 'paused': {
+        if (target.status !== 'running' || !observed.approval) return false;
+        // An approved gate keeps reporting `paused` for a while: the executor is
+        // resuming, but has not got there yet. Re-opening the gate on that window
+        // would post a second comment and, on the following tick, approve a
+        // second time. Wait out a short settle window instead.
+        const grace = this.deps.cfg.gate_reopen_grace_ms ?? DEFAULT_GATE_REOPEN_GRACE_MS;
+        if (Date.now() - Date.parse(target.status_changed_at) < grace) {
+          return false;
+        }
+        await this.deps.service.gateOpened(
+          target.id,
+          observed.approval.id,
+          observed.approval.message,
+        );
+        return true;
+      }
+      case 'running':
+      case 'pending':
+      case 'unknown':
+        // Deliberately nothing for a `gate_waiting` target whose run reports
+        // `running`. Approving on the control plane's behalf here is what caused
+        // the double-approve: our own approval leaves the target `running`
+        // already, so the only way to reach this is a genuine desync, and a
+        // desynced gate is safer left for a human than resolved by a guess.
+        return false;
+    }
   }
 
   /**
@@ -417,10 +448,27 @@ export class Reconciler {
    * `gate_waiting` keep their run id and are handled by `reconcileRuns`, which
    * asks the executor what actually happened rather than guessing.
    */
-  async recoverOnStartup(): Promise<{ requeued: number; adopted: number }> {
+  async recoverOnStartup(): Promise<{ requeued: number; adopted: number; reopened: number }> {
+    const cutoff =
+      Date.now() - (this.deps.cfg.stranded_claim_grace_ms ?? DEFAULT_STRANDED_CLAIM_GRACE_MS);
+
     const stranded = await this.deps.store.listTargetsByStatus(['dispatching'], this.deps.cfg.workspace);
     let requeued = 0;
     for (const target of stranded) {
+      // Age guard. `dispatching` means "claimed, not yet spawned", which for our
+      // own crash is unambiguous — but a concurrently-live peer daemon's claim
+      // looks identical and is only milliseconds old. Requeueing that one spawns a
+      // second run on the same worktree, and the peer's run id is never recorded
+      // so it can never be cancelled. A claim older than the grace window cannot
+      // belong to a live spawn.
+      if (Date.parse(target.status_changed_at) > cutoff) {
+        logger.info('Leaving a recent dispatch claim alone — it may belong to a live peer', {
+          target_id: target.id,
+          repo_alias: target.repo_alias,
+          claimed_at: target.status_changed_at,
+        });
+        continue;
+      }
       await this.deps.store.updateTarget(target.id, {
         status: 'ready',
         attempt: target.attempt + 1,
@@ -437,17 +485,40 @@ export class Reconciler {
       requeued++;
     }
 
+    // A ticket claimed for analysis by a process that then died is stuck: only
+    // `analysis_requested` is claimable, and the dashboard offers no action from
+    // `analyzing`. Return it to the queue so the next tick picks it up.
+    const analyzing = await this.deps.store.listTickets({
+      workspace: this.deps.cfg.workspace,
+      status: ['analyzing'],
+    });
+    let reopened = 0;
+    for (const ticket of analyzing) {
+      if (Date.parse(ticket.status_changed_at) > cutoff) continue;
+      await this.deps.store.updateTicket(ticket.id, { status: 'analysis_requested' });
+      await this.deps.store.appendEvent({
+        ticket_id: ticket.id,
+        event_kind: 'requeued_after_restart',
+        from_status: 'analyzing',
+        to_status: 'analysis_requested',
+        actor: 'daemon',
+        detail: { reason: 'the process analysing this ticket did not finish' },
+      });
+      reopened++;
+    }
+
     const adopted = (
       await this.deps.store.listTargetsByStatus(['running', 'gate_waiting'], this.deps.cfg.workspace)
     ).filter((t) => t.run_id !== null);
 
-    if (requeued > 0 || adopted.length > 0) {
+    if (requeued > 0 || reopened > 0 || adopted.length > 0) {
       logger.info('Control-plane recovery complete', {
         requeued,
+        reopened,
         adopted: adopted.length,
       });
     }
-    return { requeued, adopted: adopted.length };
+    return { requeued, adopted: adopted.length, reopened };
   }
 
   /** Live targets this process is responsible for. Used for slot accounting. */

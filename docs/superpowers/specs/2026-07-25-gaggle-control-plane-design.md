@@ -1113,9 +1113,101 @@ this work. `dashboard-assets.test.ts` parses `app.js`, checks that every `$('#id
 resolves against `index.html`, checks the new CSS classes exist, and asserts that
 nothing still reads the state fields that moved to Postgres.
 
+### 19.16 Corrections from code review
+
+An adversarial review of the finished branch found fifteen findings, most
+demonstrated with scripts against the real code. The ones that changed behaviour:
+
+**A run can end while its gate is open.** `gate_waiting` had no `run_succeeded` /
+`run_failed` exit, so a gate whose Archon run then crashed made the reconciler
+throw — and because the loop had no per-target isolation, that one row stopped
+every other target in the workspace from being reconciled, forever, showing up
+only as one log line per tick. Both halves fixed: the transitions exist, and each
+target is reconciled inside its own try.
+
+**An unverifiable clean exit no longer guesses.** Archon exits 0 when a workflow
+pauses, so a clean exit is checked against the run's real status — but when that
+check *failed*, the old code trusted the exit code and marked the target
+`succeeded`, which is terminal. That closed the tracker issue, left a still-paused
+run holding its worktree, and left the operator with no button. It now decides
+nothing and leaves the question to the reconciler, which retries it every tick.
+Same for a run reporting `running` or `pending`.
+
+**The outbox is workspace-scoped and locked.** `claimOutbox` took neither, so two
+daemons drained each other's rows — posting every comment twice, through the wrong
+tracker client, with the wrong state names. It now filters by workspace and claims
+with `FOR UPDATE SKIP LOCKED` inside the drainer's transaction. Relatedly, outbox
+rows are stamped from the *ticket's* workspace, not from config, which is what
+makes the hub's writes claimable at all.
+
+**Startup recovery no longer steals a live peer's claim.** `dispatching` means
+"claimed, not yet spawned", which is unambiguous for our own crash and identical
+to a peer that is mid-spawn right now. Requeueing the latter started a second run
+on the same worktree whose id was never recorded, so it could never be cancelled.
+A claim younger than `stranded_claim_grace_ms` is left alone.
+
+**A ticket stranded in `analyzing` is recoverable.** Only `analysis_requested` is
+claimable and the dashboard offers no action from `analyzing`, so a crash mid
+analysis needed manual SQL. Recovery now returns it to the queue.
+
+**Re-analysis no longer destroys the audit trail.**
+`control_events.target_id` was `ON DELETE CASCADE`, and `replaceTargets` deletes
+rows — so pressing Re-analyze erased the record of everything the previous targets
+did. Now `ON DELETE SET NULL`: the events survive with their target reference
+cleared.
+
+**An approved gate is not re-opened while the executor is still resuming.** Archon
+keeps reporting the old gate for a moment after being resumed, which made the
+reconciler post a second comment and then approve a second time. There is now a
+settle window, and the reconciler no longer approves on the operator's behalf when
+a gated run reports `running` — a desynced gate is safer visible than guessed at.
+
+**Two guards that could not start work now refuse it.** Re-dispatching a target of
+a *cancelled* ticket used to spawn a run the operator had explicitly cancelled,
+leaving a ticket that could never settle. And starting a ticket whose whole fan-out
+is excluded parked it in `running` with nothing to run and no way out; `Start` now
+refuses, and excluding the last target after the fact settles the ticket instead.
+
+**Re-dispatch goes through `blocked`, not straight to `ready`**, so it cannot
+bypass tracker blockers or `depends_on`, and it resets the gate rework budget.
+
+**Migrations are serialized by a transaction-scoped advisory lock.** `gaggle nest
+start` migrates from every daemon and then the hub, so a concurrent first-boot
+migration is the normal case — and the loser did not fail politely, it died inside
+`CREATE TABLE`. Worth recording how the *fix* went wrong first: a session-level
+`pg_advisory_lock` looks correct but, over a connection pool, the matching unlock
+can run on a different connection where it silently returns false. That left the
+lock held by an idle backend and every later migration hanging on it — observed
+directly in `pg_locks`. `pg_advisory_xact_lock` inside the migration transaction
+has no such failure mode.
+
+**Two tests were not testing what they claimed.** The dashboard parse guard used
+`new vm.Script`, which does not eagerly parse in Bun — it accepted
+`function f( {` — so it was green while the real file was unloadable, the exact
+failure it existed to catch. It uses `Bun.Transpiler` now, verified by
+reintroducing the corruption. And the transition matrix only asserted "returns a
+valid status or throws the right type", which a table where every pair throws would
+also satisfy; it could not detect a *missing* transition, which is precisely the
+first finding above. The accepted set is now written out explicitly, and it
+immediately caught two undocumented pairs.
+
+Also corrected: the `create-blocker` gate outcome was implemented end to end with
+no button to trigger it; `FakeExecutor` handed every target the same run id, which
+silently collided in any test keying observations by run id; and the in-memory
+store's "monotonic" clock returned timestamps in the *future*, which inverted every
+age comparison written against it.
+
+**Not fixed, deliberately.** The concurrency ceiling still is not atomic across two
+daemons sharing one workspace: the count and the claim are separate statements, so
+both can see the same free slots. Row-level exclusivity holds, so the failure mode
+is "more concurrent runs than configured", not corruption — and one daemon per
+workspace is the supported configuration, enforced by the pid sidecar. Making it
+atomic means computing the ceiling inside the claim statement. The comment on
+`SlotPort` now says this rather than claiming otherwise.
+
 ### What is built
 
-All phases A–H, plus the orchestrator flip. **583 tests pass, `tsc --noEmit` is
+All phases A–H, plus the orchestrator flip. **602 tests pass, `tsc --noEmit` is
 clean** (including three pre-existing errors in `src/hub/` fixed along the way).
 
 | Spec phase | State |

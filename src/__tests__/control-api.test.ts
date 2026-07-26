@@ -47,7 +47,7 @@ function daemon(h: Harness) {
     slots,
     runs,
     trackerWrites: new FakeTrackerWrites(),
-    cfg: { workspace: WS, gate_timeout_ms: 0, outbox: { batch_size: 50, max_attempts: 5 } },
+    cfg: { workspace: WS, gate_timeout_ms: 0, outbox: { workspace: WS, batch_size: 50, max_attempts: 5 } },
   });
 }
 

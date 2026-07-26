@@ -9,6 +9,7 @@
 
 import { describe, expect, test } from 'bun:test';
 import {
+  ControlConflictError,
   DEFAULT_MIRROR_LABELS,
   InvalidControlTransitionError,
   TARGET_EVENT_KINDS,
@@ -199,10 +200,25 @@ describe('ticketTransition', () => {
   });
 
   test('analyzed + start_requested → running, stamps started_at, readies the targets', () => {
-    const t = ticketTransition('analyzed', { kind: 'start_requested' }, ticketCtx());
+    const t = ticketTransition(
+      'analyzed',
+      { kind: 'start_requested' },
+      ticketCtx({ targets: [target()] }),
+    );
     expect(t.to).toBe('running');
     expect(t.patch.started_at).toBeTruthy();
     expect(kinds(t)).toContain('evaluate_target_readiness');
+  });
+
+  test('Start is refused when every target is excluded — there would be nothing to run', () => {
+    // Otherwise the ticket parks in `running` forever: `targets_settled` cannot
+    // complete a ticket with no participating targets, and `running` accepts no
+    // operator action except Cancel.
+    expect(() =>
+      ticketTransition('analyzed', { kind: 'start_requested' }, ticketCtx({
+        targets: [target({ status: 'excluded' })],
+      })),
+    ).toThrow(/every target is excluded/i);
   });
 
   test('start_requested is rejected from imported — Analyze comes first', () => {
@@ -244,10 +260,20 @@ describe('ticketTransition', () => {
     expect(t.to).toBe('done');
   });
 
-  test('a ticket with only excluded targets does not complete', () => {
+  test('excluding the last participating target completes the ticket', () => {
+    // Start refuses an all-excluded fan-out, but a target can be excluded *after*
+    // the ticket started. Staying `running` with nothing to run would be a dead
+    // end, so an empty-but-non-zero fan-out settles.
     const t = ticketTransition('running', { kind: 'targets_settled' }, ticketCtx({
       targets: [target({ status: 'excluded' })],
     }));
+    expect(t.to).toBe('done');
+  });
+
+  test('a ticket with no targets at all is left alone', () => {
+    // Distinct from "everything excluded": there is no fan-out yet, so there is
+    // nothing to conclude.
+    const t = ticketTransition('running', { kind: 'targets_settled' }, ticketCtx({ targets: [] }));
     expect(t.to).toBe('running');
   });
 
@@ -540,11 +566,41 @@ describe('targetTransition', () => {
         { kind: 'redispatch_requested' },
         targetCtx({ target: target({ status: from, attempt: 2 }) }),
       );
-      expect(t.to).toBe('ready');
+      // `blocked`, not `ready`: going straight to `ready` would bypass blockers
+      // and `depends_on`. The readiness effect promotes it in the same operation.
+      expect(t.to).toBe('blocked');
+      expect(kinds(t)).toContain('evaluate_target_readiness');
       expect(t.patch.attempt).toBe(3);
       expect(t.patch.failure_reason).toBeNull();
       expect(t.patch.run_id).toBeNull();
+      // A fresh attempt gets a fresh rework budget.
+      expect(t.patch.gate_rework_attempts).toBe(0);
     }
+  });
+
+  test('a re-dispatch is refused once the ticket is terminal', () => {
+    // Otherwise an operator click starts a run on work they explicitly cancelled,
+    // and the ticket can never settle again because `cancelled` accepts nothing.
+    for (const ticketStatus of ['cancelled', 'done', 'archived'] as const) {
+      expect(() =>
+        targetTransition('failed', { kind: 'redispatch_requested' }, targetCtx({
+          ticket: ticket({ status: ticketStatus }),
+          target: target({ status: 'failed' }),
+        })),
+      ).toThrow(/not running/i);
+    }
+  });
+
+  test('a run that ends while its gate is open settles the target', () => {
+    // Without these the reconciler throws on every tick for that target.
+    const gated = targetCtx({ target: target({ status: 'gate_waiting' }) });
+    expect(targetTransition('gate_waiting', { kind: 'run_succeeded' }, gated).to).toBe('succeeded');
+
+    const failed = targetTransition('gate_waiting', { kind: 'run_failed', reason: 'crashed' }, gated);
+    expect(failed.to).toBe('failed');
+    expect(failed.patch.failure_reason).toBe('crashed');
+    // The gate is cleared either way, so it does not linger on the board.
+    expect(failed.patch.gate_message).toBeNull();
   });
 
   test('exclude and include round-trip a pre-dispatch target', () => {
@@ -587,52 +643,122 @@ describe('targetTransition', () => {
 
 // ─── matrices ───────────────────────────────────────────────────────────────
 
+// ─── the accepted matrix, stated explicitly ─────────────────────────────────
+//
+// The earlier version of these tests asserted only "it either returns a valid
+// status or throws the right error type" — which a table where *every* pair
+// throws would also satisfy. It could not detect a transition that should exist
+// and does not, which is exactly the defect it was written to catch (a run ending
+// while its gate was open had no exit from `gate_waiting`, and the reconciler
+// threw on every tick as a result).
+//
+// So the accepted set is written out. Adding a status or an event now fails here
+// until someone records a decision about every pair.
+
+const TICKET_ACCEPTS: Record<TicketStatus, readonly (typeof TICKET_EVENT_KINDS)[number][]> = {
+  imported: ['analyze_requested', 'archive_requested', 'external_terminal'],
+  // `external_terminal` is accepted as a no-op while analysis is in flight rather
+  // than archiving: archiving would make the analyzer's own
+  // `analysis_succeeded` throw when it lands moments later. The ticket reaches
+  // `analyzed` and the next sync pass archives it then.
+  analysis_requested: ['analysis_claimed', 'external_terminal'],
+  analyzing: ['analysis_succeeded', 'analysis_failed', 'cancel_requested', 'external_terminal'],
+  analyzed: ['start_requested', 'analyze_requested', 'archive_requested', 'cancel_requested', 'external_terminal'],
+  analysis_failed: ['analyze_requested', 'archive_requested', 'external_terminal'],
+  running: ['targets_settled', 'cancel_requested', 'external_terminal'],
+  // Terminal, except that a sync pass may observe the tracker going terminal and
+  // is answered with a no-op rather than a throw.
+  done: ['external_terminal'],
+  cancelled: ['external_terminal'],
+  archived: ['restore_requested', 'external_terminal'],
+};
+
+const TARGET_ACCEPTS: Record<TargetStatus, readonly (typeof TARGET_EVENT_KINDS)[number][]> = {
+  excluded: ['include_requested', 'exclude_requested', 'cancel_requested'],
+  blocked: ['blockers_satisfied', 'exclude_requested', 'cancel_requested'],
+  ready: ['blockers_unsatisfied', 'dispatch_claimed', 'exclude_requested', 'cancel_requested'],
+  dispatching: ['run_started', 'run_failed', 'cancel_requested', 'cancel_confirmed'],
+  running: ['run_succeeded', 'run_failed', 'gate_opened', 'cancel_requested', 'cancel_confirmed'],
+  gate_waiting: [
+    'gate_approved',
+    'gate_rejected',
+    'gate_blocker_created',
+    'gate_timed_out',
+    // A run can end while its gate is still open — see the note in transitions.ts.
+    'run_succeeded',
+    'run_failed',
+    'cancel_requested',
+    'cancel_confirmed',
+  ],
+  failed: ['redispatch_requested'],
+  cancelled: ['redispatch_requested'],
+  succeeded: [],
+};
+
 describe('transition matrices', () => {
-  test('every ticket status × event either transitions or throws InvalidControlTransitionError', () => {
+  test('the ticket machine accepts exactly the documented pairs', () => {
+    const unexpected: string[] = [];
+    const missing: string[] = [];
+
     for (const from of TICKET_STATUSES) {
       for (const kind of TICKET_EVENT_KINDS) {
+        const shouldAccept = TICKET_ACCEPTS[from].includes(kind);
+        let accepted = false;
         try {
-          const t = ticketTransition(from, sampleTicketEvent(kind), ticketCtx());
+          const t = ticketTransition(from, sampleTicketEvent(kind), ticketCtx({
+            targets: [target()],
+          }));
           expect(TICKET_STATUSES).toContain(t.to);
+          expect(t.from).toBe(from);
+          accepted = true;
         } catch (err) {
-          expect(err).toBeInstanceOf(Error);
-          if (!(err instanceof InvalidControlTransitionError)) {
-            // The only other permitted rejection is the live-target guard.
-            expect((err as Error).message).toMatch(/live target/i);
-          }
+          // A ControlConflictError is a *guarded* accept: the pair is legal, the
+          // world is not in a state that allows it. Treat it as accepted.
+          accepted = err instanceof ControlConflictError;
+          if (!accepted) expect(err).toBeInstanceOf(InvalidControlTransitionError);
         }
+        if (accepted && !shouldAccept) unexpected.push(`${from} × ${kind}`);
+        if (!accepted && shouldAccept) missing.push(`${from} × ${kind}`);
       }
     }
+
+    expect({ unexpected, missing }).toEqual({ unexpected: [], missing: [] });
   });
 
-  test('every target status × event either transitions or throws InvalidControlTransitionError', () => {
+  test('the target machine accepts exactly the documented pairs', () => {
+    const unexpected: string[] = [];
+    const missing: string[] = [];
+
     for (const from of TARGET_STATUSES) {
       for (const kind of TARGET_EVENT_KINDS) {
+        const shouldAccept = TARGET_ACCEPTS[from].includes(kind);
+        let accepted = false;
         try {
           const t = targetTransition(from, sampleTargetEvent(kind), targetCtx({
             target: target({ status: from }),
           }));
           expect(TARGET_STATUSES).toContain(t.to);
+          expect(t.from).toBe(from);
+          accepted = true;
         } catch (err) {
-          expect(err).toBeInstanceOf(InvalidControlTransitionError);
+          accepted = err instanceof ControlConflictError;
+          if (!accepted) expect(err).toBeInstanceOf(InvalidControlTransitionError);
         }
+        if (accepted && !shouldAccept) unexpected.push(`${from} × ${kind}`);
+        if (!accepted && shouldAccept) missing.push(`${from} × ${kind}`);
       }
     }
+
+    expect({ unexpected, missing }).toEqual({ unexpected: [], missing: [] });
   });
 
-  test('a transition never reports a from-status other than the one asked for', () => {
-    for (const from of TARGET_STATUSES) {
-      for (const kind of TARGET_EVENT_KINDS) {
-        try {
-          const t = targetTransition(from, sampleTargetEvent(kind), targetCtx({
-            target: target({ status: from }),
-          }));
-          expect(t.from).toBe(from);
-        } catch {
-          /* illegal pairs covered above */
-        }
-      }
-    }
+  test('every status is reachable out of, except the genuinely terminal ones', () => {
+    // A status with no accepted event is a trap: work that lands there needs
+    // manual database surgery. `succeeded` is the only target status allowed to be
+    // one, and no ticket status is (terminal tickets still accept the sync no-op).
+    const targetTraps = TARGET_STATUSES.filter((s) => TARGET_ACCEPTS[s].length === 0);
+    expect(targetTraps).toEqual(['succeeded']);
+    expect(TICKET_STATUSES.filter((s) => TICKET_ACCEPTS[s].length === 0)).toEqual([]);
   });
 });
 

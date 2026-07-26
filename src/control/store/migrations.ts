@@ -11,9 +11,10 @@
  *     VALUE` cannot run inside a transaction block on older servers, which makes
  *     adding a status later a migration hazard for no real benefit. This also
  *     matches the engine's tables.
- *   - `ticket_targets.run_id` is a bare UUID with no foreign key. The FK to
- *     `workflow_runs(id)` belongs to a 300-range migration that runs once both
- *     halves exist, which is what makes merge order between the two branches
+ *   - `ticket_targets.run_id` is TEXT with no foreign key — see the comment on the
+ *     column for why TEXT. If a constraint against `workflow_runs(id)` is ever
+ *     wanted it belongs in a 300-range migration that runs once both halves of the
+ *     schema exist, which is what keeps merge order between the two branches
  *     irrelevant.
  */
 
@@ -112,7 +113,11 @@ CREATE INDEX idx_targets_active ON ticket_targets (status)
 CREATE TABLE control_events (
   id          BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
   ticket_id   UUID NOT NULL REFERENCES tickets(id) ON DELETE CASCADE,
-  target_id   UUID REFERENCES ticket_targets(id) ON DELETE CASCADE,
+  -- SET NULL, not CASCADE. Re-analysing a ticket replaces its whole fan-out, and
+  -- cascading here would delete the audit trail of everything those targets did —
+  -- the record this design calls authoritative. The event keeps its ticket and its
+  -- text; only the now-dangling target reference is dropped.
+  target_id   UUID REFERENCES ticket_targets(id) ON DELETE SET NULL,
   event_kind  TEXT NOT NULL,
   from_status TEXT,
   to_status   TEXT NOT NULL,
