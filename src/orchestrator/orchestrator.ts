@@ -44,7 +44,7 @@ import { blockersSatisfied, repoTargetReady } from './readiness.ts';
 import { defaultGateResumeState, completedState } from '../config/service-config.ts';
 import type { RegistryLoaderHandle } from '../registry/loader.ts';
 import type { SyncerHandle } from '../registry/repo-syncer.ts';
-import { writeRunEntry, deleteRunEntry, allRunEntries, allRetryEntries, deleteRetryEntry } from '../registry/run-registry.ts';
+import { allRetryEntries, allRunLinks, deleteRetryEntry } from '../registry/run-registry.ts';
 import { classifyGateReply, type GateClassification } from './gate-classifier.ts';
 import {
   classifyTargetState,
@@ -72,8 +72,8 @@ interface RecoveryContext {
   retryingIssues: Issue[];
   executorRuns: RunRecord[];
   runsById: Map<string, RunRecord>;
-  persistedRunIds: ReturnType<typeof allRunEntries>;
-  persistedRetries: ReturnType<typeof allRetryEntries>;
+  persistedRunIds: Awaited<ReturnType<typeof allRunLinks>>;
+  persistedRetries: Awaited<ReturnType<typeof allRetryEntries>>;
 }
 
 export interface OrchestratorDeps {
@@ -133,6 +133,7 @@ export class Orchestrator {
       cfg: this.cfg,
       tracker: this.tracker,
       executorClient: this.executorClient,
+      store: this.store,
       workspace: this.workspace,
       state: this.state,
       registryBaseFolder: this.cfg.registry.base_folder,
@@ -537,6 +538,8 @@ export class Orchestrator {
       executor: this.executor,
       workspace: this.workspace,
       issue: parentIssue,
+      worker_key: key,
+      sub_issue_id: subIssueId,
       repo_target: target,
       analysis: analysisOverride
         ?? this.state.analysis_cache.get(parentIssue.id)?.analysis
@@ -567,17 +570,10 @@ export class Orchestrator {
             s.run_id = db_run_id;
             this.attachPoller(key, db_run_id, parentIssue, target, subIssueId, attempt);
           }
-          writeRunEntry(this.cfg.registry.base_folder, key, {
-            run_id: db_run_id,
-            parent_issue_id: parentIssue.id,
-            sub_issue_id: subIssueId,
-            repo_alias: target.repo_alias,
-          });
           log.info('Run created', { run_id: db_run_id });
         },
         onGatePaused: (run_id, gate_message) => { void this.handleGatePaused(parentIssue, target, subIssueId, run_id, gate_message, attempt); },
         onExit: (event) => {
-          deleteRunEntry(this.cfg.registry.base_folder, key);
           void this.handleWorkerExit(parentIssue, target, event, attempt);
         },
       });
@@ -637,12 +633,6 @@ export class Orchestrator {
           onRunId: (resumedRunId) => {
             const s = this.state.running.get(key);
             if (s) s.run_id = resumedRunId;
-            writeRunEntry(this.cfg.registry.base_folder, key, {
-              run_id: resumedRunId,
-              parent_issue_id: parentIssue.id,
-              sub_issue_id: subIssueId,
-              repo_alias: target.repo_alias,
-            });
           },
           onGatePaused: (gateRunId, gateMessage) => {
             void this.handleGatePaused(
@@ -650,7 +640,6 @@ export class Orchestrator {
             );
           },
           onExit: (event) => {
-            deleteRunEntry(this.cfg.registry.base_folder, key);
             void this.handleWorkerExit(parentIssue, target, event, attempt);
           },
         }),
@@ -2081,8 +2070,8 @@ export class Orchestrator {
       this.tracker.fetchIssuesByLabel(this.cfg.tracker.gaggle_labels.retrying),
       this.executorClient.listRuns(),
     ]);
-    const persistedRunIds = allRunEntries(this.cfg.registry.base_folder);
-    const persistedRetries = allRetryEntries(this.cfg.registry.base_folder);
+    const persistedRunIds = await allRunLinks(this.store);
+    const persistedRetries = await allRetryEntries(this.store);
     const runsById = new Map<string, RunRecord>(executorRuns.map((r) => [r.id, r]));
     logger.info('Run status snapshot at startup', {
       total_runs: executorRuns.length,
@@ -2357,7 +2346,7 @@ export class Orchestrator {
     for (const [retryKey, entry] of Object.entries(ctx.persistedRetries)) {
       const targetIssueId = entry.sub_issue_id ?? entry.parent_issue_id;
       if (!retryIssueIds.has(targetIssueId)) {
-        deleteRetryEntry(this.cfg.registry.base_folder, retryKey);
+        await deleteRetryEntry(this.store, retryKey);
         logger.info('Pruned orphaned retry entry', { key: retryKey });
       }
     }

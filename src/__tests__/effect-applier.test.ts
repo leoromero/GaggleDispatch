@@ -7,6 +7,7 @@ import { afterEach, describe, expect, test } from 'bun:test';
 import { mkdtempSync, rmSync, existsSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { MemoryStore } from '../executor/store/memory.ts';
 import { EffectApplier, type EffectApplierDeps } from '../orchestrator/effect-applier.ts';
 import type { Effect, TargetIdentity } from '../orchestrator/state-machine.ts';
 import { createInitialState } from '../orchestrator/state.ts';
@@ -56,10 +57,12 @@ function makeApplier(overrides: { archonShouldThrow?: boolean } = {}) {
     cleanAuxiliaryWorkspace: (id: string) => { calls.push({ op: 'cleanAuxiliaryWorkspace', args: [id] }); },
   } as unknown as WorkspaceManager;
 
+  const store = new MemoryStore();
   const deps: EffectApplierDeps = {
     cfg,
     tracker,
     executorClient: archon,
+    store,
     workspace,
     state,
     registryBaseFolder: baseFolder,
@@ -72,7 +75,7 @@ function makeApplier(overrides: { archonShouldThrow?: boolean } = {}) {
   };
 
   const applier = new EffectApplier(deps);
-  return { applier, calls, state, baseFolder };
+  return { applier, calls, state, baseFolder, store };
 }
 
 function hasCall(calls: Call[], op: string, args?: unknown[]): boolean {
@@ -229,7 +232,11 @@ describe('EffectApplier: Archon control plane', () => {
 // ─── Persistence ───────────────────────────────────────────────────────────
 
 describe('EffectApplier: persistence', () => {
-  test('persist_run writes a run entry to gaggle-runs.json', async () => {
+  test('persist_run is a no-op — the run row already carries the link', async () => {
+    // The worker key is stamped on the run at creation, so there is no
+    // separate record to write and nothing that can disagree with the run's
+    // own status. The effect stays in the vocabulary because the transition
+    // still expresses the intent.
     const { applier, baseFolder } = makeApplier();
     await applier.apply({
       kind: 'persist_run',
@@ -237,49 +244,61 @@ describe('EffectApplier: persistence', () => {
       run_id: 'cafebabecafebabecafebabecafebabe',
       meta: { parent_issue_id: 'p1', sub_issue_id: 'sub-be', repo_alias: 'trialmatch-be' },
     });
-    const file = join(baseFolder, 'gaggle-runs.json');
-    expect(existsSync(file)).toBe(true);
-    const data = JSON.parse(readFileSync(file, 'utf8'));
-    expect(data.entries['p1__trialmatch-be'].run_id).toBe('cafebabecafebabecafebabecafebabe');
+    expect(existsSync(join(baseFolder, 'gaggle-runs.json'))).toBe(false);
   });
 
-  test('delete_run removes the entry', async () => {
-    const { applier, baseFolder } = makeApplier();
-    await applier.apply({
-      kind: 'persist_run', key: 'p1__trialmatch-be', run_id: 'r1',
-      meta: { parent_issue_id: 'p1', sub_issue_id: 'sub-be', repo_alias: 'trialmatch-be' },
-    });
+  test('delete_run is a no-op and does not throw', async () => {
+    const { applier } = makeApplier();
     await applier.apply({ kind: 'delete_run', key: 'p1__trialmatch-be' });
-    const data = JSON.parse(readFileSync(join(baseFolder, 'gaggle-runs.json'), 'utf8'));
-    expect(data.entries['p1__trialmatch-be']).toBeUndefined();
   });
 
-  test('persist_retry writes a retry entry to gaggle-runs.json', async () => {
-    const { applier, baseFolder, state } = makeApplier();
-    // Set up sibling_subissues so the applier can resolve sub_issue_id.
+  test('persist_retry writes to the store, resolving sub_issue_id from siblings', async () => {
+    const { applier, state, store } = makeApplier();
     state.sibling_subissues.set('p1', new Map([['trialmatch-be', 'sub-be']]));
     await applier.apply({
       kind: 'persist_retry',
       key: 'p1__trialmatch-be',
       meta: { attempt: 2, due_at_ms: 1_700_000_000_000, reason: 'crash' },
     });
-    const file = join(baseFolder, 'gaggle-runs.json');
-    expect(existsSync(file)).toBe(true);
-    const data = JSON.parse(readFileSync(file, 'utf8')) as { retries: Record<string, { attempt: number; sub_issue_id: string | null }> };
-    expect(data.retries['p1__trialmatch-be']?.attempt).toBe(2);
-    expect(data.retries['p1__trialmatch-be']?.sub_issue_id).toBe('sub-be');
+    const row = await store.getRetry('p1__trialmatch-be');
+    expect(row?.attempt).toBe(2);
+    expect(row?.sub_issue_id).toBe('sub-be');
+    expect(row?.reason).toBe('crash');
+    expect(Date.parse(row!.due_at)).toBe(1_700_000_000_000);
   });
 
-  test('delete_retry removes the entry', async () => {
-    const { applier, baseFolder } = makeApplier();
+  test('persist_retry overwrites rather than accumulating', async () => {
+    const { applier, store } = makeApplier();
+    for (const attempt of [1, 2, 3]) {
+      await applier.apply({
+        kind: 'persist_retry',
+        key: 'p1__trialmatch-be',
+        meta: { attempt, due_at_ms: 100, reason: null },
+      });
+    }
+    expect(await store.listRetries()).toHaveLength(1);
+    expect((await store.getRetry('p1__trialmatch-be'))?.attempt).toBe(3);
+  });
+
+  test('delete_retry removes the row', async () => {
+    const { applier, store } = makeApplier();
     await applier.apply({
       kind: 'persist_retry',
       key: 'p1__trialmatch-be',
       meta: { attempt: 2, due_at_ms: 100, reason: 'x' },
     });
     await applier.apply({ kind: 'delete_retry', key: 'p1__trialmatch-be' });
-    const data = JSON.parse(readFileSync(join(baseFolder, 'gaggle-runs.json'), 'utf8')) as { retries: Record<string, unknown> };
-    expect(data.retries['p1__trialmatch-be']).toBeUndefined();
+    expect(await store.getRetry('p1__trialmatch-be')).toBeNull();
+  });
+
+  test('persist_retry ignores a malformed worker key', async () => {
+    const { applier, store } = makeApplier();
+    await applier.apply({
+      kind: 'persist_retry',
+      key: 'no-separator-here',
+      meta: { attempt: 1, due_at_ms: 100, reason: null },
+    });
+    expect(await store.listRetries()).toEqual([]);
   });
 });
 

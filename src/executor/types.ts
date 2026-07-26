@@ -146,6 +146,14 @@ export interface StartRunRequest {
   message: string;
   /** Slug of the registered repo, for run attribution. */
   repo_slug?: string;
+  /**
+   * Caller's identity for this run — the orchestrator passes its worker key.
+   * Makes "which run belongs to this issue and repo" a query, which is what
+   * replaced the run-registry sidecar.
+   */
+  external_key?: string;
+  /** Merged into the run's metadata at creation. */
+  metadata?: RunMetadata;
   /** Extra env injected into every bash/script/AI subprocess. */
   env?: Record<string, string>;
   /** Branch new worktrees are cut from. Defaults to the repo's current HEAD branch. */

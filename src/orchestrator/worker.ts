@@ -40,6 +40,13 @@ export interface WorkerStartArgs {
   attempt: number | null;
   source_branch: string;
   sub_issue_url?: string | null;
+  /** Sub-issue this run is tracked by, if the target has one. */
+  sub_issue_id?: string | null;
+  /**
+   * Orchestrator's key for this (issue, repo) pair. Stamped on the run so
+   * startup recovery can find it again without a separate sidecar.
+   */
+  worker_key: string;
   /** When set, used as the run message instead of building one from issue+target. */
   message_override?: string;
 }
@@ -138,6 +145,14 @@ export async function spawnWorker(args: WorkerStartArgs, cb: WorkerCallbacks): P
         repo_slug: repo_target.repo_alias,
         env,
         base_branch: args.source_branch,
+        external_key: args.worker_key,
+        metadata: {
+          worker: {
+            parent_issue_id: issue.id,
+            sub_issue_id: args.sub_issue_id ?? null,
+            repo_alias: repo_target.repo_alias,
+          },
+        },
       },
       toWorkerCallbacks(cb),
     );

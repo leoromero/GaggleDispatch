@@ -147,7 +147,9 @@ export class GaggleExecutor implements WorkflowExecutor {
       working_path: req.cwd,
       base_branch: baseBranch,
       artifacts_dir: artifactsDir,
+      external_key: req.external_key ?? null,
       env: req.env ?? {},
+      metadata: req.metadata ?? {},
       dry_run: req.dry_run ?? false,
     });
 

@@ -25,7 +25,7 @@ import type {
   RegistryContext,
   ServiceConfig,
 } from '../domain/types.ts';
-import { writeRunEntry, writeRetryEntry } from '../registry/run-registry.ts';
+import { writeRetryEntry } from '../registry/run-registry.ts';
 import { ExecutorClient, type RunRecord } from '../executor/client.ts';
 import { MemoryStore } from '../executor/store/memory.ts';
 import { GaggleExecutor } from '../executor/engine/index.ts';
@@ -36,13 +36,64 @@ import { makeIssue, makeRegistryContext, makeServiceConfig, makeRepoTarget } fro
  * The engine handle every Orchestrator needs. These tests drive the
  * orchestrator's own logic — labels, gates, recovery — and never start a real
  * workflow, so an executor over a MemoryStore is enough.
+ *
+ * Memoized per test so a test can seed the same store the orchestrator will
+ * read. `beforeEach` clears it, so nothing leaks between tests.
  */
+let sharedEngine: { executor: GaggleExecutor; store: MemoryStore } | null = null;
+
 function makeEngineDeps(): { executor: GaggleExecutor; store: MemoryStore } {
-  const store = new MemoryStore();
-  return {
-    store,
-    executor: new GaggleExecutor({ store, artifactsRoot: '/tmp/gaggle-test-artifacts' }),
-  };
+  if (!sharedEngine) {
+    const store = new MemoryStore();
+    sharedEngine = {
+      store,
+      executor: new GaggleExecutor({ store, artifactsRoot: '/tmp/gaggle-test-artifacts' }),
+    };
+  }
+  return sharedEngine;
+}
+
+/** The store the Orchestrator under construction will be given. */
+const engineStore = (): MemoryStore => makeEngineDeps().store;
+
+beforeEach(() => {
+  sharedEngine = null;
+});
+
+/**
+ * Seed a live run linked to a worker key — the replacement for what
+ * `writeRunEntry` used to put in gaggle-runs.json. The link now lives on the
+ * run itself, so seeding means creating the run.
+ */
+async function seedRunLink(
+  store: MemoryStore,
+  workerKey: string,
+  link: {
+    run_id: string;
+    parent_issue_id: string;
+    sub_issue_id: string | null;
+    repo_alias: string;
+    status?: 'running' | 'paused';
+  },
+): Promise<void> {
+  await store.createRun({
+    id: link.run_id,
+    workflow_name: 'gaggle/gaggle-fix-issue',
+    workflow_source: '/wf.yaml',
+    workflow_hash: 'h',
+    user_message: 'm',
+    repo_slug: link.repo_alias,
+    working_path: `/repos/${link.repo_alias}`,
+    external_key: workerKey,
+    metadata: {
+      worker: {
+        parent_issue_id: link.parent_issue_id,
+        sub_issue_id: link.sub_issue_id,
+        repo_alias: link.repo_alias,
+      },
+    },
+  });
+  await store.updateRun(link.run_id, { status: link.status ?? 'running' });
 }
 
 /** Build a fake ExecutorClient whose listRuns() delegates to the provided function. */
@@ -1552,7 +1603,7 @@ describe('crash recovery â€” recoverFromLinearLabels', () => {
     const WORKER_KEY = 'p1__trialmatch-be';
     const ARCHON_RUN_ID = 'deadbeefdeadbeefdeadbeefdeadbeef';
     try {
-      writeRunEntry(BASE, WORKER_KEY, {
+      await seedRunLink(engineStore(), WORKER_KEY, {
         run_id: ARCHON_RUN_ID,
         parent_issue_id: 'p1',
         sub_issue_id: 'sub-be',
@@ -1631,7 +1682,7 @@ describe('crash recovery â€” recoverFromLinearLabels', () => {
     try {
       // Pre-populate the retry registry with attempt=3 due in the past
       // (should reschedule with delay=0, attempt preserved).
-      writeRetryEntry(BASE, WORKER_KEY, {
+      await writeRetryEntry(engineStore(), WORKER_KEY, {
         parent_issue_id: 'p1',
         sub_issue_id: 'sub-be',
         repo_alias: 'trialmatch-be',
@@ -1671,7 +1722,7 @@ describe('crash recovery â€” recoverFromLinearLabels', () => {
     const BASE = mkdirSync(`/tmp/gaggle-test-orphan-retry-${Date.now()}`, { recursive: true }) as unknown as string ?? `/tmp/gaggle-test-orphan-retry-${Date.now()}`;
     try {
       // Persist a retry entry but DO NOT label any issue gaggle:retrying.
-      writeRetryEntry(BASE, 'p1__stale', {
+      await writeRetryEntry(engineStore(), 'p1__stale', {
         parent_issue_id: 'p1', sub_issue_id: 'stale-sub', repo_alias: 'stale',
         attempt: 2, due_at_ms: Date.now(), reason: null,
       });
@@ -1686,8 +1737,7 @@ describe('crash recovery â€” recoverFromLinearLabels', () => {
 
       await o.start();
       // The orphaned entry should have been deleted by recoverRetryingIssues.
-      const remaining = JSON.parse(readFileSync(join(BASE, 'gaggle-runs.json'), 'utf8')) as { retries: Record<string, unknown> };
-      expect(remaining.retries['p1__stale']).toBeUndefined();
+      expect(await engineStore().getRetry('p1__stale')).toBeNull();
     } finally {
       rmSync(BASE, { recursive: true, force: true });
     }
@@ -1699,7 +1749,7 @@ describe('crash recovery â€” recoverFromLinearLabels', () => {
     mkdirSync(BASE, { recursive: true });
     const WORKER_KEY = 'p1__trialmatch-be';
     const ARCHON_RUN_ID = 'cafebabecafebabecafebabecafebabe';
-    writeRunEntry(BASE, WORKER_KEY, {
+    await seedRunLink(engineStore(), WORKER_KEY, {
       run_id: ARCHON_RUN_ID,
       parent_issue_id: 'p1',
       sub_issue_id: 'sub-be',
@@ -1749,7 +1799,7 @@ describe('crash recovery â€” recoverFromLinearLabels', () => {
     const WORKER_KEY = 'p1__trialmatch-be';
     const ARCHON_RUN_ID = 'c0ffeec0ffeec0ffeec0ffeec0ffeec0';
     try {
-      writeRunEntry(BASE, WORKER_KEY, {
+      await seedRunLink(engineStore(), WORKER_KEY, {
         run_id: ARCHON_RUN_ID,
         parent_issue_id: 'p1',
         sub_issue_id: 'sub-be',
@@ -1801,7 +1851,7 @@ describe('crash recovery â€” recoverFromLinearLabels', () => {
     const WORKER_KEY = 'p1__trialmatch-be';
     const ARCHON_RUN_ID = 'babe1234babe1234babe1234babe1234';
     try {
-      writeRunEntry(BASE, WORKER_KEY, {
+      await seedRunLink(engineStore(), WORKER_KEY, {
         run_id: ARCHON_RUN_ID,
         parent_issue_id: 'p1',
         sub_issue_id: 'sub-be',

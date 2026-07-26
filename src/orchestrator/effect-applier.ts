@@ -24,8 +24,9 @@
 import type { Issue, OrchestratorState, RepoTarget, ServiceConfig } from '../domain/types.ts';
 import type { LinearClient } from '../tracker/linear.ts';
 import type { ExecutorClient } from '../executor/client.ts';
+import type { Store } from '../executor/store/types.ts';
 import type { WorkspaceManager } from '../workspace/workspace-manager.ts';
-import { writeRunEntry, deleteRunEntry, writeRetryEntry, deleteRetryEntry } from '../registry/run-registry.ts';
+import { deleteRetryEntry, writeRetryEntry } from '../registry/run-registry.ts';
 import { workerKey as makeWorkerKey } from './state.ts';
 import { logger } from '../util/logger.ts';
 import type { BlockerSpec, Effect, TargetIdentity, WorkerKey } from './state-machine.ts';
@@ -72,6 +73,7 @@ export interface EffectApplierDeps {
   cfg: ServiceConfig;
   tracker: LinearClient;
   executorClient: ExecutorClient;
+  store: Store;
   workspace: WorkspaceManager;
   state: OrchestratorState;
   /** Used by persist_run / delete_run; gaggle-runs.json lives here. */
@@ -187,16 +189,14 @@ export class EffectApplier {
       }
 
       // ─── Persistence ───────────────────────────────────────────────────
+      //
+      // persist_run and delete_run are no-ops now. The run row carries the
+      // worker key and the worker metadata from the moment it is created, so
+      // there is no separate link to write, and nothing that can disagree with
+      // the run's own status. The effects stay in the state machine's
+      // vocabulary because the transitions still express the intent.
       case 'persist_run':
-        writeRunEntry(this.deps.registryBaseFolder, effect.key, {
-          run_id: effect.run_id,
-          parent_issue_id: effect.meta.parent_issue_id,
-          sub_issue_id: effect.meta.sub_issue_id,
-          repo_alias: effect.meta.repo_alias,
-        });
-        return;
       case 'delete_run':
-        deleteRunEntry(this.deps.registryBaseFolder, effect.key);
         return;
       case 'persist_retry': {
         // Resolve sub_issue_id / repo_alias from the WorkerKey + in-memory
@@ -211,7 +211,7 @@ export class EffectApplier {
         const repo_alias = effect.key.slice(sep + 2);
         const sub_issue_id =
           this.deps.state.sibling_subissues.get(parent_issue_id)?.get(repo_alias) ?? null;
-        writeRetryEntry(this.deps.registryBaseFolder, effect.key, {
+        await writeRetryEntry(this.deps.store, effect.key, {
           parent_issue_id,
           sub_issue_id,
           repo_alias,
@@ -222,7 +222,7 @@ export class EffectApplier {
         return;
       }
       case 'delete_retry':
-        deleteRetryEntry(this.deps.registryBaseFolder, effect.key);
+        await deleteRetryEntry(this.deps.store, effect.key);
         return;
 
       // ─── Timers ────────────────────────────────────────────────────────

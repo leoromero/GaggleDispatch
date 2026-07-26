@@ -1,25 +1,26 @@
 /**
- * Persistent registry of worker state, keyed by workerKey.
+ * Worker → run links and the retry schedule.
  *
- * Two parallel maps live in <base_folder>/gaggle-runs.json:
+ * This used to be `<base_folder>/gaggle-runs.json`, holding two maps. Only one
+ * of them survived the move to Postgres.
  *
- *   entries  — workerKey → run id, written while a worker is live
- *              so the orchestrator can rebind to the right run on
- *              restart instead of guessing by repo basename.
+ * **Run links no longer exist as stored records.** The file existed so the
+ * orchestrator could rebind a worker key to its run after a restart, because
+ * the executor's run state lived in another process's database and could not
+ * be queried by anything the orchestrator knew. Now the run carries the worker
+ * key itself (`workflow_runs.external_key`), so the link *is* the run — there
+ * is nothing separate to write, and nothing to go stale when the two disagree.
  *
- *   retries  — workerKey → retry meta (attempt count, due-at timestamp,
- *              last error). Written when a target enters `retrying`, deleted
- *              when the retry fires. Lets retry attempt counts and back-off
- *              schedules survive an orchestrator crash.
+ * **Retries do survive**, as a table. They are orchestrator state with no
+ * corresponding run: a target waiting to be retried has, by definition, no run
+ * in flight.
  */
 
-import { existsSync, readFileSync, writeFileSync } from 'node:fs';
-import { join } from 'node:path';
-import { logger } from '../util/logger.ts';
+import type { Store } from '../executor/store/types.ts';
+import type { RunStatus } from '../executor/types.ts';
 
-const FILENAME = 'gaggle-runs.json';
-
-interface RunEntry {
+/** What the old `RunEntry` carried, reconstructed from the run row. */
+export interface RunLink {
   run_id: string;
   parent_issue_id: string;
   sub_issue_id: string | null;
@@ -27,107 +28,119 @@ interface RunEntry {
   started_at: string;
 }
 
-interface RetryEntry {
+/**
+ * Worker context stashed in run metadata at launch.
+ *
+ * `external_key` alone identifies the run, but recovery also needs the
+ * sub-issue id, which is not derivable from anything else on the row.
+ */
+export interface WorkerMetadata {
+  parent_issue_id: string;
+  sub_issue_id: string | null;
+  repo_alias: string;
+}
+
+/** A run is still "live" for linking purposes until it reaches a terminal state. */
+const LIVE_STATUSES: RunStatus[] = ['pending', 'running', 'paused', 'interrupted'];
+
+function toLink(row: {
+  id: string;
+  external_key: string | null;
+  started_at: string;
+  metadata: Record<string, unknown>;
+  repo_slug?: string | null;
+}): RunLink | null {
+  const worker = row.metadata.worker as WorkerMetadata | undefined;
+  if (!worker?.parent_issue_id) return null;
+  return {
+    run_id: row.id,
+    parent_issue_id: worker.parent_issue_id,
+    sub_issue_id: worker.sub_issue_id ?? null,
+    repo_alias: worker.repo_alias ?? row.repo_slug ?? '',
+    started_at: row.started_at,
+  };
+}
+
+/** The run currently linked to this worker key, if it has not finished. */
+export async function readRunLink(store: Store, workerKey: string): Promise<RunLink | null> {
+  const row = await store.findRunByExternalKey(workerKey);
+  if (!row || !LIVE_STATUSES.includes(row.status)) return null;
+  return toLink(row);
+}
+
+/**
+ * Every live worker → run link, keyed by worker key. Used by startup recovery
+ * to reconstruct what was in flight.
+ */
+export async function allRunLinks(store: Store): Promise<Record<string, RunLink>> {
+  const rows = await store.listRuns({ status: LIVE_STATUSES });
+  const out: Record<string, RunLink> = {};
+  for (const row of rows) {
+    if (!row.external_key) continue;
+    const link = toLink(row);
+    // Newest first from listRuns, so the first key wins — a retried worker
+    // links to its most recent run.
+    if (link && !(row.external_key in out)) out[row.external_key] = link;
+  }
+  return out;
+}
+
+// ─── retry schedule ─────────────────────────────────────────────────────────
+
+export interface RetryLink {
   parent_issue_id: string;
   sub_issue_id: string | null;
   repo_alias: string;
   attempt: number;
   due_at_ms: number;
   reason: string | null;
-  updated_at: string;
 }
 
-interface RunsFile {
-  entries: Record<string, RunEntry>;
-  retries: Record<string, RetryEntry>;
+export async function writeRetryEntry(
+  store: Store,
+  workerKey: string,
+  entry: RetryLink,
+): Promise<void> {
+  await store.upsertRetry({
+    worker_key: workerKey,
+    parent_issue_id: entry.parent_issue_id,
+    sub_issue_id: entry.sub_issue_id,
+    repo_alias: entry.repo_alias,
+    attempt: entry.attempt,
+    due_at: new Date(entry.due_at_ms).toISOString(),
+    reason: entry.reason,
+  });
 }
 
-function filePath(baseFolder: string): string {
-  return join(baseFolder, FILENAME);
+export async function readRetryEntry(store: Store, workerKey: string): Promise<RetryLink | null> {
+  const row = await store.getRetry(workerKey);
+  if (!row) return null;
+  return {
+    parent_issue_id: row.parent_issue_id,
+    sub_issue_id: row.sub_issue_id,
+    repo_alias: row.repo_alias,
+    attempt: row.attempt,
+    due_at_ms: Date.parse(row.due_at),
+    reason: row.reason,
+  };
 }
 
-function load(baseFolder: string): RunsFile {
-  const p = filePath(baseFolder);
-  if (!existsSync(p)) return { entries: {}, retries: {} };
-  try {
-    const parsed = JSON.parse(readFileSync(p, 'utf8')) as Partial<RunsFile>;
-    return {
-      entries: parsed.entries ?? {},
-      retries: parsed.retries ?? {},
+export async function deleteRetryEntry(store: Store, workerKey: string): Promise<void> {
+  await store.deleteRetry(workerKey);
+}
+
+export async function allRetryEntries(store: Store): Promise<Record<string, RetryLink>> {
+  const rows = await store.listRetries();
+  const out: Record<string, RetryLink> = {};
+  for (const r of rows) {
+    out[r.worker_key] = {
+      parent_issue_id: r.parent_issue_id,
+      sub_issue_id: r.sub_issue_id,
+      repo_alias: r.repo_alias,
+      attempt: r.attempt,
+      due_at_ms: Date.parse(r.due_at),
+      reason: r.reason,
     };
-  } catch {
-    return { entries: {}, retries: {} };
   }
-}
-
-function save(baseFolder: string, data: RunsFile): void {
-  try {
-    writeFileSync(filePath(baseFolder), JSON.stringify(data, null, 2), 'utf8');
-  } catch (err) {
-    logger.warn('gaggle-runs.json write failed', { error: (err as Error).message });
-  }
-}
-
-// ─── run entries ───────────────────────────────────────────────────────────
-
-/** Record that a worker started and its run id is now known. */
-export function writeRunEntry(
-  baseFolder: string,
-  workerKey: string,
-  entry: Omit<RunEntry, 'started_at'>,
-): void {
-  const data = load(baseFolder);
-  data.entries[workerKey] = { ...entry, started_at: new Date().toISOString() };
-  save(baseFolder, data);
-}
-
-/** Retrieve the run entry for a worker key. Returns null if not found. */
-export function readRunEntry(baseFolder: string, workerKey: string): RunEntry | null {
-  const data = load(baseFolder);
-  return data.entries[workerKey] ?? null;
-}
-
-/** Remove a run entry (call on worker success, failure, or cancellation). */
-export function deleteRunEntry(baseFolder: string, workerKey: string): void {
-  const data = load(baseFolder);
-  if (!(workerKey in data.entries)) return;
-  delete data.entries[workerKey];
-  save(baseFolder, data);
-}
-
-/** Return all current run entries (used during crash recovery). */
-export function allRunEntries(baseFolder: string): Record<string, RunEntry> {
-  return load(baseFolder).entries;
-}
-
-// ─── retry entries ─────────────────────────────────────────────────────────
-
-/** Record that a target has entered the retrying state. */
-export function writeRetryEntry(
-  baseFolder: string,
-  workerKey: string,
-  entry: Omit<RetryEntry, 'updated_at'>,
-): void {
-  const data = load(baseFolder);
-  data.retries[workerKey] = { ...entry, updated_at: new Date().toISOString() };
-  save(baseFolder, data);
-}
-
-/** Retrieve the retry entry for a worker key. Returns null if not found. */
-export function readRetryEntry(baseFolder: string, workerKey: string): RetryEntry | null {
-  const data = load(baseFolder);
-  return data.retries[workerKey] ?? null;
-}
-
-/** Remove a retry entry (call on retry-due fire, success, or cancellation). */
-export function deleteRetryEntry(baseFolder: string, workerKey: string): void {
-  const data = load(baseFolder);
-  if (!(workerKey in data.retries)) return;
-  delete data.retries[workerKey];
-  save(baseFolder, data);
-}
-
-/** Return all current retry entries (used during crash recovery). */
-export function allRetryEntries(baseFolder: string): Record<string, RetryEntry> {
-  return load(baseFolder).retries;
+  return out;
 }

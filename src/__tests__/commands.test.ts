@@ -170,3 +170,62 @@ describe('the shipped templates resolve every command they reference', () => {
     }
   });
 });
+
+// ── worker identity round-trip ──────────────────────────────────────────────
+
+describe('the worker key reaches the run row', () => {
+  test('startRun stamps external_key and worker metadata, and allRunLinks reads them back', async () => {
+    // This is the seam that replaced gaggle-runs.json. If the worker stops
+    // passing the key, recovery silently finds nothing — tests that seed the
+    // store directly would still pass, so this asserts the real path.
+    const { MemoryStore } = await import('../executor/store/memory.ts');
+    const { GaggleExecutor } = await import('../executor/engine/index.ts');
+    const { allRunLinks, readRunLink } = await import('../registry/run-registry.ts');
+
+    const dir = mkdtempSync(join(tmpdir(), 'gaggle-link-'));
+    try {
+      mkdirSync(join(dir, '.gaggle', 'workflows'), { recursive: true });
+      writeFileSync(
+        join(dir, '.gaggle', 'workflows', 'noop.yaml'),
+        'name: noop\ndescription: d\nnodes:\n  - id: a\n    prompt: "x"\n',
+      );
+
+      const store = new MemoryStore();
+      const executor = new GaggleExecutor({
+        store,
+        artifactsRoot: join(dir, '.artifacts'),
+        ai: async () =>
+          ({ text: 'ok', sessionId: null, inputTokens: 0, outputTokens: 0, timedOut: false, cancelled: false }) as never,
+      });
+
+      const handle = await executor.startRun(
+        {
+          workflow: 'noop',
+          cwd: dir,
+          message: 'm',
+          repo_slug: 'trialmatch-be',
+          external_key: 'p1__trialmatch-be',
+          metadata: {
+            worker: { parent_issue_id: 'p1', sub_issue_id: 'sub-be', repo_alias: 'trialmatch-be' },
+          },
+        },
+        () => {},
+      );
+
+      // Readable while the run is live.
+      const link = await readRunLink(store, 'p1__trialmatch-be');
+      expect(link?.run_id).toBe(handle.run_id);
+      expect(link?.sub_issue_id).toBe('sub-be');
+      expect((await allRunLinks(store))['p1__trialmatch-be']?.parent_issue_id).toBe('p1');
+
+      await handle.done;
+
+      // Once the run finishes the link is gone — the run's own status is the
+      // truth, so there is no stale entry to prune.
+      expect(await readRunLink(store, 'p1__trialmatch-be')).toBeNull();
+      expect(await allRunLinks(store)).toEqual({});
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
