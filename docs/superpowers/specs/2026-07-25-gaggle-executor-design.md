@@ -561,9 +561,37 @@ whose answer is meaningless off-host.
 **Sequencing.** Phase 1 builds the store, schema, and migration runner. The
 non-executor stores migrate in a **phase 1.5** that lands independently: they are
 mechanical, off the 3 → 4 → 6 critical path, and keeping them out of the executor PRs
-keeps those reviewable. Phase 1.5 must land **before** phase 8 so the deletion commit
-removes the old persistence in one pass and the tree never sits in a four-technology
-interim state.
+keeps those reviewable.
+
+The plan had 1.5 landing before phase 8, so the deletion commit would remove all
+the old persistence at once. In practice it did not — phase 8 went first and 1.5
+is partly done, so the tree currently runs Postgres, a SQLite hub history, and
+three file stores. That interim state is the cost of the reordering; it is
+tolerable because the file stores still work, but it is not where this should
+come to rest.
+
+### 12.3 Phase 1.5 status
+
+| Store | State |
+|---|---|
+| Schema (migrations 002, 003) | **Done.** All tables exist; both Store implementations carry the methods; 82 conformance tests cover them against MemoryStore and real Postgres |
+| Analysis cache | **Done.** `analysis-registry.ts` deleted |
+| Run registry | **Not started.** `external_key` and `retry_schedule` exist and are tested, but nothing writes them yet. The lookup half should disappear rather than be ported — see above |
+| Scaffold jobs | **Not started.** Store methods exist; ~10 CLI call sites still read the YAML file |
+| Synced registry | **Not started.** Store methods exist; the repo syncer and loader still use the file, and the chokidar watcher still needs replacing with a poll of `registry_meta.synced_at` |
+| Hub history | **Not started.** `hub_*` tables exist; `hub/history.ts` is still SQLite. This is the largest remaining piece because its API is synchronous and making it async ripples into `hub/server.ts` |
+
+**Deviation from the plan:** Bun's SQL driver exposes no `listen`/`notify`, so
+the `LISTEN/NOTIFY` this section promised is not reachable without adding a
+dependency. Polling the single `registry_meta` marker row achieves the same
+thing for the case that motivated it — an operator running `gaggle sync`
+against a live daemon — at negligible cost.
+
+**Known collision:** another branch has its own `control_plane` migration
+(version 100) and its own `scaffold_jobs` table, with a `workspace` column this
+one does not have. The two need reconciling before both land. The conformance
+suite now uses a dedicated `gaggle_exec_test` database so they stop colliding
+during development.
 
 
 ---
