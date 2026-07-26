@@ -21,7 +21,6 @@ import { parseWorkflow } from '../executor/engine/loader.ts';
 import {
   appendContextIfAbsent,
   MissingBaseBranchError,
-  shellQuote,
   substitute,
   type SubstitutionContext,
 } from '../executor/engine/substitute.ts';
@@ -249,21 +248,6 @@ const ctx = (over: Partial<SubstitutionContext> = {}): SubstitutionContext => ({
   ...over,
 });
 
-describe('shellQuote', () => {
-  test('wraps in single quotes', () => {
-    expect(shellQuote('hello')).toBe("'hello'");
-  });
-
-  test('escapes embedded single quotes', () => {
-    expect(shellQuote("it's")).toBe(`'it'\\''s'`);
-  });
-
-  test('neutralises shell metacharacters', () => {
-    expect(shellQuote('a; rm -rf /')).toBe("'a; rm -rf /'");
-    expect(shellQuote('$(whoami)')).toBe("'$(whoami)'");
-  });
-});
-
 describe('substitute — scalars', () => {
   test('replaces the documented variables', () => {
     const r = substitute('$ARGUMENTS | $USER_MESSAGE | $WORKFLOW_ID | $ARTIFACTS_DIR | $BASE_BRANCH', ctx());
@@ -355,15 +339,18 @@ describe('substitute — node outputs', () => {
     expect(r.unresolved).toEqual(['$classify.output.nope']);
   });
 
-  test('shell-quotes node output in shell bodies', () => {
+  test('binds node output to the environment in shell bodies', () => {
     const c = ctx({ nodeOutputs: new Map([['a', { text: "it's; rm -rf /" }]]) });
-    const r = substitute('echo $a.output', c, { shellQuote: true });
-    expect(r.text).toBe(`echo 'it'\\''s; rm -rf /'`);
+    const r = substitute('echo $a.output', c, { shell: true });
+    expect(r.text).toBe('echo ${GAGGLE_OUT_A}');
+    expect(r.bindings).toEqual({ GAGGLE_OUT_A: "it's; rm -rf /" });
   });
 
-  test('does not quote node output in prompts or script bodies', () => {
+  test('does not bind node output in prompts or script bodies', () => {
     const c = ctx({ nodeOutputs: new Map([['a', { text: '{"k":1}' }]]) });
-    expect(substitute('const d = $a.output;', c, { shellQuote: false }).text).toBe('const d = {"k":1};');
+    const r = substitute('const d = $a.output;', c, { shell: false });
+    expect(r.text).toBe('const d = {"k":1};');
+    expect(r.bindings).toEqual({});
   });
 
   test('hyphenated node ids resolve', () => {
@@ -396,59 +383,89 @@ describe('appendContextIfAbsent', () => {
 describe('substitute — shell injection', () => {
   const evil = "x'; touch /tmp/pwned; echo '";
 
-  test('untrusted scalars are shell-quoted in shell bodies', () => {
+  test('untrusted scalars become environment references in shell bodies', () => {
     // $ARGUMENTS carries the Linear issue title and body. The shipped Archon
     // docs put it straight into a `bash:` node, so leaving it raw let issue
     // text execute as shell.
     for (const name of ['ARGUMENTS', 'USER_MESSAGE', 'CONTEXT', 'LOOP_USER_INPUT', 'REJECTION_REASON']) {
       const r = substitute(`gh issue view $${name}`, ctx({
         arguments: evil, context: evil, loopUserInput: evil, rejectionReason: evil,
-      }), { shellQuote: true });
-      expect(r.text, name).toBe(`gh issue view ${shellQuote(evil)}`);
+      }), { shell: true });
+      expect(r.text, name).toBe(`gh issue view \${GAGGLE_VAR_${name}}`);
+      expect(r.bindings[`GAGGLE_VAR_${name}`], name).toBe(evil);
     }
   });
 
-  test('the quoted form is inert when a real shell runs it', async () => {
-    // The definitive check: the substituted script must not execute the
-    // payload. Asserting on the string alone would pass for a quoting scheme
-    // that merely looks right.
-    const bash = resolveBashPath();
-    if (!bash) return; // covered by the string assertion above on hosts without bash
+  test('one binding per distinct value, reused on repeat references', () => {
+    const c = ctx({ arguments: evil, nodeOutputs: new Map([['a', { text: 'out' }]]) });
+    const r = substitute('$ARGUMENTS $a.output $ARGUMENTS $a.output', c, { shell: true });
+    expect(r.text).toBe('${GAGGLE_VAR_ARGUMENTS} ${GAGGLE_OUT_A} ${GAGGLE_VAR_ARGUMENTS} ${GAGGLE_OUT_A}');
+    expect(Object.keys(r.bindings).sort()).toEqual(['GAGGLE_OUT_A', 'GAGGLE_VAR_ARGUMENTS']);
+  });
 
-    const marker = join(tmpdir(), `gaggle-inject-${Date.now()}.txt`).replace(/\\/g, '/');
-    const payload = `x'; touch '${marker}'; echo '`;
-    const script = substitute('echo $ARGUMENTS', ctx({ arguments: payload }), {
-      shellQuote: true,
-    }).text;
+  test('node ids that sanitise to the same env name get distinct bindings', () => {
+    // `a-b` and `a_b` both become A_B; colliding would hand one node the
+    // other's output, which is a correctness bug as much as a safety one.
+    const c = ctx({ nodeOutputs: new Map([['a-b', { text: 'dash' }], ['a_b', { text: 'under' }]]) });
+    const r = substitute('$a-b.output|$a_b.output', c, { shell: true });
+    expect(r.bindings.GAGGLE_OUT_A_B).toBe('dash');
+    expect(r.bindings.GAGGLE_OUT_A_B_2).toBe('under');
+    expect(r.text).toBe('${GAGGLE_OUT_A_B}|${GAGGLE_OUT_A_B_2}');
+  });
+
+  test('a structured field binds separately from the whole output', () => {
+    const c = ctx({ nodeOutputs: new Map([['a', { text: '{"k":"v"}', json: { k: 'v' } }]]) });
+    const r = substitute('$a.output $a.output.k', c, { shell: true });
+    expect(r.bindings.GAGGLE_OUT_A).toBe('{"k":"v"}');
+    expect(r.bindings.GAGGLE_OUT_A_K).toBe('v');
+  });
+
+  test('the expansion is inert when a real shell runs it — quoted and unquoted', async () => {
+    // The definitive check: the substituted script must not execute the
+    // payload. Asserting on the string alone would pass for a scheme that
+    // merely looks right — and the previous shell-quoting scheme did look
+    // right while being unsafe inside double quotes, which is the context
+    // every shipped template actually uses.
+    const bash = resolveBashPath();
+    if (!bash) return; // covered by the string assertions above on hosts without bash
+
+    const sub = join(tmpdir(), `gaggle-inject-sub-${Date.now()}.txt`).replace(/\\/g, '/');
+    const bt = join(tmpdir(), `gaggle-inject-bt-${Date.now()}.txt`).replace(/\\/g, '/');
+    const payload = `$(touch '${sub}') \`touch '${bt}'\` and 'quotes'`;
+
+    const r = substitute('printf "%s" "$ARGUMENTS"; printf "|%s" $ARGUMENTS', ctx({ arguments: payload }), {
+      shell: true,
+    });
 
     const out = await runBash({
-      script,
+      script: r.text,
       cwd: tmpdir(),
-      env: process.env as Record<string, string>,
+      env: { ...(process.env as Record<string, string>), ...r.bindings },
       timeoutMs: 15_000,
       bashPath: bash,
     });
 
     expect(out.exit_code).toBe(0);
-    expect(existsSync(marker)).toBe(false);
-    // The payload came back as literal text, which is the whole point.
-    expect(out.stdout).toBe(payload);
+    expect(existsSync(sub), 'command substitution must not run').toBe(false);
+    expect(existsSync(bt), 'backticks must not run').toBe(false);
+    // Quoted: verbatim. Unquoted: word-split by the shell, which is the
+    // author's business — the point is that no part of it was executed.
+    expect(out.stdout.startsWith(payload)).toBe(true);
+    expect(out.stdout).toContain('|$(touch');
   });
 
   test('engine-controlled paths are left raw so quoted usage still works', () => {
-    // Templates write "$ARTIFACTS_DIR/notes.md"; quoting would embed literal
-    // quote characters into the middle of a path.
-    const r = substitute('cat "$ARTIFACTS_DIR/notes.md"', ctx(), { shellQuote: true });
+    // Templates write "$ARTIFACTS_DIR/notes.md"; binding would leave a
+    // parameter reference where a path belongs and gain nothing — the value
+    // is the engine's own, not anyone else's text.
+    const r = substitute('cat "$ARTIFACTS_DIR/notes.md"', ctx(), { shell: true });
     expect(r.text).toBe('cat "/artifacts/run-1/notes.md"');
+    expect(r.bindings).toEqual({});
   });
 
-  test('prompts are never shell-quoted', () => {
-    const r = substitute('The task: $ARGUMENTS', ctx({ arguments: evil }), { shellQuote: false });
+  test('prompts are never bound, only expanded', () => {
+    const r = substitute('The task: $ARGUMENTS', ctx({ arguments: evil }), { shell: false });
     expect(r.text).toBe(`The task: ${evil}`);
-  });
-
-  test('node output stays quoted, as before', () => {
-    const c = ctx({ nodeOutputs: new Map([['a', { text: evil }]]) });
-    expect(substitute('echo $a.output', c, { shellQuote: true }).text).toBe(`echo ${shellQuote(evil)}`);
+    expect(r.bindings).toEqual({});
   });
 });

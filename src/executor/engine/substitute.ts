@@ -6,9 +6,19 @@
  *  - Only *known* names are replaced. A `bash:` body is full of shell
  *    variables (`$spent`, `${PIPESTATUS[0]}`, `$1`) that must survive
  *    untouched, so substitution is an allowlist, never a general `$WORD` sweep.
- *  - `$nodeId.output` is shell-quoted when injected into a shell body. Node
- *    output is model-generated text; interpolating it raw into a command line
- *    is a command-injection hole.
+ *  - Untrusted values are never pasted into a shell body. Model output, issue
+ *    text and human replies are passed through the environment and referenced
+ *    as `${GAGGLE_…}`.
+ *
+ * That second rule replaced shell-quoting, which could not be made correct.
+ * Quoting produces `'value'`, which is only safe in an *unquoted* context —
+ * and the substituter cannot see whether the reference sits inside double
+ * quotes. A template writing the entirely natural `"$node.output"` would get
+ * literal quote characters inside the string and the value re-exposed to
+ * `$(…)` and backticks. Parameter expansion has no such problem: the shell
+ * does not re-parse an expanded value for command substitution, so
+ * `${GAGGLE_…}` is inert quoted *and* unquoted, and the author's own quoting
+ * keeps meaning what it says.
  */
 
 import type { NodeOutputRef } from './conditions.ts';
@@ -39,11 +49,13 @@ export interface SubstitutionContext {
 
 export interface SubstituteOptions {
   /**
-   * Shell-quote `$nodeId.output` values. True for `bash:` bodies and
-   * `until_bash`; false for prompts and for `script:` bodies, where the value
-   * is assigned directly as a JS/Python expression.
+   * This text is a shell body (`bash:` or `until_bash`).
+   *
+   * Untrusted values are then emitted as `${GAGGLE_…}` parameter references
+   * and returned in `bindings` for the caller to put in the subprocess
+   * environment, rather than being pasted into the script.
    */
-  shellQuote?: boolean;
+  shell?: boolean;
   /**
    * Consume `\$` down to a literal `$`. Enabled for prompt and command text.
    * Off for shell bodies, where the backslash is preserved so the shell's own
@@ -56,11 +68,35 @@ export interface SubstituteResult {
   text: string;
   /** References that resolved to nothing — surfaced as run warnings. */
   unresolved: string[];
+  /**
+   * Environment the expanded shell body needs. Empty unless `shell` was set.
+   * The caller must merge this into the subprocess env.
+   */
+  bindings: Record<string, string>;
 }
 
-/** Single-quote for POSIX sh, closing and reopening around embedded quotes. */
-export function shellQuote(value: string): string {
-  return `'${value.replace(/'/g, `'\\''`)}'`;
+/**
+ * Allocates a unique, shell-legal environment variable name per value.
+ *
+ * Node ids allow hyphens and env names do not, so `a-b` and `a_b` would
+ * collide after sanitising; a numeric suffix keeps them distinct.
+ */
+class EnvBinder {
+  readonly bindings: Record<string, string> = {};
+  private readonly assigned = new Map<string, string>();
+
+  bind(kind: 'OUT' | 'VAR', key: string, value: string): string {
+    const existing = this.assigned.get(`${kind}:${key}`);
+    if (existing) return existing;
+
+    const base = `GAGGLE_${kind}_${key.toUpperCase().replace(/[^A-Z0-9]/g, '_')}`;
+    let name = base;
+    for (let i = 2; name in this.bindings; i += 1) name = `${base}_${i}`;
+
+    this.bindings[name] = value;
+    this.assigned.set(`${kind}:${key}`, name);
+    return name;
+  }
 }
 
 export class MissingBaseBranchError extends Error {
@@ -155,6 +191,7 @@ export function substitute(
 ): SubstituteResult {
   const scalars = scalarVariables(ctx);
   const unresolved: string[] = [];
+  const binder = new EnvBinder();
   let out = '';
   let i = 0;
 
@@ -208,7 +245,9 @@ export function substitute(
       }
       const { value, found } = resolveNodeRef(ctx, { node_id: word, field });
       if (!found) unresolved.push(field ? `$${word}.output.${field}` : `$${word}.output`);
-      out += opts.shellQuote ? shellQuote(value) : value;
+      out += opts.shell
+        ? `\${${binder.bind('OUT', field ? `${word}_${field}` : word, value)}}`
+        : value;
       i = k;
       continue;
     }
@@ -216,7 +255,10 @@ export function substitute(
     const scalar = scalars.find(([name]) => name === word);
     if (scalar) {
       const value = scalar[1]();
-      out += opts.shellQuote && UNTRUSTED_VARIABLES.has(word) ? shellQuote(value) : value;
+      out +=
+        opts.shell && UNTRUSTED_VARIABLES.has(word)
+          ? `\${${binder.bind('VAR', word, value)}}`
+          : value;
       i = j;
       continue;
     }
@@ -226,7 +268,7 @@ export function substitute(
     i += 1;
   }
 
-  return { text: out, unresolved };
+  return { text: out, unresolved, bindings: binder.bindings };
 }
 
 /**

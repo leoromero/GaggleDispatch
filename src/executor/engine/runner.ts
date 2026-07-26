@@ -247,8 +247,21 @@ export class WorkflowRunner {
     text: string,
     opts: { shell?: boolean; extra?: Partial<SubstitutionContext> } = {},
   ): string {
+    return this.expandShell(text, opts).text;
+  }
+
+  /**
+   * Expand and keep the environment bindings a shell body needs.
+   *
+   * Untrusted values are referenced as `${GAGGLE_…}` rather than pasted in, so
+   * a shell body is only complete once these are in the subprocess env.
+   */
+  private expandShell(
+    text: string,
+    opts: { shell?: boolean; extra?: Partial<SubstitutionContext> } = {},
+  ): { text: string; bindings: Record<string, string> } {
     const res = substitute(text, this.substitutionContext(opts.extra), {
-      shellQuote: opts.shell === true,
+      shell: opts.shell === true,
       allowEscapes: opts.shell !== true,
     });
     if (res.unresolved.length > 0) {
@@ -257,7 +270,7 @@ export class WorkflowRunner {
         unresolved: res.unresolved,
       });
     }
-    return res.text;
+    return { text: res.text, bindings: res.bindings };
   }
 
   private nodeEnv(): Record<string, string> {
@@ -305,11 +318,11 @@ export class WorkflowRunner {
   }
 
   private async executeBash(node: WorkflowNode): Promise<NodeResult> {
-    const script = this.expand(node.bash!, { shell: true });
+    const { text: script, bindings } = this.expandShell(node.bash!, { shell: true });
     const out = await runBash({
       script,
       cwd: this.ctx.cwd,
-      env: this.nodeEnv(),
+      env: { ...this.nodeEnv(), ...bindings },
       timeoutMs: node.timeout ?? this.deps.config.bashTimeoutMs,
       signal: this.abort.signal,
       bashPath: this.deps.bashPath,
@@ -661,10 +674,11 @@ export class WorkflowRunner {
 
   private async untilBashPasses(script: string | undefined): Promise<boolean> {
     if (!script?.trim()) return false;
+    const { text, bindings } = this.expandShell(script, { shell: true });
     const out = await runBash({
-      script: this.expand(script, { shell: true }),
+      script: text,
       cwd: this.ctx.cwd,
-      env: this.nodeEnv(),
+      env: { ...this.nodeEnv(), ...bindings },
       timeoutMs: this.deps.config.bashTimeoutMs,
       signal: this.abort.signal,
       bashPath: this.deps.bashPath,
