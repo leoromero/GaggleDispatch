@@ -147,8 +147,8 @@ export async function startHubServer(opts: HubServerOptions): Promise<HubServerH
       if (!known.has(g.worker_key)) {
         const paused_at = new Date(g.paused_at).toISOString();
         known.set(g.worker_key, { paused_at, message: g.gate_message });
-        try {
-          void db.recordGate({
+        void db
+          .recordGate({
             workspace_id: wsId,
             issue_id: g.issue_id,
             repo_alias: g.repo_alias,
@@ -156,10 +156,10 @@ export async function startHubServer(opts: HubServerOptions): Promise<HubServerH
             action: 'paused',
             gate_message: g.gate_message,
             paused_at,
+          })
+          .catch((e) => {
+            logger.warn('Failed to persist gate event', { error: (e as Error).message });
           });
-        } catch (e) {
-          logger.warn('Failed to persist gate event', { error: (e as Error).message });
-        }
       }
     }
     // Any previously known gate that disappeared is considered resolved.

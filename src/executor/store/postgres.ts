@@ -373,7 +373,7 @@ export class PostgresStore implements Store {
         claude_session_id, side_effects, input_tokens, output_tokens, started_at, completed_at
       ) VALUES (
         ${input.run_id}, ${input.node_id}, ${input.node_type}, ${input.status},
-        ${input.attempt ?? 0}, ${input.output ?? null},
+        COALESCE(${input.attempt ?? null}::int, 0), ${input.output ?? null},
         ${input.output_json ?? null},
         ${input.error ?? null}, ${input.claude_session_id ?? null},
         ${input.side_effects ?? 'idempotent'},
@@ -383,7 +383,10 @@ export class PostgresStore implements Store {
       ON CONFLICT (run_id, node_id) DO UPDATE SET
         node_type         = excluded.node_type,
         status            = excluded.status,
-        attempt           = excluded.attempt,
+        -- Matching MemoryStore: a bare status write must not reset the
+        -- attempt counter a retry already advanced. excluded.attempt cannot be
+        -- used here because the INSERT already defaulted it to 0.
+        attempt           = COALESCE(${input.attempt ?? null}::int, workflow_run_nodes.attempt),
         output            = COALESCE(excluded.output, workflow_run_nodes.output),
         output_json       = COALESCE(excluded.output_json, workflow_run_nodes.output_json),
         error             = excluded.error,

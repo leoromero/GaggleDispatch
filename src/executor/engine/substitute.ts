@@ -73,6 +73,28 @@ export class MissingBaseBranchError extends Error {
   }
 }
 
+/**
+ * Variables carrying text from outside the system — a Linear issue's title and
+ * body, a human's gate reply. These are shell-quoted when injected into a
+ * shell body, exactly like node output.
+ *
+ * The engine-controlled variables are deliberately *not* in this set.
+ * `$ARTIFACTS_DIR` and `$BASE_BRANCH` are a path and a branch name the engine
+ * computed, and every shipped template writes them inside double quotes
+ * (`"$ARTIFACTS_DIR/notes.md"`) — quoting those would embed literal quote
+ * characters into the middle of a path and break the script. Untrusted text is
+ * the part that has to be neutralised.
+ */
+const UNTRUSTED_VARIABLES = new Set([
+  'ARGUMENTS',
+  'USER_MESSAGE',
+  'CONTEXT',
+  'EXTERNAL_CONTEXT',
+  'ISSUE_CONTEXT',
+  'LOOP_USER_INPUT',
+  'REJECTION_REASON',
+]);
+
 /** Names replaced with a plain scalar, longest-first so prefixes cannot shadow. */
 function scalarVariables(ctx: SubstitutionContext): Array<[string, () => string]> {
   return [
@@ -193,7 +215,8 @@ export function substitute(
 
     const scalar = scalars.find(([name]) => name === word);
     if (scalar) {
-      out += scalar[1]();
+      const value = scalar[1]();
+      out += opts.shellQuote && UNTRUSTED_VARIABLES.has(word) ? shellQuote(value) : value;
       i = j;
       continue;
     }

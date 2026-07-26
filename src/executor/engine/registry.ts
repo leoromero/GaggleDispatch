@@ -12,6 +12,7 @@ import { join } from 'node:path';
 import { logger } from '../../util/logger.ts';
 import { discoverWorkflowFiles, loadWorkflowFile, WorkflowLoadError } from './loader.ts';
 import type { Diagnostic, WorkflowDef } from './schema.ts';
+import { validateWorkflow } from './validate.ts';
 
 export interface WorkflowEntry {
   name: string;
@@ -86,9 +87,35 @@ export class WorkflowNotFoundError extends Error {
   }
 }
 
+export class WorkflowInvalidError extends Error {
+  readonly diagnostics: Diagnostic[];
+  constructor(name: string, diagnostics: Diagnostic[]) {
+    const detail = diagnostics
+      .map((d) => `  ${d.node_id ? `[${d.node_id}] ` : ''}${d.message}`)
+      .join('\n');
+    super(`workflow '${name}' is invalid:\n${detail}`);
+    this.name = 'WorkflowInvalidError';
+    this.diagnostics = diagnostics;
+  }
+}
+
+/**
+ * Resolve a workflow by name and refuse to hand back an invalid one.
+ *
+ * Validation runs here rather than only in `gaggle workflow validate` because
+ * the runner cannot execute a broken graph safely — a dependency cycle leaves
+ * nodes that never become runnable, and the alternative to failing here is
+ * discovering it part-way through a run.
+ */
 export function resolveWorkflow(name: string, searchPaths: string[]): WorkflowEntry {
   const { entries } = scanWorkflows(searchPaths);
   const hit = entries.find((e) => e.name === name);
   if (!hit) throw new WorkflowNotFoundError(name, entries.map((e) => e.name));
+
+  const result = validateWorkflow(hit.workflow);
+  if (!result.ok) throw new WorkflowInvalidError(name, result.errors);
+  for (const w of [...hit.warnings, ...result.warnings]) {
+    logger.warn('Workflow warning', { workflow: name, node_id: w.node_id, message: w.message });
+  }
   return hit;
 }

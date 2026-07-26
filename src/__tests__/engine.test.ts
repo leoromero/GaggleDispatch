@@ -9,6 +9,7 @@
 import { describe, expect, test, beforeEach, afterEach } from 'bun:test';
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync, existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
+import { randomUUID } from 'node:crypto';
 import { tmpdir } from 'node:os';
 import { MemoryStore } from '../executor/store/memory.ts';
 import { GaggleExecutor, WorkflowChangedError } from '../executor/engine/index.ts';
@@ -755,5 +756,147 @@ describe('events', () => {
     const exec = makeExecutor(stubAi([{ when: always, reply: { text: 'ok' } }]));
     const { runId } = await runToCompletion(exec, 'art2');
     expect(existsSync(join(artifacts, runId))).toBe(true);
+  });
+});
+
+// ── review findings: regressions ────────────────────────────────────────────
+
+describe('a graph that cannot progress fails loudly', () => {
+  test('a dependency cycle is refused at start rather than reported as success', async () => {
+    // The loop used to break on "nothing ready, nothing skipped" and then run
+    // runOutcome over an empty state map, which returns 'succeeded'. A cyclic
+    // workflow executed zero nodes and marked the Linear issue Done.
+    writeWorkflow(
+      'cyclic',
+      `name: cyclic\ndescription: d\nnodes:\n  - id: a\n    bash: "echo a"\n    depends_on: [c]\n  - id: b\n    bash: "echo b"\n    depends_on: [a]\n  - id: c\n    bash: "echo c"\n    depends_on: [b]`,
+    );
+    const exec = makeExecutor(stubAi([]));
+    await expect(
+      exec.startRun({ workflow: 'cyclic', cwd: repo, message: 'm' }, () => {}),
+    ).rejects.toThrow(/cycle/i);
+  });
+
+  test('a validation failure names the offending node', async () => {
+    writeWorkflow(
+      'dangling',
+      `name: dangling\ndescription: d\nnodes:\n  - id: a\n    prompt: "uses $ghost.output"`,
+    );
+    const exec = makeExecutor(stubAi([]));
+    await expect(
+      exec.startRun({ workflow: 'dangling', cwd: repo, message: 'm' }, () => {}),
+    ).rejects.toThrow(/ghost/);
+  });
+});
+
+describe('lease exclusivity', () => {
+  test('a run held by another executor is refused, not executed', async () => {
+    writeWorkflow('leased', `name: leased\ndescription: d\nnodes:\n  - id: a\n    prompt: "x"`);
+    let calls = 0;
+    const exec = makeExecutor(async (req) => {
+      seen.push(req);
+      calls += 1;
+      return { text: 'ok', sessionId: null, inputTokens: 0, outputTokens: 0, timedOut: false, cancelled: false } as AiResult;
+    });
+
+    const handle = await exec.startRun({ workflow: 'leased', cwd: repo, message: 'm' }, () => {});
+    await handle.done;
+    expect(calls).toBe(1);
+
+    // Another process takes the lease, then we try to resume.
+    await store.updateRun(handle.run_id, { status: 'failed' });
+    await store.acquireLease(handle.run_id, 'other-host:999', 600_000);
+
+    const resumed = await exec.resumeRun(handle.run_id, () => {});
+    await resumed.done;
+
+    // The node must not have run a second time under someone else's lease.
+    expect(calls).toBe(1);
+    expect(await statusOf(exec, handle.run_id)).toBe('failed');
+  });
+});
+
+describe('the at_most_once recovery gate', () => {
+  test('rejecting it does not re-run the node', async () => {
+    // recovery.ts parks an interrupted at_most_once node behind a synthetic
+    // gate carrying that node's id. Only approval/loop nodes used to consume a
+    // decision, so a bash node ignored the human's answer and re-ran anyway.
+    writeWorkflow(
+      'once',
+      `name: once\ndescription: d\nnodes:\n  - id: publish\n    side_effects: at_most_once\n    bash: "echo published"\n  - id: after\n    depends_on: [publish]\n    bash: "echo after"`,
+    );
+    const exec = makeExecutor(stubAi([]));
+    const handle = await exec.startRun({ workflow: 'once', cwd: repo, message: 'm' }, () => {});
+    await handle.done;
+
+    // Simulate the crash-and-park that recovery performs.
+    await store.updateRun(handle.run_id, { status: 'paused' });
+    await store.upsertNode({
+      run_id: handle.run_id, node_id: 'publish', node_type: 'bash',
+      status: 'interrupted', side_effects: 'at_most_once',
+    });
+    await store.createApproval({
+      id: randomUUID(), run_id: handle.run_id, node_id: 'publish',
+      message: 'may already have published — re-run?',
+    });
+
+    await exec.reject(handle.run_id, 'it already published');
+    await Bun.sleep(250);
+
+    const run = (await exec.getRun(handle.run_id))!;
+    expect(run.status).toBe('cancelled');
+    expect(String(run.metadata.cancel_reason)).toContain('publish');
+    // The node stayed interrupted rather than being re-executed.
+    expect((await nodeMap(exec, handle.run_id)).publish!.status).not.toBe('completed');
+  });
+
+  test('approving it lets the node run', async () => {
+    writeWorkflow(
+      'once2',
+      `name: once2\ndescription: d\nnodes:\n  - id: publish\n    side_effects: at_most_once\n    bash: "echo published"`,
+    );
+    const exec = makeExecutor(stubAi([]));
+    const handle = await exec.startRun({ workflow: 'once2', cwd: repo, message: 'm' }, () => {});
+    await handle.done;
+
+    await store.updateRun(handle.run_id, { status: 'paused' });
+    await store.upsertNode({
+      run_id: handle.run_id, node_id: 'publish', node_type: 'bash',
+      status: 'interrupted', side_effects: 'at_most_once',
+    });
+    await store.createApproval({
+      id: randomUUID(), run_id: handle.run_id, node_id: 'publish', message: 're-run?',
+    });
+
+    await exec.approve(handle.run_id, 'it never got that far');
+    await Bun.sleep(250);
+    expect(await statusOf(exec, handle.run_id)).toBe('completed');
+  });
+});
+
+describe('a gate decision survives a failed resume', () => {
+  test('an unpreparable resume leaves the gate answerable', async () => {
+    // decide() used to consume the approval before attempting the resume, so a
+    // WorkflowChangedError left the run paused forever with nothing pending.
+    writeWorkflow(
+      'gatev1',
+      `name: gatev1\ndescription: d\nnodes:\n  - id: g\n    approval:\n      message: "ok?"\n  - id: after\n    depends_on: [g]\n    prompt: "go"`,
+    );
+    const exec = makeExecutor(stubAi([{ when: always, reply: { text: 'ok' } }]));
+    const handle = await exec.startRun({ workflow: 'gatev1', cwd: repo, message: 'm' }, () => {});
+    await handle.done;
+    expect(await statusOf(exec, handle.run_id)).toBe('paused');
+
+    // The workflow changes underneath, exactly as template sync would do.
+    writeWorkflow(
+      'gatev1',
+      `name: gatev1\ndescription: d\nnodes:\n  - id: g\n    approval:\n      message: "ok? v2"\n  - id: after\n    depends_on: [g]\n    prompt: "go differently"`,
+    );
+
+    await expect(exec.approve(handle.run_id, 'yes')).rejects.toThrow(WorkflowChangedError);
+
+    // The gate is still pending, so the operator can retry once the drift is
+    // resolved rather than being stuck with an unanswerable paused run.
+    expect(await store.getPendingApproval(handle.run_id)).not.toBeNull();
+    expect(await statusOf(exec, handle.run_id)).toBe('paused');
   });
 });

@@ -84,7 +84,18 @@ export class RunPoller {
 
   private schedule(delayMs: number): void {
     if (this.stopped) return;
-    this.timer = setTimeout(() => void this.poll(), delayMs);
+    this.timer = setTimeout(() => {
+      // A rejected poll must reschedule: this is the only channel by which the
+      // orchestrator learns an adopted run's outcome, and one transient store
+      // error would otherwise silence it for good.
+      void this.poll().catch((err) => {
+        logger.warn('Run poll failed; retrying', {
+          run_id: this.runId,
+          error: (err as Error).message,
+        });
+        this.schedule(this.pollIntervalMs);
+      });
+    }, delayMs);
   }
 
   private async poll(): Promise<void> {

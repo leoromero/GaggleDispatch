@@ -3,6 +3,11 @@
  */
 
 import { describe, expect, test } from 'bun:test';
+import { existsSync } from 'node:fs';
+import { join } from 'node:path';
+import { tmpdir } from 'node:os';
+import { resolveBashPath } from '../executor/engine/shell.ts';
+import { runBash } from '../executor/engine/nodes/shell.ts';
 import type { NodeStatus } from '../executor/types.ts';
 import {
   isSettled,
@@ -383,5 +388,67 @@ describe('appendContextIfAbsent', () => {
   test('is a no-op when there is no context', () => {
     expect(appendContextIfAbsent('do work', undefined)).toBe('do work');
     expect(appendContextIfAbsent('do work', '   ')).toBe('do work');
+  });
+});
+
+// ── review finding: untrusted text must be neutralised in shell bodies ──────
+
+describe('substitute — shell injection', () => {
+  const evil = "x'; touch /tmp/pwned; echo '";
+
+  test('untrusted scalars are shell-quoted in shell bodies', () => {
+    // $ARGUMENTS carries the Linear issue title and body. The shipped Archon
+    // docs put it straight into a `bash:` node, so leaving it raw let issue
+    // text execute as shell.
+    for (const name of ['ARGUMENTS', 'USER_MESSAGE', 'CONTEXT', 'LOOP_USER_INPUT', 'REJECTION_REASON']) {
+      const r = substitute(`gh issue view $${name}`, ctx({
+        arguments: evil, context: evil, loopUserInput: evil, rejectionReason: evil,
+      }), { shellQuote: true });
+      expect(r.text, name).toBe(`gh issue view ${shellQuote(evil)}`);
+    }
+  });
+
+  test('the quoted form is inert when a real shell runs it', async () => {
+    // The definitive check: the substituted script must not execute the
+    // payload. Asserting on the string alone would pass for a quoting scheme
+    // that merely looks right.
+    const bash = resolveBashPath();
+    if (!bash) return; // covered by the string assertion above on hosts without bash
+
+    const marker = join(tmpdir(), `gaggle-inject-${Date.now()}.txt`).replace(/\\/g, '/');
+    const payload = `x'; touch '${marker}'; echo '`;
+    const script = substitute('echo $ARGUMENTS', ctx({ arguments: payload }), {
+      shellQuote: true,
+    }).text;
+
+    const out = await runBash({
+      script,
+      cwd: tmpdir(),
+      env: process.env as Record<string, string>,
+      timeoutMs: 15_000,
+      bashPath: bash,
+    });
+
+    expect(out.exit_code).toBe(0);
+    expect(existsSync(marker)).toBe(false);
+    // The payload came back as literal text, which is the whole point.
+    expect(out.stdout).toBe(payload);
+  });
+
+  test('engine-controlled paths are left raw so quoted usage still works', () => {
+    // Templates write "$ARTIFACTS_DIR/notes.md"; quoting would embed literal
+    // quote characters into the middle of a path.
+    const r = substitute('cat "$ARTIFACTS_DIR/notes.md"', ctx(), { shellQuote: true });
+    expect(r.text).toBe('cat "/artifacts/run-1/notes.md"');
+  });
+
+  test('prompts are never shell-quoted', () => {
+    const r = substitute('The task: $ARGUMENTS', ctx({ arguments: evil }), { shellQuote: false });
+    expect(r.text).toBe(`The task: ${evil}`);
+  });
+
+  test('node output stays quoted, as before', () => {
+    const c = ctx({ nodeOutputs: new Map([['a', { text: evil }]]) });
+    expect(substitute('echo $a.output', c, { shellQuote: true }).text).toBe(`echo ${shellQuote(evil)}`);
   });
 });

@@ -299,17 +299,25 @@ export class GaggleExecutor implements WorkflowExecutor {
       return;
     }
 
-    await this.store.decideApproval(pending.id, decision, comment);
-    await this.store.appendEvent(runId, `gate_${decision}`, pending.node_id, { comment });
-
-    const handle = await this.resumeWithDecision(runId, {
+    // Build the resumed runner *before* recording the decision. Preparing can
+    // fail — most reachably with WorkflowChangedError, since template sync
+    // rewrites the same checkout the workflow is read from — and consuming the
+    // gate first would leave the run paused forever with nothing left to
+    // approve.
+    const prepared = await this.prepareResume(runId, () => {}, {}, {
       node_id: pending.node_id,
       decision,
       comment,
       rework_attempts: pending.rework_attempts,
     });
+
+    await this.store.decideApproval(pending.id, decision, comment);
+    await this.store.appendEvent(runId, `gate_${decision}`, pending.node_id, { comment });
+
+    const handle = this.launch(runId, prepared.runner);
     // Resumption runs in the background; the caller is a webhook or a poll
-    // tick and should not block for the rest of the workflow.
+    // tick and should not block for the rest of the workflow. Failures are
+    // logged inside launch().
     void handle.done;
   }
 
@@ -329,14 +337,15 @@ export class GaggleExecutor implements WorkflowExecutor {
   ): Promise<RunHandle | null> {
     const pending = await this.store.getPendingApproval(runId);
     if (!pending) return null;
-    await this.store.decideApproval(pending.id, 'approved', comment ?? null);
-    await this.store.appendEvent(runId, 'gate_approved', pending.node_id, { comment });
+    // Prepare first, decide second — see `decide()` for why.
     const { runner } = await this.prepareResume(runId, onEvent, {}, {
       node_id: pending.node_id,
       decision: 'approved',
       comment: comment ?? null,
       rework_attempts: pending.rework_attempts,
     });
+    await this.store.decideApproval(pending.id, 'approved', comment ?? null);
+    await this.store.appendEvent(runId, 'gate_approved', pending.node_id, { comment });
     return this.launch(runId, runner);
   }
 

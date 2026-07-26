@@ -652,7 +652,19 @@ export class Orchestrator {
         return;
       }
       session.cancel = () => void this.executorClient.cancelRun(handle.run_id, 'cancelled');
-    })();
+    })().catch((err) => {
+      // Without this the session sits in state.running forever, holding a
+      // concurrency slot for a run that never started.
+      logger.error('Approve-and-resume failed', {
+        issue_id: parentIssue.id,
+        repo_alias: target.repo_alias,
+        run_id: runId,
+        error: (err as Error).message,
+      });
+      void this.handleWorkerExit(
+        parentIssue, target, { type: 'run_failed', exit_code: 97 }, attempt,
+      );
+    });
   }
 
   /** Poll-loop recovery path: dispatch a sub-issue that has no gaggle labels (e.g. crash before label was applied). */

@@ -22,7 +22,7 @@ import type { NodeStatus, RunEvent, RunEventHandler, SideEffects } from '../type
 import type { Store } from '../store/types.ts';
 import { evaluateCondition } from './conditions.ts';
 import { CommandResolver } from './commands.ts';
-import { plan, runOutcome, type NodeStateMap } from './planner.ts';
+import { isSettled, plan, runOutcome, type NodeStateMap } from './planner.ts';
 import { runBash, runScript, type ShellOutcome } from './nodes/shell.ts';
 import type { AiRunner } from './provider/claude.ts';
 import type { WorkflowDef, WorkflowNode } from './schema.ts';
@@ -142,9 +142,6 @@ export class WorkflowRunner {
   private stopped: RunnerStop | null = null;
   private heartbeat: ReturnType<typeof setInterval> | null = null;
   private runDeadline: ReturnType<typeof setTimeout> | null = null;
-  /** Feedback for the next loop iteration, consumed exactly once. */
-  private pendingLoopInput: string | null = null;
-  private pendingRejectionReason: string | null = null;
   private pendingDecision: PendingDecision | null = null;
 
   constructor(deps: RunnerDeps, ctx: RunnerContext, onEvent: RunEventHandler) {
@@ -159,11 +156,10 @@ export class WorkflowRunner {
    * Set before `run()`; the gate node consumes it instead of parking again.
    */
   primeDecision(decision: PendingDecision): void {
+    // A loop gate's comment becomes the next iteration's `$LOOP_USER_INPUT`;
+    // executeLoop reads it off the decision, so there is no instance-level
+    // "pending input" for a concurrent node to consume by mistake.
     this.pendingDecision = decision;
-    if (decision.decision === 'approved' && decision.comment) {
-      // A loop gate's comment is the next iteration's `$LOOP_USER_INPUT`.
-      this.pendingLoopInput = decision.comment;
-    }
   }
 
   cancel(reason = 'cancelled by caller'): void {
@@ -345,15 +341,16 @@ export class WorkflowRunner {
     }
   }
 
-  private async executeAi(node: WorkflowNode, promptText: string): Promise<NodeResult> {
+  private async executeAi(
+    node: WorkflowNode,
+    promptText: string,
+    // Passed per call rather than held on the instance: nodes run
+    // concurrently, and instance-level "pending" values would be consumed by
+    // whichever node happened to expand its prompt first.
+    extras: { loopUserInput?: string; rejectionReason?: string } = {},
+  ): Promise<NodeResult> {
     const prompt = appendContextIfAbsent(
-      this.expand(promptText, {
-        shell: false,
-        extra: {
-          loopUserInput: this.pendingLoopInput ?? undefined,
-          rejectionReason: this.pendingRejectionReason ?? undefined,
-        },
-      }),
+      this.expand(promptText, { shell: false, extra: extras }),
       this.ctx.issueContext,
     );
 
@@ -435,6 +432,28 @@ export class WorkflowRunner {
   }
 
   private async executeNodeOnce(node: WorkflowNode): Promise<NodeResult> {
+    // A decision may target a node that is not itself a gate: startup recovery
+    // parks an interrupted `at_most_once` node behind a synthetic gate carrying
+    // that node's id. Only approval and loop nodes consume decisions in their
+    // own bodies, so without this every other node type would ignore the
+    // human's answer and simply re-run — which is precisely what the marker
+    // exists to prevent.
+    if (node.type !== 'approval' && node.type !== 'loop') {
+      const decision = this.takeDecisionFor(node.id);
+      if (decision?.decision === 'rejected') {
+        return {
+          status: 'cancelled',
+          output: '',
+          cancel: {
+            reason: `not re-running '${node.id}' after interruption: ${
+              decision.comment ?? 'rejected by operator'
+            }`,
+          },
+        };
+      }
+      // An approval means "run it anyway", so fall through.
+    }
+
     switch (node.type) {
       case 'bash':
         return this.executeBash(node);
@@ -474,12 +493,20 @@ export class WorkflowRunner {
 
     if (!decision) {
       const message = this.expand(cfg.message, { shell: false });
-      await this.deps.store.createApproval({
-        id: randomUUID(),
-        run_id: this.ctx.runId,
-        node_id: node.id,
-        message,
-      });
+      // At most one pending gate per run — the store enforces it with a
+      // partial unique index. Two gates reaching this concurrently is possible
+      // when they sit in the same layer, and the second must not throw: the
+      // run is stopping either way, and the first gate is the one the human
+      // will answer.
+      const existing = await this.deps.store.getPendingApproval(this.ctx.runId);
+      if (!existing) {
+        await this.deps.store.createApproval({
+          id: randomUUID(),
+          run_id: this.ctx.runId,
+          node_id: node.id,
+          message,
+        });
+      }
       return { status: 'completed', output: '', pause: { message } };
     }
 
@@ -506,8 +533,7 @@ export class WorkflowRunner {
     }
 
     // Run the rework prompt, then park at the same gate again.
-    this.pendingRejectionReason = reason;
-    const rework = await this.executeAi(node, cfg.on_reject.prompt);
+    const rework = await this.executeAi(node, cfg.on_reject.prompt, { rejectionReason: reason });
     if (rework.status === 'failed') return rework;
 
     const message = this.expand(cfg.message, { shell: false });
@@ -544,7 +570,7 @@ export class WorkflowRunner {
     let lastOutput = prior[prior.length - 1]?.output ?? '';
 
     // Only the first iteration after a gate sees the human's feedback.
-    let loopInput = this.takeLoopInput();
+    let loopInput: string | null = null;
     const decision = this.takeDecisionFor(node.id);
     if (decision?.decision === 'rejected') {
       return {
@@ -565,6 +591,7 @@ export class WorkflowRunner {
         this.expand(cfg.prompt, { shell: false, extra: { loopUserInput: loopInput ?? undefined } }),
         this.ctx.issueContext,
       );
+      // Consumed: only the first iteration after a gate sees the feedback.
       loopInput = null;
 
       const res = await this.deps.ai({
@@ -612,12 +639,15 @@ export class WorkflowRunner {
 
       if (cfg.interactive) {
         const message = this.expand(cfg.gate_message ?? '', { shell: false });
-        await this.deps.store.createApproval({
-          id: randomUUID(),
-          run_id: this.ctx.runId,
-          node_id: node.id,
-          message,
-        });
+        const existing = await this.deps.store.getPendingApproval(this.ctx.runId);
+        if (!existing) {
+          await this.deps.store.createApproval({
+            id: randomUUID(),
+            run_id: this.ctx.runId,
+            node_id: node.id,
+            message,
+          });
+        }
         return { status: 'completed', output: lastOutput, pause: { message } };
       }
     }
@@ -702,13 +732,32 @@ export class WorkflowRunner {
     const byId = new Map(this.ctx.workflow.nodes.map((n) => [n.id, n]));
     mkdirSync(this.ctx.artifactsDir, { recursive: true });
 
-    await this.deps.store.acquireLease(this.ctx.runId, LEASE_OWNER, this.deps.config.leaseTtlMs);
+    // Refuse to execute a run another process is driving. Two runners on one
+    // run would interleave node writes and re-execute everything the other has
+    // not finished yet — including `at_most_once` nodes.
+    const leased = await this.deps.store.acquireLease(
+      this.ctx.runId,
+      LEASE_OWNER,
+      this.deps.config.leaseTtlMs,
+    );
+    if (!leased) {
+      const stop: RunnerStop = {
+        kind: 'failed',
+        error: 'run is leased by another executor',
+      };
+      logger.warn('Refusing to run: lease held elsewhere', { run_id: this.ctx.runId });
+      this.stopped = stop;
+      return stop;
+    }
+
     await this.deps.store.updateRun(this.ctx.runId, { status: 'running' });
     this.startLeaseHeartbeat();
     this.emit({ type: 'run_started', run_id: this.ctx.runId });
     await this.deps.store.appendEvent(this.ctx.runId, 'run_started', null);
 
     const inFlight = new Map<string, Promise<void>>();
+    /** Nodes that never became runnable — populated only on a stuck graph. */
+    let deadlocked: string[] = [];
 
     try {
       for (;;) {
@@ -742,10 +791,18 @@ export class WorkflowRunner {
         }
 
         if (inFlight.size === 0) {
-          // Nothing running and nothing newly startable: either the graph is
-          // done or the last plan only produced skips, which the next
-          // iteration will observe.
-          if (step.ready.length === 0 && step.skip.length === 0) break;
+          if (step.finished) break;
+          if (step.ready.length === 0 && step.skip.length === 0) {
+            // Nothing running, nothing startable, yet the planner says work
+            // remains: the graph cannot progress. A cycle does this — the
+            // validator rejects those, but a runner that silently reported
+            // success here would mark the Linear issue Done having executed
+            // nothing at all.
+            deadlocked = [...this.ctx.workflow.nodes]
+              .filter((n) => !isSettled(this.states.get(n.id) ?? 'pending'))
+              .map((n) => n.id);
+            break;
+          }
           continue;
         }
 
@@ -756,17 +813,39 @@ export class WorkflowRunner {
       await Promise.allSettled(inFlight.values());
 
       if (!this.stopped) {
-        const outcome = runOutcome(this.states);
-        this.stopped =
-          outcome === 'succeeded'
-            ? { kind: 'succeeded' }
-            : outcome === 'cancelled'
-              ? { kind: 'cancelled', reason: 'a node cancelled the run' }
-              : { kind: 'failed', error: this.firstFailure() ?? 'a node failed' };
+        if (deadlocked.length > 0) {
+          this.stopped = {
+            kind: 'failed',
+            error:
+              `the graph cannot progress — ${deadlocked.length} node(s) never became ` +
+              `runnable: ${deadlocked.join(', ')}. This usually means a dependency cycle.`,
+          };
+        } else {
+          const outcome = runOutcome(this.states);
+          this.stopped =
+            outcome === 'succeeded'
+              ? { kind: 'succeeded' }
+              : outcome === 'cancelled'
+                ? { kind: 'cancelled', reason: 'a node cancelled the run' }
+                : { kind: 'failed', error: this.firstFailure() ?? 'a node failed' };
+        }
       }
 
       await this.finalize(this.stopped);
       return this.stopped;
+    } catch (err) {
+      // A store error must not skip finalize: without a terminal status the run
+      // row stays `running` forever and the orchestrator's slot never frees.
+      const stop: RunnerStop = { kind: 'failed', error: `run loop failed: ${(err as Error).message}` };
+      logger.error('Run loop threw', { run_id: this.ctx.runId, error: (err as Error).message });
+      this.stopped = stop;
+      await this.finalize(stop).catch((e) =>
+        logger.error('Could not finalize a failed run', {
+          run_id: this.ctx.runId,
+          error: (e as Error).message,
+        }),
+      );
+      return stop;
     } finally {
       this.stopLeaseHeartbeat();
       await this.deps.store.releaseLease(this.ctx.runId, LEASE_OWNER).catch(() => {});
@@ -807,7 +886,10 @@ export class WorkflowRunner {
     }
 
     if (result.cancel) {
-      await this.record(node, 'completed', {
+      // A `cancel:` node reports 'completed' — it did its job. A node refused
+      // by an at_most_once decision reports 'cancelled', because recording it
+      // completed would claim the side effect ran.
+      await this.record(node, result.status, {
         output: '',
         completed_at: new Date().toISOString(),
       });
@@ -890,17 +972,6 @@ export class WorkflowRunner {
         });
         break;
     }
-  }
-
-  /**
-   * Consumed exactly once, so only the first iteration after a gate sees the
-   * human's feedback — later iterations in the same resumed run see empty,
-   * which is the documented `$LOOP_USER_INPUT` behaviour.
-   */
-  private takeLoopInput(): string | null {
-    const v = this.pendingLoopInput;
-    this.pendingLoopInput = null;
-    return v;
   }
 
   /** Node states as the runner currently sees them. For assertions in tests. */
