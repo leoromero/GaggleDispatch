@@ -25,7 +25,8 @@ export interface HubConfig {
   workspaces: HubWorkspaceEntry[];
   ui: HubUiConfig;
   /** Optional override for the history DB location. */
-  history_db?: string;
+  /** Postgres for hub history. Defaults to $DATABASE_URL. */
+  database_url?: string;
 }
 
 const DEFAULT_CONFIG: HubConfig = {
@@ -67,7 +68,6 @@ export function loadHubConfig(path = defaultHubConfigPath()): HubConfig {
       port: parsed.ui?.port ?? DEFAULT_CONFIG.ui.port,
       host: parsed.ui?.host ?? DEFAULT_CONFIG.ui.host,
     },
-    history_db: parsed.history_db ? String(parsed.history_db) : undefined,
   };
 }
 

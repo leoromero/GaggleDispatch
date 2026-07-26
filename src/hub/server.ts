@@ -12,7 +12,8 @@ import { extname, join } from 'node:path';
 import type { Server, ServerWebSocket } from 'bun';
 import type { HubConfig } from './config.ts';
 import { HubProcessManager } from './process-manager.ts';
-import { HistoryDb, defaultHistoryDbPath } from './history.ts';
+import { HistoryDb } from './history.ts';
+import { PostgresStore } from '../executor/store/postgres.ts';
 import { logger } from '../util/logger.ts';
 
 interface DashWsData {
@@ -53,25 +54,29 @@ export interface HubServerHandle {
   stop: () => Promise<void>;
 }
 
-export function startHubServer(opts: HubServerOptions): HubServerHandle {
-  const dbPath = opts.cfg.history_db || defaultHistoryDbPath();
-  const db = new HistoryDb(dbPath);
+export async function startHubServer(opts: HubServerOptions): Promise<HubServerHandle> {
+  const databaseUrl = opts.cfg.database_url || process.env.DATABASE_URL || '';
+  const store = new PostgresStore(databaseUrl, { maxConnections: 5 });
+  await store.migrate();
+  const db = new HistoryDb(store);
 
-  // Ensure every configured workspace is recorded in the DB.
+  // Ensure every configured workspace is recorded.
   const wsRowByName = new Map<string, number>();
   for (const w of opts.cfg.workspaces) {
-    const row = db.upsertWorkspace(w.name, w.path, w.color ?? null);
+    const row = await db.upsertWorkspace(w.name, w.path, w.color ?? null);
     wsRowByName.set(w.name, row.id);
   }
 
   // Periodic log retention pass.
   const pruneTimer = setInterval(() => {
-    try {
-      const removed = db.pruneOldLogs();
-      if (removed > 0) logger.debug('Pruned old log events', { removed });
-    } catch (e) {
-      logger.warn('Log retention pass failed', { error: (e as Error).message });
-    }
+    void (async () => {
+      try {
+        const removed = await db.pruneOldLogs();
+        if (removed > 0) logger.debug('Pruned old log events', { removed });
+      } catch (e) {
+        logger.warn('Log retention pass failed', { error: (e as Error).message });
+      }
+    })();
   }, 60 * 60 * 1000);
 
   // Dashboard clients (websocket subscribers).
@@ -112,8 +117,9 @@ export function startHubServer(opts: HubServerOptions): HubServerHandle {
   function recordLog(workspaceName: string, ev: { ts: string; level: string; message: string; context: Record<string, unknown> }): void {
     const wsId = wsRowByName.get(workspaceName);
     if (!wsId) return;
-    try {
-      db.appendLog({
+    void (async () => {
+      try {
+      await db.appendLog({
         workspace_id: wsId,
         ts: ev.ts,
         level: ev.level,
@@ -123,9 +129,10 @@ export function startHubServer(opts: HubServerOptions): HubServerHandle {
         repo_alias: (ev.context?.repo_alias as string) ?? null,
         fields: ev.context ?? null,
       });
-    } catch (e) {
-      logger.warn('Failed to persist log event', { error: (e as Error).message });
-    }
+      } catch (e) {
+        logger.warn('Failed to persist log event', { error: (e as Error).message });
+      }
+    })();
   }
 
   function diffGates(workspaceName: string, state: { supervised_gates?: Array<{ worker_key: string; issue_id: string; repo_alias: string; run_id: string | null; gate_message: string; paused_at: number }> }): void {
@@ -141,7 +148,7 @@ export function startHubServer(opts: HubServerOptions): HubServerHandle {
         const paused_at = new Date(g.paused_at).toISOString();
         known.set(g.worker_key, { paused_at, message: g.gate_message });
         try {
-          db.recordGate({
+          void db.recordGate({
             workspace_id: wsId,
             issue_id: g.issue_id,
             repo_alias: g.repo_alias,
@@ -314,7 +321,7 @@ export function startHubServer(opts: HubServerOptions): HubServerHandle {
         const wsName = url.searchParams.get('workspace');
         const limit = Number(url.searchParams.get('limit') ?? 50);
         const wsId = wsName ? wsRowByName.get(wsName) ?? null : null;
-        return Response.json({ runs: db.recentRuns(wsId, limit) });
+        return Response.json({ runs: await db.recentRuns(wsId, limit) });
       }
       if (url.pathname === '/api/history/logs') {
         const wsName = url.searchParams.get('workspace');
@@ -325,7 +332,7 @@ export function startHubServer(opts: HubServerOptions): HubServerHandle {
         const repo = url.searchParams.get('repo') ?? undefined;
         const limit = Number(url.searchParams.get('limit') ?? 200);
         return Response.json({
-          logs: db.queryLogs({
+          logs: await db.queryLogs({
             workspace_id: wsId,
             since,
             level,
@@ -338,13 +345,13 @@ export function startHubServer(opts: HubServerOptions): HubServerHandle {
       if (url.pathname === '/api/history/gates') {
         const wsName = url.searchParams.get('workspace');
         const wsId = wsName ? wsRowByName.get(wsName) ?? null : null;
-        return Response.json({ gates: db.recentGateEvents(wsId, 50) });
+        return Response.json({ gates: await db.recentGateEvents(wsId, 50) });
       }
       if (url.pathname === '/api/history/tokens') {
         const wsName = url.searchParams.get('workspace');
         const wsId = wsName ? wsRowByName.get(wsName) ?? null : null;
         const days = Number(url.searchParams.get('days') ?? 30);
-        return Response.json({ tokens: db.tokenHistory(wsId, days) });
+        return Response.json({ tokens: await db.tokenHistory(wsId, days) });
       }
       return serveStatic(url.pathname);
     },
@@ -383,6 +390,7 @@ export function startHubServer(opts: HubServerOptions): HubServerHandle {
       }
       server.stop(true);
       db.close();
+      void store.close();
     },
   };
 }

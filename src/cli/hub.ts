@@ -135,7 +135,7 @@ export async function runNestStart(opts: { only?: string[] }): Promise<void> {
 
   // Start hub server.
   const dashboardDir = resolveDashboardDir();
-  const hub = startHubServer({ cfg, manager, dashboardDir });
+  const hub = await startHubServer({ cfg, manager, dashboardDir });
   console.log(chalk.green(`✓ Nest dashboard at ${hub.url}`));
 
   let shuttingDown = false;

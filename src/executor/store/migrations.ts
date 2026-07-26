@@ -216,7 +216,10 @@ CREATE TABLE hub_runs (
   status            TEXT NOT NULL,
   tokens_in         INT NOT NULL DEFAULT 0,
   tokens_out        INT NOT NULL DEFAULT 0,
-  turn_count        INT NOT NULL DEFAULT 0
+  turn_count        INT NOT NULL DEFAULT 0,
+  -- The SQLite original used INSERT OR IGNORE against this natural key so a
+  -- duplicate start event could not create a second row.
+  UNIQUE (workspace_id, issue_id, repo_alias, started_at)
 );
 CREATE INDEX idx_hub_runs_ws ON hub_runs (workspace_id, started_at DESC);
 
@@ -241,17 +244,18 @@ CREATE TABLE hub_gate_events (
   repo_alias   TEXT NOT NULL,
   run_id       TEXT,
   action       TEXT NOT NULL CHECK (action IN ('paused','approved','rejected','timed_out')),
-  message      TEXT,
-  ts           TIMESTAMPTZ NOT NULL DEFAULT now()
+  gate_message TEXT,
+  paused_at    TIMESTAMPTZ NOT NULL,
+  resolved_at  TIMESTAMPTZ
 );
-CREATE INDEX idx_hub_gates_ws ON hub_gate_events (workspace_id, ts DESC);
+CREATE INDEX idx_hub_gates_ws ON hub_gate_events (workspace_id, paused_at DESC);
 
 CREATE TABLE hub_token_daily (
   workspace_id BIGINT NOT NULL REFERENCES hub_workspaces(id) ON DELETE CASCADE,
-  day          DATE NOT NULL,
+  date         DATE NOT NULL,
   tokens_in    BIGINT NOT NULL DEFAULT 0,
   tokens_out   BIGINT NOT NULL DEFAULT 0,
-  PRIMARY KEY (workspace_id, day)
+  PRIMARY KEY (workspace_id, date)
 );
 `;
 
