@@ -390,37 +390,8 @@ describe('LinearClient error handling', () => {
   });
 });
 
-describe('LinearClient.fetchIssuesByLabel', () => {
-  test('queries labels filter and normalizes', async () => {
-    const c = makeClient();
-    enqueue(...teamResolution());
-    enqueue({
-      data: {
-        issues: {
-          nodes: [
-            {
-              id: 'i1',
-              identifier: 'SYM-1',
-              title: '[repo-a] X',
-              description: null,
-              priority: null,
-              url: null,
-              state: { name: 'In Progress' },
-              labels: { nodes: [{ name: 'gaggle:running' }] },
-              parent: { id: 'parent-1' },
-              createdAt: null,
-              updatedAt: null,
-              inverseRelations: { nodes: [] },
-            },
-          ],
-        },
-      },
-    });
-    const r = await c.fetchIssuesByLabel('gaggle:running');
-    expect(r.length).toBe(1);
-    expect(r[0]!.parent_id).toBe('parent-1');
-  });
-});
+// The `fetchIssuesByLabel` suite is gone with the method — see the note in
+// linear.ts. Labels are a one-way mirror now and nothing queries by them.
 
 describe('LinearClient.ensureGaggleLabels', () => {
   test('creates all eight labels when none exist', async () => {

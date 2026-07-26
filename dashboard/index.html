@@ -16,20 +16,34 @@
       <div class="stats">
         <span id="slots-stat" class="stat">—</span>
         <span id="tokens-stat" class="stat">—</span>
+        <button id="btn-sync" class="nest-btn" title="Import new tickets from the tracker now">⟳ Sync</button>
         <a id="archon-chip" class="stat archon-chip" target="_blank" rel="noopener" title="Archon UI"></a>
         <span id="conn-stat" class="stat conn">●</span>
       </div>
     </header>
 
     <main>
-      <section id="pipeline-panel" class="panel">
-        <h2>Pipeline</h2>
-        <div id="pipeline-summary" class="pipeline-summary"></div>
-        <div id="pipeline-list" class="pipeline-list"></div>
+      <section id="gates-panel" class="panel full hidden">
+        <div class="panel-header">
+          <h2>Waiting for you</h2>
+          <span id="gates-count" class="stat"></span>
+        </div>
+        <div id="gates-list" class="gates-list"></div>
+      </section>
+
+      <section id="board-panel" class="panel full">
+        <div class="panel-header">
+          <h2>Tickets</h2>
+          <div class="board-controls">
+            <div id="board-filters" class="board-filters"></div>
+            <input id="board-search" type="text" placeholder="filter tickets…" />
+          </div>
+        </div>
+        <div id="board-list" class="board-list"></div>
       </section>
 
       <section id="workers-panel" class="panel wide">
-        <h2>Workers</h2>
+        <h2>Running now</h2>
         <div id="workers-list" class="workers-list"></div>
       </section>
 

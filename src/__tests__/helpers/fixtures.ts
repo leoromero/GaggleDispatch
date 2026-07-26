@@ -121,6 +121,8 @@ export function makeServiceConfig(overrides: Partial<ServiceConfig> = {}): Servi
         redirect_uri: '',
         scopes: [],
       },
+      mirror_labels: false,
+      outbox_max_attempts: 5,
     },
     polling: { interval_ms: 30_000 },
     workspace: { root: '/tmp/aux' },
@@ -141,6 +143,7 @@ export function makeServiceConfig(overrides: Partial<ServiceConfig> = {}): Servi
       gate_timeout_ms: 0,
       startup_cleanup_age_days: 0,
     },
+    database: { url: '', max_connections: 0 },
     claude: {
       api_key: '',
       analyzer_model: 'claude-sonnet-4-5',

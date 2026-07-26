@@ -13,6 +13,7 @@ import type {
   AgentConfig,
   AuthConfig,
   ClaudeConfig,
+  DatabaseConfig,
   HooksConfig,
   PollingConfig,
   RegistryConfig,
@@ -218,6 +219,10 @@ export function buildServiceConfig(def: WorkflowDefinition): ServiceConfig {
     pr_ready_state: asOptionalString(trackerRaw.pr_ready_state, 'tracker.pr_ready_state'),
     gaggle_labels,
     auth: parseAuthConfig(trackerRaw.auth),
+    // Off by default: the control plane is the state machine, so labels are a
+    // courtesy for humans reading the tracker, not an input.
+    mirror_labels: asBool(trackerRaw.mirror_labels, 'tracker.mirror_labels', false),
+    outbox_max_attempts: asPositiveInt(trackerRaw.outbox_max_attempts, 'tracker.outbox_max_attempts', 5),
   };
 
   // ── polling ──────────────────────────────────────────────────────────────
@@ -268,6 +273,21 @@ export function buildServiceConfig(def: WorkflowDefinition): ServiceConfig {
     default_workflow: asString(archonRaw.default_workflow, 'archon.default_workflow', 'gaggle/gaggle-fix-issue'),
     gate_timeout_ms: asInt(archonRaw.gate_timeout_ms, 'archon.gate_timeout_ms', 0),
     startup_cleanup_age_days: asInt(archonRaw.startup_cleanup_age_days, 'archon.startup_cleanup_age_days', 7),
+  };
+
+  // ── database ─────────────────────────────────────────────────────────────
+  // One key names the shared database. `executor.database_url` is accepted as an
+  // alias because the workflow-engine branch introduced that name; whichever the
+  // operator has written, both halves resolve to the same connection.
+  const databaseRaw = asObject(root.database, 'database');
+  const executorRaw = asObject(root.executor, 'executor');
+  const databaseUrlRaw =
+    asOptionalString(databaseRaw.url, 'database.url') ??
+    asOptionalString(executorRaw.database_url, 'executor.database_url') ??
+    '$DATABASE_URL';
+  const database: DatabaseConfig = {
+    url: resolveSecretOrLiteral(databaseUrlRaw),
+    max_connections: asInt(databaseRaw.max_connections, 'database.max_connections', 0),
   };
 
   // ── claude ───────────────────────────────────────────────────────────────
@@ -363,6 +383,7 @@ export function buildServiceConfig(def: WorkflowDefinition): ServiceConfig {
     hooks,
     agent,
     archon,
+    database,
     claude,
     workflow_templates,
     registry,

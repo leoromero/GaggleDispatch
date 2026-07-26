@@ -98,13 +98,21 @@ export async function runStart(opts: {
 
   const syncer = startPeriodicSyncer(cfg);
 
-  const orchestrator = new Orchestrator({ cfg, tracker, analyzer, workspace, registry, syncer });
+  const workspaceName = opts.workspaceName ?? basename(cfg.project_dir);
+  const orchestrator = new Orchestrator({
+    cfg,
+    tracker,
+    analyzer,
+    workspace,
+    registry,
+    syncer,
+    workspaceName,
+  });
 
-  // Hot-reload WORKFLOW.md template body (full reload would be more invasive; we
-  // surface a warning and recommend restart for full config changes).
+  // Hot-reload WORKFLOW.md template body (a full reload would be more invasive;
+  // we surface a warning and recommend a restart for config changes).
   const wfWatch = watchFile(cfg.workflow_md_path, () => {
     logger.warn('WORKFLOW.md changed on disk. Restart `gaggle start` to apply config changes.');
-    orchestrator.invalidateAnalysisCache();
   });
 
   // Optional local HTTP API server (used by the hub or when running standalone
@@ -113,9 +121,13 @@ export async function runStart(opts: {
   const apiHandle = wantApi
     ? startGaggleApi({
         port: opts.apiPort ?? 0,
-        workspaceName: opts.workspaceName ?? basename(cfg.project_dir),
+        workspaceName,
         getState: () => orchestrator.getState(),
-        onRedispatch: (issue_id, repo_alias) => orchestrator.redispatch(issue_id, repo_alias),
+        // Read lazily: the control plane opens during `orchestrator.start()`,
+        // which happens after the API is already listening.
+        control: () => orchestrator.controlApi(),
+        onRedispatch: (target_id) => orchestrator.redispatch(target_id),
+        onSync: () => orchestrator.syncNow(),
       })
     : null;
 

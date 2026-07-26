@@ -74,6 +74,9 @@ export class HubProcessManager {
       this.workspaces.set(entry.name, {
         entry,
         process: null,
+        // An adopted gaggle was not stopped by us, so it is eligible for the
+        // supervisor's restart handling like any other running workspace.
+        manualStopped: false,
         api_url: sidecar.api_url,
         api_port: sidecar.api_port,
         pid: sidecar.pid,

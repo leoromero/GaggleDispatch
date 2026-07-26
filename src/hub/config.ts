@@ -42,6 +42,11 @@ export interface HubConfig {
   ui: HubUiConfig;
   archon: HubArchonConfig;
   /** Optional override for the history DB location. */
+  /**
+   * @deprecated Ignored. History moved into the shared Postgres database
+   * (migrations 200–299), so there is no separate file to point at. Kept only so
+   * an existing hub.yaml still parses.
+   */
   history_db?: string;
 }
 

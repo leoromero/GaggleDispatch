@@ -71,105 +71,94 @@ export async function runStatus(opts: { cwd?: string; json?: boolean }): Promise
 }
 
 /** `gaggle ps` — query Linear gaggle labels to show live orchestrator state. */
-export async function runPs(opts: { cwd?: string }): Promise<void> {
+/**
+ * `gaggle ps` — what the control plane is doing.
+ *
+ * This used to fan out over `fetchIssuesByLabel` and reconstruct state from
+ * whichever `gaggle:*` labels happened to be on each issue, which meant it
+ * reported a projection and could disagree with reality. It now reads the same
+ * board the dashboard does, so it needs no tracker credentials and works with
+ * every gaggle process stopped.
+ */
+export async function runPs(opts: { cwd?: string; json?: boolean }): Promise<void> {
   const cfg = loadConfig({ cwd: opts.cwd });
-
-  let tracker: LinearClient;
-  try {
-    if (cfg.tracker.auth.mode === 'oauth') {
-      const oauthMod = await import('../tracker/linear-auth.ts');
-      const auth = new oauthMod.OAuthAuth({
-        client_id: cfg.tracker.auth.client_id,
-        client_secret: cfg.tracker.auth.client_secret,
-      });
-      if (!auth.hasTokens()) {
-        console.error(chalk.red('✗ Linear OAuth tokens not found. Run `gaggle init` or `gaggle auth linear`.'));
-        process.exit(1);
-      }
-      tracker = new LinearClient(cfg, auth);
-    } else {
-      const { ApiKeyAuth } = await import('../tracker/linear-auth.ts');
-      tracker = new LinearClient(cfg, new ApiKeyAuth(cfg.tracker.api_key));
-    }
-  } catch (err) {
-    console.error(chalk.red(`✗ Cannot connect to Linear: ${(err as Error).message}`));
+  if (!cfg.database.url) {
+    console.error(chalk.red('✗ No database configured. Set DATABASE_URL and run `gaggle doctor`.'));
     process.exit(1);
   }
 
-  const labels = cfg.tracker.gaggle_labels;
-  const labelDefs = [
-    { key: 'claimed',       name: labels.claimed,       color: chalk.blue,   badge: 'CLAIMED'  },
-    { key: 'running',       name: labels.running,       color: chalk.green,  badge: 'RUNNING'  },
-    { key: 'queued',        name: labels.queued,        color: chalk.yellow, badge: 'QUEUED'   },
-    { key: 'waiting_human', name: labels.waiting_human, color: chalk.red,    badge: 'WAITING'  },
-  ] as const;
+  const { openControlReadPlane } = await import('../control/index.ts');
+  const plane = await openControlReadPlane({ cfg });
+  try {
+    const rows = await plane.store.board({
+      status: ['analysis_requested', 'analyzing', 'analyzed', 'analysis_failed', 'running'],
+    });
 
-  const allIssues: Map<string, { issue: Awaited<ReturnType<typeof tracker.fetchIssuesByLabel>>[number]; badges: string[] }> = new Map();
-
-  for (const def of labelDefs) {
-    let issues: Awaited<ReturnType<typeof tracker.fetchIssuesByLabel>>;
-    try {
-      issues = await tracker.fetchIssuesByLabel(def.name);
-    } catch (err) {
-      console.error(chalk.red(`✗ Failed to fetch ${def.name}: ${(err as Error).message}`));
-      continue;
+    if (opts.json) {
+      console.log(JSON.stringify({ tickets: rows }, null, 2));
+      return;
     }
-    for (const issue of issues) {
-      const entry = allIssues.get(issue.id) ?? { issue, badges: [] };
-      entry.badges.push(def.badge);
-      allIssues.set(issue.id, entry);
+
+    console.log(chalk.bold('\nGaggleDispatch — control plane'));
+    console.log('─'.repeat(76));
+
+    if (rows.length === 0) {
+      console.log(chalk.gray('  Nothing in flight.'));
+      console.log(chalk.gray('  Import tickets, then press Analyze and Start in the dashboard.\n'));
+      return;
     }
-  }
 
-  console.log(chalk.bold('\nGaggleDispatch — Live Orchestrator State'));
-  console.log('─'.repeat(70));
-
-  if (allIssues.size === 0) {
-    console.log(chalk.gray('  No active gaggle issues found in Linear.'));
-    console.log(chalk.gray('  (nothing is claimed, running, queued, or waiting for human input)\n'));
-    return;
-  }
-
-  // Separate parents from sub-issues.
-  const parents = [...allIssues.values()].filter((e) => !e.issue.parent_id);
-  const children = [...allIssues.values()].filter((e) => !!e.issue.parent_id);
-
-  if (parents.length > 0) {
-    console.log(chalk.bold('\n  Parent issues:'));
-    for (const { issue, badges } of parents) {
-      const badgeStr = badges.map((b) => {
-        if (b === 'RUNNING') return chalk.green(`[${b}]`);
-        if (b === 'QUEUED')  return chalk.yellow(`[${b}]`);
-        if (b === 'WAITING') return chalk.red(`[${b}]`);
-        return chalk.blue(`[${b}]`);
-      }).join(' ');
-      console.log(`    ${chalk.bold(issue.identifier.padEnd(10))} ${badgeStr}  ${issue.title}`);
-      if (issue.url) console.log(chalk.gray(`               ${issue.url}`));
+    for (const { ticket, targets } of rows) {
+      console.log(
+        `  ${chalk.bold(ticket.identifier.padEnd(10))} ${statusBadge(ticket.status)}  ${ticket.title}`,
+      );
+      if (ticket.external_terminal_at) {
+        console.log(chalk.yellow('             ⚠ closed in the tracker while running'));
+      }
+      if (ticket.analysis_error) {
+        console.log(chalk.red(`             ${ticket.analysis_error}`));
+      }
+      for (const t of targets) {
+        const age = t.status_changed_at ? ` ${chalk.gray(ageFromIso(t.status_changed_at))}` : '';
+        const extra = t.failure_reason ? chalk.red(`  ${t.failure_reason}`) : '';
+        console.log(`             ${t.repo_alias.padEnd(18)} ${statusBadge(t.status)}${age}${extra}`);
+      }
     }
+
+    const counts = await plane.store.countTicketsByStatus();
+    const gates = await plane.store.listPendingGates();
+    console.log(chalk.bold('\n  Summary:'));
+    console.log(`    ${chalk.green(String(counts.running ?? 0).padStart(3))} running`);
+    console.log(`    ${chalk.cyan(String(counts.analyzed ?? 0).padStart(3))} analyzed, awaiting Start`);
+    console.log(`    ${chalk.yellow(String(gates.length).padStart(3))} waiting for you at a gate`);
+    console.log('');
+  } finally {
+    await plane.close();
   }
+}
 
-  if (children.length > 0) {
-    console.log(chalk.bold('\n  Sub-issues (active workers):'));
-    for (const { issue, badges } of children) {
-      const badgeStr = badges.map((b) => {
-        if (b === 'RUNNING') return chalk.green(`[${b}]`);
-        if (b === 'QUEUED')  return chalk.yellow(`[${b}]`);
-        if (b === 'WAITING') return chalk.red(`[${b}]`);
-        return chalk.blue(`[${b}]`);
-      }).join(' ');
-      console.log(`    ${chalk.bold(issue.identifier.padEnd(10))} ${badgeStr}  ${issue.title}`);
-    }
+/** Colour a status without inventing new vocabulary for it. */
+function statusBadge(status: string): string {
+  const label = `[${status.replace(/_/g, ' ').toUpperCase()}]`;
+  switch (status) {
+    case 'running':
+    case 'succeeded':
+      return chalk.green(label);
+    case 'gate_waiting':
+    case 'blocked':
+      return chalk.yellow(label);
+    case 'failed':
+    case 'analysis_failed':
+      return chalk.red(label);
+    case 'analyzed':
+    case 'ready':
+      return chalk.cyan(label);
+    case 'excluded':
+    case 'cancelled':
+      return chalk.gray(label);
+    default:
+      return chalk.blue(label);
   }
-
-  const runningCount = [...allIssues.values()].filter((e) => e.badges.includes('RUNNING')).length;
-  const queuedCount  = [...allIssues.values()].filter((e) => e.badges.includes('QUEUED')).length;
-  const waitingCount = [...allIssues.values()].filter((e) => e.badges.includes('WAITING')).length;
-
-  console.log(chalk.bold('\n  Summary:'));
-  console.log(`    ${chalk.green(String(runningCount).padStart(3))} running`);
-  console.log(`    ${chalk.yellow(String(queuedCount).padStart(3))} queued (blocked on dependency)`);
-  console.log(`    ${chalk.red(String(waitingCount).padStart(3))} waiting for human input`);
-  console.log('');
 }
 
 function ageFromIso(iso: string): string {
