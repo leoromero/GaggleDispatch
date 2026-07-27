@@ -103,6 +103,25 @@ describe('ControlApi — board', () => {
     expect((await a.handle(get('/board', { offset: '-1' }))).status).toBe(400);
   });
 
+  test('an absurd limit is capped before it reaches the database', async () => {
+    // The board is a public read on a shared database. A hand-edited URL must not
+    // be able to ask for every row and the fan-out of each — that is one query per
+    // ticket returned, so an uncapped limit is an amplification lever.
+    const h = await harness();
+    await h.store.upsertTicket(ticketInput());
+    const seen: Array<number | undefined> = [];
+    const real = h.store.board.bind(h.store);
+    h.store.board = async (q) => {
+      seen.push(q?.limit);
+      return real(q);
+    };
+
+    const res = await (await api(h)).handle(get('/board', { workspace: WS, limit: '1000000' }));
+
+    expect(res.status).toBe(200);
+    expect(seen).toEqual([500]);
+  });
+
   test('the ticket detail includes targets and the event timeline', async () => {
     const h = await harness();
     const ticket = await startedTicket(h);
@@ -210,16 +229,44 @@ describe('ControlApi — ticket actions', () => {
 });
 
 describe('ControlApi — target actions', () => {
-  test('exclude and include round-trip', async () => {
+  test('exclude and include round-trip, and the ticket follows the target set', async () => {
     const h = await harness();
     const ticket = await startedTicket(h);
     const target = (await h.store.listTargets(ticket.id))[0]!;
     const a = await api(h);
 
+    // Excluding the only target leaves nothing to run, which completes the ticket.
     expect((await a.handle(post(`/targets/${target.id}/exclude`))).status).toBe(200);
     expect((await h.store.getTarget(target.id))!.status).toBe('excluded');
+    expect((await h.store.getTicket(ticket.id))!.status).toBe('done');
+
+    // Including it puts work back, so the ticket has to reopen — and once it is
+    // running again the readiness pass promotes an unblocked target to `ready`.
     expect((await a.handle(post(`/targets/${target.id}/include`))).status).toBe(200);
-    expect((await h.store.getTarget(target.id))!.status).toBe('blocked');
+    expect((await h.store.getTarget(target.id))!.status).toBe('ready');
+    const reopened = await h.store.getTicket(ticket.id);
+    expect(reopened!.status).toBe('running');
+    expect(reopened!.completed_at).toBeNull();
+  });
+
+  test('excluding a permanently-failed target completes the ticket', async () => {
+    // Without this the ticket stays `running` forever: `failed` is settled but
+    // never successful, and Cancel would discard the siblings that did succeed.
+    const h = await harness();
+    const ticket = await startedTicket(h, [
+      targetSpec(),
+      targetSpec({ repo_alias: 'web', repo_url: 'https://github.com/acme/web', local_path: '/repos/web' }),
+    ]);
+    const [a1, b1] = await h.store.listTargets(ticket.id);
+    await h.service.applyTargetEvent(a1!.id, { kind: 'dispatch_claimed' });
+    await h.service.applyTargetEvent(a1!.id, { kind: 'run_started', run_id: 'r1' });
+    await h.service.applyTargetEvent(a1!.id, { kind: 'run_succeeded' });
+    await h.service.applyTargetEvent(b1!.id, { kind: 'dispatch_claimed' });
+    await h.service.applyTargetEvent(b1!.id, { kind: 'run_failed', reason: 'validate.sh exit 1' });
+    expect((await h.store.getTicket(ticket.id))!.status).toBe('running');
+
+    expect((await (await api(h)).handle(post(`/targets/${b1!.id}/exclude`))).status).toBe(200);
+    expect((await h.store.getTicket(ticket.id))!.status).toBe('done');
   });
 
   test('cancel on a live target records intent rather than killing inline', async () => {

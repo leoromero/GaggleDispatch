@@ -329,15 +329,36 @@ describe('ticketTransition', () => {
     );
   });
 
-  test('done and cancelled accept nothing', () => {
+  test('done and cancelled accept nothing but a re-derivation of done', () => {
     for (const from of ['done', 'cancelled'] as TicketStatus[]) {
       for (const kind of TICKET_EVENT_KINDS) {
         if (kind === 'external_terminal') continue; // asserted as a no-op above
+        if (from === 'done' && kind === 'targets_settled') continue; // asserted below
         expect(() =>
           ticketTransition(from, { kind } as TicketEvent, ticketCtx()),
         ).toThrow(InvalidControlTransitionError);
       }
     }
+  });
+
+  test('a done ticket reopens when a target comes back into the participating set', () => {
+    // `done` is derived from the target set, so Include on the last excluded target
+    // of a fully-excluded ticket has to revoke it — otherwise that target is
+    // stranded, since nothing dispatches for a settled ticket.
+    const t = ticketTransition('done', { kind: 'targets_settled' }, ticketCtx({
+      targets: [target({ status: 'ready' })],
+    }));
+    expect(t.to).toBe('running');
+    expect(t.patch.completed_at).toBeNull();
+    expect(kinds(t)).toContain('evaluate_target_readiness');
+  });
+
+  test('a done ticket stays done while every participating target is successful', () => {
+    const t = ticketTransition('done', { kind: 'targets_settled' }, ticketCtx({
+      targets: [target({ status: 'succeeded' }), target({ status: 'excluded' })],
+    }));
+    expect(t.to).toBe('done');
+    expect(t.effects).toHaveLength(0);
   });
 
   test('mirror_labels off emits no label effects; on emits them', () => {
@@ -399,6 +420,36 @@ describe('targetTransition', () => {
     const comment = t.effects.find((e) => e.kind === 'tracker_post_comment');
     expect(comment).toBeTruthy();
     expect((comment as { body: string }).body).toContain('exit 1');
+  });
+
+  test('failing lowers a pending cancel flag, so the reconciler stops chasing it', () => {
+    // `listCancelRequested` keys off the flag. Leaving it raised on a settled
+    // target makes `applyCancelRequests` pick the row up on every tick forever,
+    // each time throwing an invalid-transition it can only log.
+    const t = targetTransition(
+      'running',
+      { kind: 'run_failed', reason: 'exit 1' },
+      targetCtx({ target: target({ status: 'running', cancel_requested: true }) }),
+    );
+    expect(t.patch.cancel_requested).toBe(false);
+  });
+
+  test('a target label replaces the others rather than accumulating', () => {
+    // Linear labels are additive, so without the removals a target that went
+    // claimed → gate → failed ends up wearing all three at once.
+    const t = targetTransition(
+      'running',
+      { kind: 'run_failed', reason: 'exit 1' },
+      targetCtx({ mirror_labels: true }),
+    );
+    const applied = t.effects.filter((e) => e.kind === 'tracker_apply_label');
+    const removed = t.effects.filter((e) => e.kind === 'tracker_remove_label');
+    expect(applied.map((e) => (e as { label: string }).label)).toEqual([
+      DEFAULT_MIRROR_LABELS.failed,
+    ]);
+    expect(removed.map((e) => (e as { label: string }).label).sort()).toEqual(
+      [DEFAULT_MIRROR_LABELS.claimed, DEFAULT_MIRROR_LABELS.waiting_human].sort(),
+    );
   });
 
   test('running + gate_opened → gate_waiting, storing the gate for the dashboard', () => {
@@ -534,11 +585,31 @@ describe('targetTransition', () => {
   });
 
   test('cancel_requested on a pre-dispatch target cancels immediately', () => {
-    for (const from of ['blocked', 'ready', 'excluded'] as TargetStatus[]) {
-      const t = targetTransition('' + from as TargetStatus, { kind: 'cancel_requested' }, targetCtx());
+    for (const from of ['blocked', 'ready'] as TargetStatus[]) {
+      const t = targetTransition(from, { kind: 'cancel_requested' }, targetCtx());
       expect(t.to).toBe('cancelled');
       expect(t.patch.cancel_requested).toBe(false);
       expect(kinds(t)).not.toContain('kill_run');
+    }
+  });
+
+  test('cancel_requested on an excluded target is idempotent, not a move to cancelled', () => {
+    // `cancelled` participates in the ticket's settle rule and never counts as a
+    // success, so moving an *excluded* target there would permanently block the
+    // ticket from reaching `done`. Cancelling a ticket fans out to every target,
+    // and POST /targets/:id/cancel reaches an excluded target directly.
+    const t = targetTransition('excluded', { kind: 'cancel_requested' }, targetCtx());
+    expect(t.to).toBe('excluded');
+    expect(kinds(t)).not.toContain('kill_run');
+  });
+
+  test('exclude_requested resolves a failed or cancelled target', () => {
+    // The operator's only way out of a permanently-failed target. Without it the
+    // ticket stays `running` forever: `failed` is settled but not successful.
+    for (const from of ['failed', 'cancelled'] as TargetStatus[]) {
+      const t = targetTransition(from, { kind: 'exclude_requested' }, targetCtx());
+      expect(t.to).toBe('excluded');
+      expect(t.patch.cancel_requested).toBe(false);
     }
   });
 
@@ -661,14 +732,18 @@ const TICKET_ACCEPTS: Record<TicketStatus, readonly (typeof TICKET_EVENT_KINDS)[
   // than archiving: archiving would make the analyzer's own
   // `analysis_succeeded` throw when it lands moments later. The ticket reaches
   // `analyzed` and the next sync pass archives it then.
-  analysis_requested: ['analysis_claimed', 'external_terminal'],
+  // `cancel_requested` is accepted here because a ticket sits in
+  // `analysis_requested` indefinitely when no daemon is running to claim it.
+  // Without an exit it would be a trap.
+  analysis_requested: ['analysis_claimed', 'cancel_requested', 'external_terminal'],
   analyzing: ['analysis_succeeded', 'analysis_failed', 'cancel_requested', 'external_terminal'],
   analyzed: ['start_requested', 'analyze_requested', 'archive_requested', 'cancel_requested', 'external_terminal'],
   analysis_failed: ['analyze_requested', 'archive_requested', 'external_terminal'],
   running: ['targets_settled', 'cancel_requested', 'external_terminal'],
   // Terminal, except that a sync pass may observe the tracker going terminal and
-  // is answered with a no-op rather than a throw.
-  done: ['external_terminal'],
+  // is answered with a no-op rather than a throw — and that `done` is derived from
+  // the target set, so Include on a target revokes it.
+  done: ['external_terminal', 'targets_settled'],
   cancelled: ['external_terminal'],
   archived: ['restore_requested', 'external_terminal'],
 };
@@ -690,8 +765,11 @@ const TARGET_ACCEPTS: Record<TargetStatus, readonly (typeof TARGET_EVENT_KINDS)[
     'cancel_requested',
     'cancel_confirmed',
   ],
-  failed: ['redispatch_requested'],
-  cancelled: ['redispatch_requested'],
+  // `exclude_requested` is the operator's only way to resolve a target they have
+  // decided not to pursue. Without it a ticket with one permanently-failed target
+  // stays `running` forever.
+  failed: ['redispatch_requested', 'exclude_requested'],
+  cancelled: ['redispatch_requested', 'exclude_requested'],
   succeeded: [],
 };
 

@@ -90,8 +90,18 @@ export interface TrackerWritePort {
 
 /** Tracker operations that create structure rather than annotate it. */
 export interface TrackerStructurePort {
-  /** Create an issue and mark it as blocking `blocksExternalId`. */
-  createBlockerIssue(spec: BlockerSpec, blocksExternalId: string): Promise<void>;
+  /**
+   * Create an issue and mark it as blocking `blocksExternalId`.
+   *
+   * Returns the created issue so the caller can record it on the ticket
+   * immediately. Waiting for the next sync pass to discover it is not good
+   * enough: the readiness sweep runs later in the same tick, sees no blockers, and
+   * promotes the target the operator just declared blocked.
+   */
+  createBlockerIssue(
+    spec: BlockerSpec,
+    blocksExternalId: string,
+  ): Promise<{ external_id: string; identifier: string } | null>;
   /** Create a sub-issue for a target. Returns its tracker identity. */
   createSubIssue(args: {
     ticket: TicketRow;

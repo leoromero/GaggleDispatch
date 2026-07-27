@@ -15,6 +15,7 @@
  */
 
 import { randomUUID } from 'node:crypto';
+import type { BlockerRef } from '../../domain/types.ts';
 import {
   TARGET_LIVE_STATUSES,
   type ControlEventRow,
@@ -240,6 +241,15 @@ export class MemoryControlStore implements ControlStore {
       ]),
       status_changed_at: statusChanged ? now() : row.status_changed_at,
     };
+    this.t.tickets.set(id, updated);
+    return { ...updated };
+  }
+
+  async addTicketBlocker(id: string, blocker: BlockerRef): Promise<TicketRow | null> {
+    const row = this.t.tickets.get(id);
+    if (!row) return null;
+    if (row.blocked_by.some((b) => b.id === blocker.id)) return { ...row };
+    const updated: TicketRow = { ...row, blocked_by: [...row.blocked_by, { ...blocker }] };
     this.t.tickets.set(id, updated);
     return { ...updated };
   }

@@ -23,7 +23,9 @@ import type { BlockerRef } from '../domain/types.ts';
  *                     This is the manual gate that replaces auto-dispatch.
  * analysis_failed     The analyzer errored, or matched zero repos.
  * running             At least one target dispatched; not every target settled.
- * done                Every participating target succeeded.
+ * done                Every participating target succeeded — or every target was
+ *                     excluded, leaving nothing to run. Revocable: bringing a
+ *                     target back with Include returns the ticket to `running`.
  * cancelled           An operator cancelled the ticket.
  * archived            Dismissed without running, or went terminal in the tracker
  *                     before it ever started.
@@ -40,7 +42,9 @@ export type TicketStatus =
   | 'archived';
 
 /**
- * excluded      Operator removed this repo from the fan-out. Not participating.
+ * excluded      Operator removed this repo from the fan-out. Not participating,
+ *               so it neither holds the ticket open nor counts as a success.
+ *               Reachable from `failed`/`cancelled` too: "I am not pursuing this."
  * blocked       An upstream sibling target or a tracker blocker is unsatisfied.
  * ready         Dispatchable. Waiting only on a concurrency slot.
  * dispatching   The daemon is spawning the run. A crash here is recoverable:
@@ -311,7 +315,10 @@ export function isSettled(status: TargetStatus): boolean {
  * `running` is sticky while any participating target failed or was cancelled:
  * the ticket stays on the operator's board until they resolve it. This preserves
  * the current parent state machine, which holds `claimed` while any target sits
- * in `failed`.
+ * in `failed`. Resolving it means Re-dispatch or Exclude — the latter is why
+ * `exclude_requested` is accepted from `failed` and `cancelled`, and why the
+ * caller re-derives this on *every* target status change rather than only when one
+ * enters a settled status.
  *
  * Returns null when the targets imply no change.
  */

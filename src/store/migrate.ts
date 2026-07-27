@@ -67,10 +67,16 @@ const MIGRATION_LOCK_KEY = 0x6167_676c; // "aggl"
  */
 export async function applyMigrations(sql: Sql, migrations: readonly Migration[]): Promise<number[]> {
   assertUniqueVersions(migrations);
-  await sql.unsafe(BOOTSTRAP);
 
   return (await sql.begin(async (tx: Sql) => {
+    // The lock comes first, before *anything* touches the catalog. Advisory locks
+    // need no table, so this is safe on a virgin database — and it has to be here
+    // rather than around only the migrations, because `CREATE TABLE IF NOT EXISTS`
+    // is not itself race-free: two sessions running it concurrently fail with
+    // "duplicate key value violates unique constraint pg_type_typname_nsp_index",
+    // which is the very error the lock exists to prevent.
     await tx`SELECT pg_advisory_xact_lock(${MIGRATION_LOCK_KEY})`;
+    await tx.unsafe(BOOTSTRAP);
 
     const applied = (await tx`SELECT version FROM schema_migrations`) as Row[];
     const have = new Set(applied.map((r) => Number(r.version)));
@@ -90,22 +96,41 @@ export async function applyMigrations(sql: Sql, migrations: readonly Migration[]
   })) as number[];
 }
 
-/** The highest version currently recorded, or 0 on a virgin database. */
+/**
+ * The highest version currently recorded, or 0 when nothing has been applied.
+ *
+ * Read-only, deliberately: an earlier version bootstrapped the table here, which
+ * meant `gaggle doctor` — a diagnostic — created schema as a side effect, and
+ * could race a real first boot while doing it.
+ */
 export async function currentVersion(sql: Sql): Promise<number> {
-  await sql.unsafe(BOOTSTRAP);
-  const rows = (await sql`SELECT COALESCE(MAX(version), 0)::int AS v FROM schema_migrations`) as Row[];
-  return Number(rows[0]?.v ?? 0);
+  const rows = await readApplied(sql);
+  return rows.reduce((max, v) => Math.max(max, v), 0);
 }
 
-/** Versions in `migrations` that the database has not applied yet. */
+/** Versions in `migrations` the database has not applied yet. Read-only. */
 export async function pendingVersions(sql: Sql, migrations: readonly Migration[]): Promise<number[]> {
-  await sql.unsafe(BOOTSTRAP);
-  const applied = (await sql`SELECT version FROM schema_migrations`) as Row[];
-  const have = new Set(applied.map((r) => Number(r.version)));
+  const have = new Set(await readApplied(sql));
   return migrations
     .filter((m) => !have.has(m.version))
     .map((m) => m.version)
     .sort((a, b) => a - b);
+}
+
+/**
+ * Applied versions, treating a missing `schema_migrations` as "none".
+ *
+ * `42P01` is undefined_table. Catching it is what lets the read-only helpers stay
+ * read-only on a database nothing has migrated yet.
+ */
+async function readApplied(sql: Sql): Promise<number[]> {
+  try {
+    const rows = (await sql`SELECT version FROM schema_migrations`) as Row[];
+    return rows.map((r) => Number(r.version));
+  } catch (err) {
+    if ((err as { errno?: string }).errno === '42P01') return [];
+    throw err;
+  }
 }
 
 function assertUniqueVersions(migrations: readonly Migration[]): void {

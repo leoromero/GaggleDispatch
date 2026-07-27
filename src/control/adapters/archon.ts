@@ -223,6 +223,28 @@ export class ArchonExecutorAdapter implements ExecutorPort {
     event: { type: string; exit_code?: number },
     runId: () => string | null,
   ): Promise<void> {
+    // Everything below is reached from a fire-and-forget subprocess callback, so an
+    // escaping rejection is unhandled and Bun terminates the daemon. And it *will*
+    // escape on the ordinary Cancel path: `cancel_confirmed` commits `cancelled`,
+    // then kills the process, which exits and reports `archon_cancelled` — and
+    // `run_failed` is not accepted from `cancelled`. A refused transition here
+    // means the outcome was already recorded, which is not an error.
+    try {
+      await this.translateExit(targetId, event, runId);
+    } catch (err) {
+      logger.warn('Ignoring a worker exit the control plane had already accounted for', {
+        target_id: targetId,
+        event: event.type,
+        error: (err as Error).message,
+      });
+    }
+  }
+
+  private async translateExit(
+    targetId: string,
+    event: { type: string; exit_code?: number },
+    runId: () => string | null,
+  ): Promise<void> {
     const sink = this.deps.sink();
     const id = runId();
 

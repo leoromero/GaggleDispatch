@@ -6,7 +6,6 @@ import chalk from 'chalk';
 import { loadConfig } from './common.ts';
 import { loadSyncedRegistry } from '../registry/synced-registry.ts';
 import { loadScaffoldJobs } from '../registry/scaffold-jobs.ts';
-import { LinearClient } from '../tracker/linear.ts';
 
 export async function runStatus(opts: { cwd?: string; json?: boolean }): Promise<void> {
   const cfg = loadConfig({ cwd: opts.cwd });
@@ -70,7 +69,6 @@ export async function runStatus(opts: { cwd?: string; json?: boolean }): Promise
   console.log(chalk.gray('  Service status: not running (use `gaggle start`)'));
 }
 
-/** `gaggle ps` — query Linear gaggle labels to show live orchestrator state. */
 /**
  * `gaggle ps` — what the control plane is doing.
  *
@@ -79,6 +77,10 @@ export async function runStatus(opts: { cwd?: string; json?: boolean }): Promise
  * reported a projection and could disagree with reality. It now reads the same
  * board the dashboard does, so it needs no tracker credentials and works with
  * every gaggle process stopped.
+ *
+ * Strictly read-only, migrations included: `gaggle ps` in a shell loop must not be
+ * able to move the schema. If the tables are not there yet the query says so, and
+ * `gaggle doctor` is the command that puts them there.
  */
 export async function runPs(opts: { cwd?: string; json?: boolean }): Promise<void> {
   const cfg = loadConfig({ cwd: opts.cwd });
@@ -88,7 +90,7 @@ export async function runPs(opts: { cwd?: string; json?: boolean }): Promise<voi
   }
 
   const { openControlReadPlane } = await import('../control/index.ts');
-  const plane = await openControlReadPlane({ cfg });
+  const plane = await openControlReadPlane({ cfg, migrate: false });
   try {
     const rows = await plane.store.board({
       status: ['analysis_requested', 'analyzing', 'analyzed', 'analysis_failed', 'running'],

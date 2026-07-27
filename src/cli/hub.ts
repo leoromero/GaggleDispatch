@@ -215,8 +215,13 @@ export async function runNestStart(opts: { only?: string[] }): Promise<void> {
  * every workspace shares one database by design — if two workspaces disagreed
  * about the URL they would be separate boards, which the `workspace` column
  * exists to avoid.
+ *
+ * Every failure here returns null rather than throwing: the nest's job is to give
+ * you process controls and logs, and those are exactly what you need when the
+ * database is the thing that is broken. Exported so the degradation paths can be
+ * tested without standing up a hub.
  */
-async function openHubControlPlane(
+export async function openHubControlPlane(
   manager: HubProcessManager,
 ): Promise<{ api: ControlApi; history: HistoryStore | null; close: () => Promise<void> } | null> {
   const first = manager.list()[0]?.entry;

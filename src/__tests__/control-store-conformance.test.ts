@@ -479,6 +479,14 @@ function suite(name: string, makeStore: () => Promise<ControlStore>, cleanup?: (
       const pending = await store.listGateDecisions(WS);
       expect(pending.map((p) => p.repo_alias)).toEqual(['b', 'a']);
       expect(await store.listGateDecisions('other')).toHaveLength(0);
+
+      // A target that has left the gate is no longer awaiting anything, even with
+      // a decision still on the row — the run ended, was cancelled, or timed out
+      // before the daemon got to it. Leaving `gate_decision` set is deliberate
+      // (it is part of the audit trail); this filter is what stops the daemon
+      // retrying a decision it can no longer apply on every tick.
+      await store.updateTarget(targets[1]!.id, { status: 'failed' });
+      expect((await store.listGateDecisions(WS)).map((p) => p.repo_alias)).toEqual(['a']);
     });
 
     test('clearing a decision removes it from the pending list', async () => {
@@ -508,9 +516,14 @@ function suite(name: string, makeStore: () => Promise<ControlStore>, cleanup?: (
       const targets = await store.replaceTargets(t.id, [
         targetSpec({ repo_alias: 'a' }),
         targetSpec({ repo_alias: 'b' }),
+        targetSpec({ repo_alias: 'c' }),
       ]);
       await store.updateTarget(targets[0]!.id, { status: 'running', cancel_requested: true });
       await store.updateTarget(targets[1]!.id, { status: 'running' });
+      // Flagged but already settled: the run ended on its own before anyone acted
+      // on the cancel. Returning it would make the daemon attempt a
+      // `cancel_confirmed` the machine refuses, once per tick, forever.
+      await store.updateTarget(targets[2]!.id, { status: 'failed', cancel_requested: true });
       const pending = await store.listCancelRequested(WS);
       expect(pending.map((x) => x.repo_alias)).toEqual(['a']);
     });

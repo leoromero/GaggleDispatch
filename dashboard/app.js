@@ -542,6 +542,10 @@ const TICKET_ACTIONS = {
   ],
   running: [['cancel', 'Cancel', 'stop']],
   archived: [['restore', 'Restore', '']],
+  // Both of these are waiting on a daemon. A ticket whose workspace is stopped or
+  // misconfigured would sit here with no way out at all if Cancel were missing.
+  analysis_requested: [['cancel', 'Cancel', 'stop']],
+  analyzing: [['cancel', 'Cancel', 'stop']],
 };
 
 state.board = { tickets: [], counts: {}, gates: [], cursor: 0, filter: '', search: '', expanded: new Set(), available: true };
@@ -715,7 +719,12 @@ function targetRow(ticket, t) {
     onclick: () => controlPost(`/targets/${t.id}/${action}`),
   }, label));
 
-  if (t.status === 'failed' || t.status === 'cancelled') push('redispatch', 'Re-dispatch', 'primary');
+  if (t.status === 'failed' || t.status === 'cancelled') {
+    push('redispatch', 'Re-dispatch', 'primary');
+    // The only way to resolve a target you have decided not to pursue. Without it
+    // one permanently-failed target keeps its ticket `running` forever.
+    push('exclude', 'Give up on this');
+  }
   if (['blocked', 'ready'].includes(t.status)) push('exclude', 'Exclude');
   if (t.status === 'excluded') push('include', 'Include');
   if (['dispatching', 'running', 'gate_waiting'].includes(t.status)) {

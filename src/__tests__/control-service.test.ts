@@ -14,6 +14,7 @@ import {
 } from '../control/transitions.ts';
 import { ControlNotFoundError } from '../control/service.ts';
 import { OutboxDrainer } from '../control/outbox.ts';
+import { PostgresControlStore } from '../control/store/postgres.ts';
 import {
   FakeTrackerWrites,
   harness,
@@ -239,6 +240,38 @@ describe('ControlService — Start and dispatch', () => {
     expect(outbox.some((o) => o.op === 'post_comment' && String(o.payload.body).includes('no worktree available'))).toBe(true);
   });
 
+  test('one target whose bookkeeping fails does not strand its siblings', async () => {
+    // Without per-target isolation the throw escapes the dispatch loop, and every
+    // target claimed behind the failing one stays `dispatching` with no run:
+    // invisible to reconcileRuns, swept only at the next startup, and holding a
+    // concurrency slot the whole time.
+    const h = await harness();
+    await startedTicket(h, [targetSpec({ repo_alias: 'a' })], {
+      external_id: 'lin-a',
+      identifier: 'GAG-A',
+    });
+    await startedTicket(h, [targetSpec({ repo_alias: 'b' })], {
+      external_id: 'lin-b',
+      identifier: 'GAG-B',
+    });
+
+    // Fail whichever target the claim happens to hand back first, so the test does
+    // not depend on claim ordering.
+    const real = h.store.getTicket.bind(h.store);
+    let remaining = 1;
+    h.store.getTicket = async (id: string) => {
+      if (remaining > 0 && (await real(id))!.status === 'running') {
+        remaining--;
+        throw new Error('connection reset');
+      }
+      return real(id);
+    };
+
+    const claimed = await h.service.claimAndDispatch(10);
+    expect(claimed).toHaveLength(2);
+    expect(h.executor.spawned).toHaveLength(1);
+  });
+
   test('every dispatch is recorded in the audit trail', async () => {
     const h = await harness();
     const ticket = await startedTicket(h);
@@ -331,6 +364,24 @@ describe('ControlService — completion', () => {
 
     await h.service.evaluateReadiness(ticket.id);
     expect(indexByAlias(await h.store.listTargets(ticket.id)).web!.status).toBe('ready');
+  });
+
+  test('a ready target is demoted when a blocker appears after Start', async () => {
+    // Readiness is re-derived, not latched. A "blocks" relation added in the
+    // tracker after Start has to pull the target back off the ready queue, or the
+    // next drain dispatches work the operator has since gated.
+    const h = await harness();
+    const ticket = await startedTicket(h);
+    const target = (await h.store.listTargets(ticket.id))[0]!;
+    expect(target.status).toBe('ready');
+
+    await h.store.upsertTicket(
+      ticketInput({ blocked_by: [{ id: 'lin-9', identifier: 'GAG-9', state: 'Todo', labels: [] }] }),
+    );
+    await h.service.evaluateReadiness(ticket.id);
+
+    expect((await h.store.getTarget(target.id))!.status).toBe('blocked');
+    expect(await h.service.claimAndDispatch(10)).toHaveLength(0);
   });
 
   test('excluded targets do not hold a ticket open', async () => {
@@ -514,6 +565,31 @@ describe('ControlService — cancellation', () => {
     expect(after.c!.status).toBe('cancelled');
   });
 
+  test('the cascade raises a flag on a live target instead of cancelling it outright', async () => {
+    // The subprocess may belong to a different daemon, so the cascade must not
+    // declare the target cancelled before anyone has killed the run. Doing so
+    // leaves an orphaned worker writing to a branch nothing is watching.
+    const h = await harness();
+    const ticket = await startedTicket(h, [
+      targetSpec({ repo_alias: 'a' }),
+      targetSpec({ repo_alias: 'b' }),
+    ]);
+    await h.service.claimAndDispatch(10);
+
+    await h.service.cancelTicket(ticket.id);
+
+    for (const t of await h.store.listTargets(ticket.id)) {
+      expect({ alias: t.repo_alias, status: t.status, flag: t.cancel_requested }).toEqual({
+        alias: t.repo_alias,
+        status: 'running',
+        flag: true,
+      });
+    }
+    expect(h.executor.killed).toEqual([]);
+    // And the daemon can find them, which is what makes the flag worth raising.
+    expect(await h.store.listCancelRequested(WS)).toHaveLength(2);
+  });
+
   test('a cancelled target can be re-dispatched', async () => {
     const h = await harness();
     const ticket = await startedTicket(h);
@@ -620,6 +696,19 @@ describe('ControlService — label mirroring', () => {
     expect(applied).toContain('gaggle:analyzing');
     expect(applied).toContain('gaggle:claimed');
   });
+
+  test('an outbox row is filed under its ticket own workspace, not the caller config', async () => {
+    // The hub serves every workspace from one service with no workspace of its
+    // own, so a row stamped from config lands under '' and no drainer ever claims
+    // it — the write is enqueued, looks durable, and is never sent.
+    const h = await harness({ mirror_labels: true, workspace: '' });
+    const ticket = await h.store.upsertTicket(ticketInput({ workspace: 'beta' }));
+    await h.service.requestAnalysis(ticket.id);
+
+    expect(await h.store.claimOutbox('', 50)).toHaveLength(0);
+    const theirs = await h.store.claimOutbox('beta', 50);
+    expect(theirs.map((o) => o.op)).toContain('apply_label');
+  });
 });
 
 describe('OutboxDrainer', () => {
@@ -690,10 +779,90 @@ describe('OutboxDrainer', () => {
   });
 });
 
+// ─── concurrent drainers ────────────────────────────────────────────────────
+//
+// Two gaggles in one workspace both drain the outbox. The claim's row locks have
+// to be held for as long as the row is in flight, or both send it and every
+// comment is posted twice. Only real Postgres has row locks, so this needs a
+// database — MemoryControlStore's snapshot transactions cannot model the race.
+
+const PG_URL = process.env.TEST_DATABASE_URL ?? '';
+
+if (PG_URL) {
+  describe('OutboxDrainer — two drainers, one queue', () => {
+    test('a second drainer cannot take rows the first is mid-flight on', async () => {
+      const store = new PostgresControlStore(PG_URL, { maxConnections: 4 });
+      try {
+        await store.migrate();
+        await store.truncateAllForTests();
+        for (let i = 0; i < 8; i++) {
+          await store.enqueueOutbox({
+            workspace: WS,
+            external_id: `lin-${i}`,
+            op: 'post_comment',
+            payload: { body: `note ${i}` },
+          });
+        }
+
+        // Racing two `drain()` calls with Promise.all is not enough: the first can
+        // finish its whole batch before the second's query reaches the server, and
+        // the test passes for the wrong reason. Hold the first drainer inside its
+        // batch until the second has had its turn.
+        const a = new FakeTrackerWrites();
+        const b = new FakeTrackerWrites();
+        const inFlight = deferred();
+        const resume = deferred();
+        const post = a.postComment.bind(a);
+        let firstSend = true;
+        a.postComment = async (id: string, body: string) => {
+          if (firstSend) {
+            firstSend = false;
+            inFlight.resolve();
+            await resume.promise;
+          }
+          return post(id, body);
+        };
+
+        const cfg = { workspace: WS, batch_size: 50, max_attempts: 5 };
+        const first = new OutboxDrainer(store, a, cfg).drain();
+        await inFlight.promise;
+        const second = await new OutboxDrainer(store, b, cfg).drain();
+        resume.resolve();
+        const firstResult = await first;
+
+        // The whole batch belongs to the first drainer for as long as it holds the
+        // transaction, so the second finds nothing to do rather than re-sending.
+        expect(second.sent).toBe(0);
+        expect(b.comments).toEqual([]);
+        expect(firstResult.sent).toBe(8);
+
+        const ids = [...a.comments, ...b.comments].map((c) => c.id);
+        expect(ids).toHaveLength(8);
+        expect([...new Set(ids)]).toHaveLength(8);
+        expect(await store.claimOutbox(WS, 50)).toHaveLength(0);
+      } finally {
+        await store.close();
+      }
+    });
+  });
+} else {
+  describe('OutboxDrainer — two drainers, one queue', () => {
+    test.skip('set TEST_DATABASE_URL to run against real Postgres', () => {});
+  });
+}
+
 // ─── helpers ────────────────────────────────────────────────────────────────
 
 function indexByAlias<T extends { repo_alias: string }>(rows: T[]): Record<string, T | undefined> {
   const out: Record<string, T | undefined> = {};
   for (const r of rows) out[r.repo_alias] = r;
   return out;
+}
+
+function deferred(): { promise: Promise<void>; resolve: () => void } {
+  let resolve!: () => void;
+  const promise = new Promise<void>((r) => {
+    resolve = r;
+  });
+  return { promise, resolve };
 }

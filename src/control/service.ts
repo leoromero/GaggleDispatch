@@ -435,24 +435,30 @@ export class ControlService {
 
       const out = await this.applyEffects(tr, t.effects, { ticket, target });
 
-      // A target reaching a terminal status may complete the ticket. Doing it in
-      // the same transaction is what removes the deferred "release the claim a
-      // second later" dance the orchestrator needs today.
-      if (isSettled(t.to) && !isSettled(t.from) && ticket.status === 'running') {
+      // The ticket's status is derived from its target set, so *any* target status
+      // change can change it — not only one that enters a settled status. Excluding
+      // a `failed` target is the case that made the narrower rule wrong: the target
+      // leaves the participating set, which can complete the ticket, but it is a
+      // move out of a settled status rather than into one. `done` is re-evaluated
+      // for the same reason in reverse — Include can put work back on a ticket that
+      // had settled. Doing this in the same transaction is what removes the
+      // deferred "release the claim a second later" dance the old orchestrator
+      // needed.
+      if (t.to !== t.from && (ticket.status === 'running' || ticket.status === 'done')) {
         const after = await tr.listTargets(target.ticket_id);
-        const settle = ticketTransition('running', { kind: 'targets_settled' }, {
+        const settle = ticketTransition(ticket.status, { kind: 'targets_settled' }, {
           ticket,
           targets: after,
           mirror_labels: this.deps.cfg.mirror_labels,
           completed_state: this.deps.cfg.completed_state,
           labels: this.deps.cfg.labels,
         });
-        if (settle.to !== 'running') {
+        if (settle.to !== ticket.status) {
           await tr.updateTicket(ticket.id, { ...settle.patch, status: settle.to });
           await tr.appendEvent({
             ticket_id: ticket.id,
             event_kind: 'targets_settled',
-            from_status: 'running',
+            from_status: settle.from,
             to_status: settle.to,
             actor: 'daemon',
           });
@@ -662,9 +668,26 @@ export class ControlService {
         }
         return;
       }
-      case 'create_blocker_issue':
-        await this.deps.tracker.createBlockerIssue(effect.spec, effect.blocks_external_id);
+      case 'create_blocker_issue': {
+        const created = await this.deps.tracker.createBlockerIssue(
+          effect.spec,
+          effect.blocks_external_id,
+        );
+        const ctx = scopeOf(effect);
+        if (created && ctx) {
+          // Record it now rather than waiting for sync. The readiness sweep runs
+          // later in the same tick; without this it sees no blockers and promotes
+          // the target the operator just declared blocked, starting a second run on
+          // the same worktree. Sync re-derives the list from the tracker after.
+          await this.deps.store.addTicketBlocker(ctx.ticket.id, {
+            id: created.external_id,
+            identifier: created.identifier,
+            state: null,
+            labels: [],
+          });
+        }
         return;
+      }
       case 'spawn_run':
         // Dispatch is driven by `claimAndDispatch`, which owns the atomic claim.
         // A transition emitting `spawn_run` is describing intent for the record;
@@ -689,9 +712,11 @@ const TARGET_PRE_DISPATCH_OR_SETTLED: readonly TargetStatus[] = [
 /**
  * Carry the dispatch context on a deferred effect.
  *
- * Attached as a non-enumerable property so it never leaks into the JSONB written
- * to `control_events.detail`, and so effect equality in tests still compares
- * only the meaningful fields.
+ * A symbol key, so it cannot collide with a field of the effect and never
+ * survives `JSON.stringify` — that part holds whatever the descriptor says.
+ * Non-enumerable is for object copies and equality: a spread of an effect would
+ * otherwise carry a whole ticket and target along with it, and `toEqual` in tests
+ * would compare them.
  */
 const SCOPE = Symbol('dispatch-scope');
 

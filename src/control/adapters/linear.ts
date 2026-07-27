@@ -60,7 +60,10 @@ export class LinearStructureAdapter implements TrackerStructurePort {
     private readonly cfg: ServiceConfig,
   ) {}
 
-  async createBlockerIssue(spec: BlockerSpec, blocksExternalId: string): Promise<void> {
+  async createBlockerIssue(
+    spec: BlockerSpec,
+    blocksExternalId: string,
+  ): Promise<{ external_id: string; identifier: string } | null> {
     const created = await this.client.createIssue({
       title: spec.title,
       description: spec.description || undefined,
@@ -82,6 +85,7 @@ export class LinearStructureAdapter implements TrackerStructurePort {
       blocker: created.identifier,
       blocks: blocksExternalId,
     });
+    return { external_id: created.id, identifier: created.identifier };
   }
 
   async createSubIssue(args: {

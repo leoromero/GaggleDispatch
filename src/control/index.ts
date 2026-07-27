@@ -53,6 +53,13 @@ export interface ControlPlane {
 export interface ControlReadPlane {
   store: ControlStore;
   api: ControlApi;
+  /**
+   * Exposed so the port guard below is observable. Callers should prefer `api`:
+   * this service is built with executor, analyzer, and tracker-structure ports
+   * that throw, so the subset of its methods that is safe here is exactly the
+   * subset `api` routes to.
+   */
+  service: ControlService;
   close(): Promise<void>;
 }
 
@@ -150,9 +157,16 @@ export async function openControlReadPlane(opts: {
   /** Forwards a sync request to a running gaggle. Omit when none is reachable. */
   requestSync?: (workspace: string | undefined) => Promise<unknown>;
   store?: ControlStore;
+  /**
+   * Whether to bring the schema up to date. True for the hub, which is a
+   * long-running owner of the board. False for short-lived read-only callers like
+   * `gaggle ps`: a status query is not a deployment, and having one apply a
+   * migration means the schema can change because somebody looked at it.
+   */
+  migrate?: boolean;
 }): Promise<ControlReadPlane> {
   const store = opts.store ?? openStore(opts.cfg);
-  await store.migrate();
+  if (opts.migrate !== false) await store.migrate();
 
   const service = new ControlService({
     store,
@@ -167,7 +181,7 @@ export async function openControlReadPlane(opts: {
   });
 
   const api = new ControlApi({ store, service, requestSync: opts.requestSync });
-  return { store, api, close: () => store.close() };
+  return { store, api, service, close: () => store.close() };
 }
 
 // ─── helpers ────────────────────────────────────────────────────────────────

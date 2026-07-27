@@ -285,7 +285,16 @@ export function ticketTransition(
     }
 
     case 'cancel_requested': {
-      if (from === 'running' || from === 'analyzed' || from === 'analyzing') {
+      // `analysis_requested` is included because a ticket can sit there
+      // indefinitely when no daemon is running to claim it. Without an exit it is
+      // a trap: nothing else is accepted from it, so the operator's only recourse
+      // would be editing the database by hand.
+      if (
+        from === 'running' ||
+        from === 'analyzed' ||
+        from === 'analyzing' ||
+        from === 'analysis_requested'
+      ) {
         return done('cancelled', { completed_at: nowIso() }, [
           { kind: 'cancel_targets' },
           ...labelsCleared(ctx),
@@ -365,6 +374,23 @@ export function ticketTransition(
     return reject();
   }
 
+  if (from === 'done') {
+    // `done` is otherwise terminal, but it is derived from the target set, so it
+    // has to be revocable when that set changes underneath it: Include on the last
+    // excluded target of a fully-excluded ticket puts real work back on the board.
+    // Leaving the ticket `done` would strand that target — nothing dispatches for
+    // a settled ticket. No tracker state is written on the way back; the `claimed`
+    // label is the mirror's in-progress signal and it is re-applied here.
+    if (event.kind === 'targets_settled') {
+      if (settleTicketStatus(ctx.targets) !== 'running') return done('done');
+      return done('running', { completed_at: null }, [
+        { kind: 'evaluate_target_readiness' },
+        ...applyLabel(ctx, 'claimed'),
+      ]);
+    }
+    return reject();
+  }
+
   if (from === 'archived') {
     if (event.kind === 'restore_requested') {
       return done('imported', { external_terminal_at: null });
@@ -372,7 +398,7 @@ export function ticketTransition(
     return reject();
   }
 
-  // imported handled by the shared block above; done / cancelled are terminal.
+  // imported handled by the shared block above; cancelled is terminal.
   return reject();
 }
 
@@ -424,6 +450,10 @@ export function targetTransition(
       // dashboard raises a flag and the owning daemon confirms. Everything else
       // cancels in the same transaction.
       if (isLive(from)) return done(from, { cancel_requested: true });
+      // Already excluded: idempotent. Moving it to `cancelled` would turn a
+      // *non-participating* target into a participating, unsuccessfully-settled
+      // one — permanently blocking the ticket from ever reaching `done`.
+      if (from === 'excluded') return done('excluded');
       if (TARGET_PRE_DISPATCH_STATUSES.includes(from)) {
         return done('cancelled', { cancel_requested: false, completed_at: nowIso() });
       }
@@ -440,8 +470,19 @@ export function targetTransition(
     }
 
     case 'exclude_requested': {
-      if (!TARGET_PRE_DISPATCH_STATUSES.includes(from)) return reject();
-      return done('excluded');
+      // Also allowed from `failed` and `cancelled`, and that is the only way an
+      // operator can resolve a target they have decided not to pursue. Without it a
+      // ticket with one permanently-failed target can never reach `done`: it stays
+      // `running` forever, and cancelling the whole ticket discards the work that
+      // did succeed and never writes the completed state to the tracker.
+      if (
+        !TARGET_PRE_DISPATCH_STATUSES.includes(from) &&
+        from !== 'failed' &&
+        from !== 'cancelled'
+      ) {
+        return reject();
+      }
+      return done('excluded', { cancel_requested: false });
     }
 
     case 'include_requested': {

@@ -31,10 +31,13 @@ class FakeRuns implements RunStatusPort {
   observations = new Map<string, RunObservation>();
   asked: string[] = [];
   error: string | null = null;
+  /** Run ids to throw for, for testing isolation between targets. */
+  failFor = new Set<string>();
 
   async observeRun(runId: string): Promise<RunObservation> {
     this.asked.push(runId);
     if (this.error) throw new Error(this.error);
+    if (this.failFor.has(runId)) throw new Error(`executor lost run ${runId}`);
     return this.observations.get(runId) ?? { status: 'unknown' };
   }
 }
@@ -254,6 +257,27 @@ describe('Reconciler — run observation', () => {
     expect((await h.store.getTicket(ticket.id))!.status).toBe('running');
   });
 
+  test('one unobservable run does not stop the workspace being reconciled', async () => {
+    // Without per-target isolation the throw escapes reconcileRuns, `step()`
+    // swallows it, and every other live target in the workspace goes unreconciled
+    // — one stuck row becomes a workspace-wide outage visible only as a log line.
+    const { h, runs, reconciler } = await rig();
+    const ticket = await startedTicket(h, [
+      targetSpec({ repo_alias: 'a' }),
+      targetSpec({ repo_alias: 'b' }),
+    ]);
+    await reconciler.tick();
+    const targets = await h.store.listTargets(ticket.id);
+    runs.failFor.add(targets[0]!.run_id!);
+    runs.observations.set(targets[1]!.run_id!, { status: 'completed' });
+
+    const result = await reconciler.tick();
+
+    expect(result.reconciled).toBe(1);
+    expect((await h.store.getTarget(targets[1]!.id))!.status).toBe('succeeded');
+    expect((await h.store.getTarget(targets[0]!.id))!.status).toBe('running');
+  });
+
   test('a paused run opens a gate the dashboard can see', async () => {
     const { h, runs, reconciler } = await rig();
     const ticket = await startedTicket(h);
@@ -388,6 +412,51 @@ describe('Reconciler — run observation', () => {
     runs.asked = [];
     await reconciler.tick();
     expect(runs.asked).toEqual([]);
+  });
+});
+
+describe('Reconciler — sub-issues', () => {
+  test('a single-repo ticket gets no sub-issue — the ticket itself is the issue', async () => {
+    // A sub-issue of a one-repo ticket duplicates its parent, and every tracker
+    // write for that target then addresses the copy instead of the issue the
+    // operator is reading.
+    const { h, reconciler } = await rig();
+    const ticket = await startedTicket(h);
+
+    const result = await reconciler.tick();
+
+    expect(result.sub_issues).toBe(0);
+    expect(h.tracker.subIssues).toEqual([]);
+    expect((await h.store.listTargets(ticket.id))[0]!.external_target_id).toBeNull();
+  });
+
+  test('a fan-out gets one sub-issue per target, once, however many ticks run', async () => {
+    const { h, reconciler } = await rig();
+    const ticket = await startedTicket(h, [
+      targetSpec({ repo_alias: 'a' }),
+      targetSpec({ repo_alias: 'b' }),
+    ]);
+
+    expect((await reconciler.tick()).sub_issues).toBe(2);
+    expect((await reconciler.tick()).sub_issues).toBe(0);
+    expect((await reconciler.tick()).sub_issues).toBe(0);
+
+    expect(h.tracker.subIssues.map((s) => s.alias).sort()).toEqual(['a', 'b']);
+    const ids = (await h.store.listTargets(ticket.id)).map((t) => t.external_target_id);
+    expect(ids.sort()).toEqual(['sub-a', 'sub-b']);
+  });
+
+  test('an excluded target is not counted toward the fan-out and gets no sub-issue', async () => {
+    const { h, reconciler } = await rig();
+    const ticket = await startedTicket(h, [
+      targetSpec({ repo_alias: 'a' }),
+      targetSpec({ repo_alias: 'b' }),
+    ]);
+    const targets = await h.store.listTargets(ticket.id);
+    await h.service.excludeTarget(targets.find((t) => t.repo_alias === 'b')!.id);
+
+    expect((await reconciler.tick()).sub_issues).toBe(0);
+    expect(h.tracker.subIssues).toEqual([]);
   });
 });
 
@@ -591,14 +660,33 @@ describe('Reconciler — startup recovery', () => {
 });
 
 describe('Reconciler — resilience', () => {
-  test('a failing step does not stop the others', async () => {
+  test('a step that genuinely throws does not stop the others', async () => {
+    // An earlier version of this set `runs.error`, which is caught by the
+    // per-target try *inside* reconcileRuns — so no step actually threw and the
+    // isolation in `step()` was never exercised. Break a step outright instead.
+    const { h, reconciler } = await rig();
+    await startedTicket(h);
+    (reconciler as unknown as { promoteBlockedTargets: () => Promise<number> }).promoteBlockedTargets =
+      async () => {
+        throw new Error('step exploded');
+      };
+
+    const result = await reconciler.tick();
+
+    expect(result.promoted).toBe(0);
+    // Everything after the broken step still ran.
+    expect(result.dispatched).toBe(1);
+    expect(h.executor.spawned).toHaveLength(1);
+  });
+
+  test('an executor that cannot be reached does not stop the tick either', async () => {
     const { h, reconciler, runs } = await rig();
     await startedTicket(h);
     runs.error = 'executor down';
 
     const result = await reconciler.tick();
 
-    // Observation failed, but dispatch still happened.
+    expect(result.reconciled).toBe(0);
     expect(result.dispatched).toBe(1);
   });
 

@@ -70,6 +70,7 @@ export interface ReconcilerDeps {
 
 export interface TickResult {
   analyzed: number;
+  orphans_requeued: number;
   sub_issues: number;
   dispatched: number;
   promoted: number;
@@ -82,6 +83,7 @@ export interface TickResult {
 
 const ZERO: TickResult = {
   analyzed: 0,
+  orphans_requeued: 0,
   sub_issues: 0,
   dispatched: 0,
   promoted: 0,
@@ -114,6 +116,7 @@ export class Reconciler {
     result.gates_answered = await this.step('applyGateDecisions', () => this.applyGateDecisions());
     result.reconciled = await this.step('reconcileRuns', () => this.reconcileRuns());
     result.cancelled = await this.step('applyCancelRequests', () => this.applyCancelRequests());
+    result.orphans_requeued = await this.step('sweepOrphanedTargets', () => this.sweepOrphanedTargets());
     result.gates_timed_out = await this.step('sweepGateTimeouts', () => this.sweepGateTimeouts());
     result.promoted = await this.step('promoteBlockedTargets', () => this.promoteBlockedTargets());
     result.dispatched = await this.step('drainReadyTargets', () => this.drainReadyTargets());
@@ -161,20 +164,40 @@ export class Reconciler {
     const slots = await this.availableSlots();
     if (slots <= 0) return 0;
     const claimed = await this.deps.service.claimAnalysisWork(slots);
+    let analyzed = 0;
+
     for (const ticket of claimed) {
-      await this.deps.service.runAnalysis(ticket);
+      // Per-ticket isolation, for the same reason `reconcileRuns` and
+      // `claimAndDispatch` have it. `runAnalysis` catches the *analyzer* failing but
+      // not the transition being refused — which happens whenever the ticket moved
+      // while its analysis was in flight, e.g. an operator cancelled it. Without
+      // this, that one ticket abandons the loop and leaves every other ticket the
+      // same batch claimed sitting in `analyzing`: not claimable, and with no
+      // dashboard action, so only a restart recovers them.
+      try {
+        await this.deps.service.runAnalysis(ticket);
+        analyzed++;
+      } catch (err) {
+        logger.error('Analysis could not be recorded; the startup sweep will requeue it', {
+          identifier: ticket.identifier,
+          ticket_id: ticket.id,
+          error: (err as Error).message,
+        });
+      }
     }
-    return claimed.length;
+    return analyzed;
   }
 
   /**
    * Reflect executor state onto targets this process may not have started.
    *
-   * Only consulted for targets whose run the control plane believes is live. An
-   * `unknown` observation is left alone rather than treated as a failure: after a
-   * restart, "the executor has not heard of this run" is not evidence that the
-   * work failed, and inventing a failure would post a false comment on the
-   * tracker. The startup sweep handles genuinely orphaned runs.
+   * Only consulted for targets that have a run id. An `unknown` observation is
+   * left alone rather than treated as a failure: after a restart, "the executor has
+   * not heard of this run" is not evidence that the work failed, and inventing a
+   * failure would post a false comment on the tracker.
+   *
+   * A live target with *no* run id cannot be observed at all, so it is not this
+   * step's problem — {@link sweepOrphanedTargets} handles it.
    */
   async reconcileRuns(): Promise<number> {
     const live = await this.deps.store.listTargetsByStatus(
@@ -359,6 +382,55 @@ export class Reconciler {
       }
     }
     return answered;
+  }
+
+  /**
+   * Requeue live targets that nothing can ever reconcile.
+   *
+   * A target reaches `running` as soon as its process is up, but its run id arrives
+   * later on a log line — so `run_id IS NULL` is the normal state for a few seconds
+   * after every dispatch. If the daemon dies in that window, or the executor never
+   * logs an id, the row is stuck: `reconcileRuns` skips it (there is nothing to
+   * ask about), it holds a concurrency slot forever, and its worktree is never
+   * reclaimed. The grace window is what separates "just dispatched" from "orphan".
+   *
+   * Runs on every tick, not only at startup, because the window is entered on every
+   * dispatch rather than only across a restart.
+   */
+  async sweepOrphanedTargets(): Promise<number> {
+    const grace = this.deps.cfg.stranded_claim_grace_ms ?? DEFAULT_STRANDED_CLAIM_GRACE_MS;
+    const cutoff = Date.now() - grace;
+    const live = await this.deps.store.listTargetsByStatus(
+      ['running', 'gate_waiting'],
+      this.deps.cfg.workspace,
+    );
+    let requeued = 0;
+
+    for (const target of live) {
+      if (target.run_id) continue;
+      if (Date.parse(target.status_changed_at) > cutoff) continue;
+      await this.deps.store.updateTarget(target.id, {
+        status: 'ready',
+        attempt: target.attempt + 1,
+      });
+      await this.deps.store.appendEvent({
+        ticket_id: target.ticket_id,
+        target_id: target.id,
+        event_kind: 'requeued_orphan',
+        from_status: target.status,
+        to_status: 'ready',
+        actor: 'daemon',
+        detail: { reason: 'live with no run id, so no executor could ever report on it' },
+      });
+      logger.warn('Requeued a live target that never reported a run id', {
+        target_id: target.id,
+        repo_alias: target.repo_alias,
+        was: target.status,
+        since: target.status_changed_at,
+      });
+      requeued++;
+    }
+    return requeued;
   }
 
   /** Kill the processes behind targets an operator asked to cancel. */

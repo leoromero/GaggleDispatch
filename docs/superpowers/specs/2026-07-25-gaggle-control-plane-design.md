@@ -1030,8 +1030,9 @@ two injected interfaces — `ExecutorPort` (spawn, kill, approve, reject) and
 `RunStatusPort` (`observeRun`) — and a target holds only an opaque `run_id` it
 never interprets. Three things fall out: this branch does not depend on the
 engine's migrations existing, it works unchanged against Archon today and the
-in-house engine later, and the whole plane is testable against fakes. `run_id`
-stays a bare `UUID`; the FK still belongs in the 300 range.
+in-house engine later, and the whole plane is testable against fakes. `run_id` is
+an opaque `TEXT` column rather than a `UUID` — see §19.10 for why — and a FK to the
+engine's run table still belongs in the 300 range.
 
 **19.2 Gate answers are intent columns, not hub-side transitions (refines §11.1).**
 Answering a gate means resuming a run, and only the process holding the executor
@@ -1205,17 +1206,78 @@ workspace is the supported configuration, enforced by the pid sidecar. Making it
 atomic means computing the ceiling inside the claim statement. The comment on
 `SlotPort` now says this rather than claiming otherwise.
 
+### 19.17 Corrections from the second review round
+
+A second reviewer, given no knowledge of the first round, went after the fixes
+themselves. Two findings landed squarely on things §19.16 claimed were solved.
+
+**The migration lock did not cover the table it was protecting.** §19.16 recorded
+the advisory lock as the fix for concurrent first boot. It was taken *after*
+`CREATE TABLE IF NOT EXISTS schema_migrations` — so the one statement two daemons
+actually race on ran unprotected, and a virgin database still failed, exactly as
+before. Demonstrated with 60 of 72 tests failing on a fresh database. The lock is
+now the first statement inside the migration transaction.
+
+**Cancel could take the daemon down.** The worker-exit handler was invoked as `void
+this.onExit(...)`, and translating an exit for a target the control plane had
+already settled throws an invalid-transition — an unhandled rejection, which
+terminates a Bun process. So cancelling a running target killed the daemon that was
+carrying out the cancellation. The handler now swallows exactly that case, which is
+the expected outcome of a race it cannot avoid.
+
+**Two dead ends an operator could reach and not leave.** A ticket with one
+permanently-failed target could never reach `done`: `failed` is settled but never
+successful, so the ticket stayed `running`, and the only alternative — cancelling
+the whole ticket — discarded the siblings that had succeeded. `exclude_requested`
+is now accepted from `failed` and `cancelled` ("I am not pursuing this"), with a
+button on the board. Symmetrically, `cancel_requested` on an *excluded* target used
+to move it to `cancelled`, which put a non-participating target back into the
+participating set and blocked `done` permanently; it is idempotent now. A ticket
+sitting in `analysis_requested` with no daemon to claim it was a third dead end and
+now accepts Cancel.
+
+Making the first of those work exposed a real gap in the settle rule: it only
+re-derived the ticket's status when a target *entered* a settled status, so
+excluding a failed target — a move *out* of one — settled nothing. It now
+re-derives on every target status change, and `done` became revocable for the same
+reason in reverse: Include on the last excluded target of a fully-excluded ticket
+puts work back on the board, and leaving the ticket `done` would strand it.
+
+**`gaggle ps` no longer migrates.** It opened the read plane, which migrated
+unconditionally, so a status query could apply a schema change — and in a watch
+loop, could do so at any moment. `openControlReadPlane` takes `migrate` now; the
+hub passes true, `ps` passes false.
+
+Also: `createBlockerIssue` discarded the created issue, so the blocker it filed was
+never recorded in `tickets.blocked_by` and never gated anything; live targets with a
+null `run_id` are swept and requeued rather than being stranded until restart; a
+failing analysis for one ticket no longer aborts the rest of the analysis pass; and
+one comment claimed the non-enumerable dispatch scope was what kept it out of JSONB,
+which is not true — a symbol key never reaches `JSON.stringify` at all. Fixed to say
+what it actually does.
+
+**Mutation testing, second pass.** 69 hand-written mutations over the control
+plane. After the first pass closed the obvious gaps, 18 survivors remained; 17 now
+have tests that kill them, verified by re-running each mutation. The one accepted
+survivor flips `enumerable: false` to `true` on that symbol-keyed dispatch scope,
+which has no observable consequence in any current code path. The survivors were
+concentrated in exactly the places assertions had been written loosely — an
+`excluded` upstream produced a reason matching `/excluded/` either way, so the
+mutation that removed the check passed the test that existed to catch it.
+
 ### What is built
 
-All phases A–H, plus the orchestrator flip. **602 tests pass, `tsc --noEmit` is
-clean** (including three pre-existing errors in `src/hub/` fixed along the way).
+All phases A–H, plus the orchestrator flip. **672 tests pass, 1 skipped,
+`tsc --noEmit` is clean** (including three pre-existing errors in `src/hub/` fixed
+along the way). The skip is the Postgres conformance run, which needs
+`TEST_DATABASE_URL`; with it set the whole suite is green.
 
 | Spec phase | State |
 |---|---|
-| A — store foundation | `src/store/` shared layer; `src/control/store/` with Postgres and in-memory implementations held to one 110-assertion conformance suite that runs against both |
+| A — store foundation | `src/store/` shared layer; `src/control/store/` with Postgres and in-memory implementations held to one 150-assertion conformance suite that runs against both |
 | B — ticket sync | `src/control/sync.ts`, two-pass discover/track |
 | C — transitions + envelope | `transitions.ts` (pure, exhaustive matrix), `service.ts`, `outbox.ts` |
-| D — reconciler + the flip | `reconciler.ts` (eight steps + `recoverOnStartup`), wired into `Orchestrator.start()`. `orchestrator.ts` went from 2,564 lines to ~330 |
+| D — reconciler + the flip | `reconciler.ts` (ten steps + `recoverOnStartup`), wired into `Orchestrator.start()`. `orchestrator.ts` went from 2,564 lines to ~344 |
 | E — board API | `src/control/api.ts`, mounted at `/api/control/*` on both the hub and each gaggle |
 | F — gates | Dashboard-only, via the intent path (19.2) |
 | G — deletions | See below |

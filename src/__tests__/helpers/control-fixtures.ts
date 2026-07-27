@@ -145,8 +145,13 @@ export class FakeTrackerStructure implements TrackerStructurePort {
   blockers: Array<{ spec: BlockerSpec; blocks: string }> = [];
   subIssues: Array<{ alias: string }> = [];
 
-  async createBlockerIssue(spec: BlockerSpec, blocksExternalId: string): Promise<void> {
+  async createBlockerIssue(
+    spec: BlockerSpec,
+    blocksExternalId: string,
+  ): Promise<{ external_id: string; identifier: string } | null> {
     this.blockers.push({ spec, blocks: blocksExternalId });
+    const n = this.blockers.length;
+    return { external_id: `blocker-${n}`, identifier: `BLK-${n}` };
   }
 
   async createSubIssue(args: {

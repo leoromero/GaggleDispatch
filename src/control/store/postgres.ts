@@ -326,6 +326,18 @@ export class PostgresControlStore implements ControlStore {
     return rows[0] ? mapTicket(rows[0]) : null;
   }
 
+  async addTicketBlocker(id: string, blocker: BlockerRef): Promise<TicketRow | null> {
+    if (!isUuid(id)) return null;
+    const rows = (await this.sql`
+      UPDATE tickets
+         SET blocked_by = blocked_by || ${[blocker]}
+       WHERE id = ${id}
+         AND NOT (blocked_by @> ${[{ id: blocker.id }]})
+      RETURNING *`) as Row[];
+    // No row means it was already there — return the current state, not null.
+    return rows[0] ? mapTicket(rows[0]) : this.getTicket(id);
+  }
+
   async lockTicket(id: string): Promise<TicketRow | null> {
     if (!isUuid(id)) return null;
     const rows = (await this.sql`SELECT * FROM tickets WHERE id = ${id} FOR UPDATE`) as Row[];

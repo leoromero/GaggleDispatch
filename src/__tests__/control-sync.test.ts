@@ -233,6 +233,47 @@ describe('TicketSync — terminal in the tracker', () => {
     expect(second.archived).toBe(0);
   });
 
+  test('a candidate that stays terminal is flagged once, not on every pass', async () => {
+    // The candidate query can keep returning an issue that has already gone
+    // terminal — overlapping state config, or a tracker that has not caught up.
+    // Without the guard every pass re-applies `external_terminal`, filling the
+    // audit trail with duplicates and re-reporting the ticket as newly archived.
+    const { h, tracker, sync } = await syncHarness();
+    tracker.candidates = [issue({ state: 'Done' })];
+
+    expect((await sync.sync()).archived).toBe(1);
+    expect((await sync.sync()).archived).toBe(0);
+    expect((await sync.sync()).archived).toBe(0);
+
+    const ticket = (await h.store.listTickets({ workspace: WS }))[0]!;
+    const terminals = (await h.store.listEvents(ticket.id)).filter(
+      (e) => e.event_kind === 'external_terminal',
+    );
+    expect(terminals).toHaveLength(1);
+  });
+
+  test("a settled ticket's sub-issues are not re-queried either", async () => {
+    // Sub-issue state is only read to decide readiness. Once the ticket is settled
+    // nothing can become ready, so asking about them is pure tracker load that
+    // grows with every ticket ever completed.
+    const { h, tracker, sync } = await syncHarness();
+    const ticket = await startedTicket(h);
+    const target = (await h.store.listTargets(ticket.id))[0]!;
+    await h.store.updateTarget(target.id, { external_target_id: 'lin-sub' });
+
+    tracker.candidates = [issue()];
+    await sync.sync();
+    expect(tracker.idCalls.flat()).toContain('lin-sub');
+
+    await h.service.claimAndDispatch(10);
+    await h.service.runSucceeded(target.id);
+    expect((await h.store.getTicket(ticket.id))!.status).toBe('done');
+
+    tracker.idCalls = [];
+    await sync.sync();
+    expect(tracker.idCalls.flat()).not.toContain('lin-sub');
+  });
+
   test('a terminal ticket is not re-queried once it is archived', async () => {
     const { tracker, sync } = await syncHarness();
     tracker.candidates = [issue()];

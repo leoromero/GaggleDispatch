@@ -132,10 +132,12 @@ describe('evaluateReadiness — sibling dependencies', () => {
   });
 
   test('an excluded upstream is called out as unsatisfiable, not left as a bare wait', () => {
+    // The exact wording matters: "waiting on be (excluded)" reads as a temporary
+    // state an operator should sit out, when in fact nothing will ever change it.
     const fe = target({ depends_on: ['be'] });
     const r = evaluateReadiness(ticket(), fe, [fe, upstream('excluded')], mergedCfg);
     expect(r.ready).toBe(false);
-    expect(r.reason).toMatch(/excluded/);
+    expect(r.reason).toBe('depends on be, which is excluded');
   });
 
   test('deployed readiness needs more than a succeeded upstream', () => {
@@ -184,6 +186,21 @@ describe('evaluateReadiness — sibling dependencies', () => {
         deployCfg,
       ).ready,
     ).toBe(true);
+  });
+
+  test("a mono-repo upstream reads the ticket's labels, not the empty target ones", () => {
+    // The deploy label is the primary signal and the state fallback is secondary,
+    // so this is the case that actually distinguishes the two label sources: the
+    // state alone ('Merged') does not satisfy `deployed`.
+    const fe = target({ depends_on: ['be'], ready_when: 'deployed' });
+    const be = upstream('succeeded');
+    const t = ticket({ external_state: 'Merged', external_labels: ['deployed:staging'] });
+    expect(evaluateReadiness(t, fe, [fe, be], deployCfg).ready).toBe(true);
+
+    // And a target that *does* have its own sub-issue reads that instead — the
+    // ticket's label must not stand in for a sub-issue that has not deployed yet.
+    const withSub = upstream('succeeded', { external_target_id: 'sub-be', external_target_state: 'Merged' });
+    expect(evaluateReadiness(t, fe, [fe, withSub], deployCfg).ready).toBe(false);
   });
 
   test('every dependency must be satisfied, not just one', () => {

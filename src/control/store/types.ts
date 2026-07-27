@@ -143,6 +143,16 @@ export interface TicketRepo {
   listTickets(query?: TicketQuery): Promise<TicketRow[]>;
   countTicketsByStatus(workspace?: string): Promise<Record<string, number>>;
   updateTicket(id: string, patch: TicketPatch): Promise<TicketRow | null>;
+  /**
+   * Add a blocker to `blocked_by` without waiting for a sync pass.
+   *
+   * Used when we create a blocker issue ourselves: the readiness sweep runs later
+   * in the same tick, so a target the operator just declared blocked would
+   * otherwise be promoted straight back to `ready`. Sync re-derives the same list
+   * from the tracker afterwards, so this is an optimistic write that self-heals.
+   * Idempotent on the blocker's id.
+   */
+  addTicketBlocker(id: string, blocker: BlockerRef): Promise<TicketRow | null>;
   /** `SELECT … FOR UPDATE`. Only meaningful inside a transaction. */
   lockTicket(id: string): Promise<TicketRow | null>;
   /**
