@@ -16,7 +16,7 @@ import { WorkspaceManager } from '../workspace/workspace-manager.ts';
 import { buildIssueMessage, buildGaggleEnv } from '../workspace/message.ts';
 
 export interface WorkerExitEvent {
-  type: 'archon_succeeded' | 'archon_failed' | 'archon_timed_out' | 'archon_stalled' | 'archon_cancelled';
+  type: 'run_succeeded' | 'run_failed' | 'run_timed_out' | 'run_stalled' | 'run_cancelled';
   exit_code?: number;
 }
 
@@ -63,7 +63,7 @@ export async function spawnWorker(args: WorkerStartArgs, cb: WorkerCallbacks): P
     await workspace.runHook('before_run', repo_target, issue, attempt);
   } catch (err) {
     log.error('before_run hook failed', { error: (err as Error).message });
-    cb.onExit({ type: 'archon_failed', exit_code: 99 });
+    cb.onExit({ type: 'run_failed', exit_code: 99 });
     return { cancel: () => {}, done: Promise.resolve() };
   }
 
@@ -71,19 +71,19 @@ export async function spawnWorker(args: WorkerStartArgs, cb: WorkerCallbacks): P
   const env = buildGaggleEnv({ issue, repo_target, analysis, attempt, sub_issue_url: args.sub_issue_url ?? null });
 
   log.info('Launching Archon workflow', {
-    archon_workflow: repo_target.archon_workflow,
+    workflow: repo_target.workflow,
     cwd: repo_target.local_path,
   });
 
   const handle = startArchon(
     {
-      archonCommand: cfg.archon.command,
-      workflowName: repo_target.archon_workflow,
+      archonCommand: cfg.executor.command,
+      workflowName: repo_target.workflow,
       cwd: repo_target.local_path,
       message,
       env,
-      turnTimeoutMs: cfg.archon.turn_timeout_ms,
-      stallTimeoutMs: cfg.archon.stall_timeout_ms,
+      turnTimeoutMs: cfg.executor.turn_timeout_ms,
+      stallTimeoutMs: cfg.executor.stall_timeout_ms,
     },
     (e: ArchonEvent) => {
       switch (e.type) {
@@ -93,17 +93,17 @@ export async function spawnWorker(args: WorkerStartArgs, cb: WorkerCallbacks): P
         case 'archon_output':
           cb.onOutput(e.line);
           break;
-        case 'archon_run_id':
+        case 'run_id':
           cb.onRunId?.(e.db_run_id);
           break;
-        case 'archon_gate_paused':
+        case 'run_gate_paused':
           cb.onGatePaused(e.run_id, e.gate_message);
           break;
-        case 'archon_succeeded':
-        case 'archon_failed':
-        case 'archon_timed_out':
-        case 'archon_stalled':
-        case 'archon_cancelled':
+        case 'run_succeeded':
+        case 'run_failed':
+        case 'run_timed_out':
+        case 'run_stalled':
+        case 'run_cancelled':
           cb.onExit({ type: e.type, exit_code: 'exit_code' in e ? e.exit_code : undefined });
           break;
       }
@@ -140,13 +140,13 @@ export function buildLiveSession(args: {
     repo_alias: repo_target.repo_alias,
     repo_target,
     sub_issue_id,
-    archon_pid: null,
-    archon_db_run_id: null,
-    archon_workflow: repo_target.archon_workflow,
-    last_archon_event: null,
-    last_archon_timestamp: null,
-    last_archon_message: null,
-    recent_archon_output: [],
+    run_pid: null,
+    run_id: null,
+    workflow: repo_target.workflow,
+    last_event: null,
+    last_event_at: null,
+    last_message: null,
+    recent_output: [],
     claude_input_tokens: 0,
     claude_output_tokens: 0,
     claude_total_tokens: 0,

@@ -44,7 +44,7 @@ export function makeRepoTarget(overrides: Partial<RepoTarget> = {}): RepoTarget 
     repo_url: 'https://github.com/o/repo-a',
     repo_alias: 'repo-a',
     local_path: '/tmp/checkouts/repo-a',
-    archon_workflow: 'gaggle/gaggle-fix-issue',
+    workflow: 'gaggle/gaggle-fix-issue',
     rationale: 'because',
     components: ['comp-a'],
     ...overrides,
@@ -121,6 +121,8 @@ export function makeServiceConfig(overrides: Partial<ServiceConfig> = {}): Servi
         redirect_uri: '',
         scopes: [],
       },
+      mirror_labels: false,
+      outbox_max_attempts: 5,
     },
     polling: { interval_ms: 30_000 },
     workspace: { root: '/tmp/aux' },
@@ -131,7 +133,7 @@ export function makeServiceConfig(overrides: Partial<ServiceConfig> = {}): Servi
       max_retry_backoff_ms: 60_000,
       max_concurrent_agents_by_state: {},
     },
-    archon: {
+    executor: {
       command: 'archon workflow run',
       api_url: 'http://localhost:3090',
       poll_interval_ms: 5_000,
@@ -141,6 +143,7 @@ export function makeServiceConfig(overrides: Partial<ServiceConfig> = {}): Servi
       gate_timeout_ms: 0,
       startup_cleanup_age_days: 0,
     },
+    database: { url: '', max_connections: 0 },
     claude: {
       api_key: '',
       analyzer_model: 'claude-sonnet-4-5',

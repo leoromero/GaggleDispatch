@@ -360,20 +360,12 @@ export class LinearClient {
   }
 
   // ── 12.1 #9: fetch_issues_by_label ────────────────────────────────────────
-  async fetchIssuesByLabel(label_name: string): Promise<Issue[]> {
-    const team = await this.resolveTeam();
-    const data = await this.query<{ issues: { nodes: RawLinearIssue[] } }>(
-      ISSUES_QUERY,
-      {
-        filter: {
-          team: { id: { eq: team.id } },
-          labels: { name: { eqIgnoreCase: label_name } },
-        },
-        first: 250,
-      },
-    );
-    return data.issues.nodes.map(normalizeIssue);
-  }
+  // `fetchIssuesByLabel` lived here. It was the mechanism by which gaggle labels
+  // became an *input*: startup recovery, failed-target polling, and `gaggle ps`
+  // all reconstructed state by asking the tracker which issues carried which
+  // label. All three read the control plane now, so there is deliberately no way
+  // left to query by label — the invariant is enforced by the method's absence
+  // rather than by remembering not to call it.
 
   // ── 12.1 #10: fetch_issue_comments ────────────────────────────────────────
   async fetchIssueComments(issue_id: string): Promise<IssueCommentRecord[]> {

@@ -28,7 +28,7 @@ export interface HubArchonConfig {
   ui_url: string;
   /**
    * Path template for a single workflow run page. `{run_id}` is replaced
-   * with the LiveSession's `archon_db_run_id`.
+   * with the LiveSession's `run_id`.
    */
   run_path: string;
   /** Command used to launch Archon's web UI (only when autostart applies). */
@@ -42,6 +42,11 @@ export interface HubConfig {
   ui: HubUiConfig;
   archon: HubArchonConfig;
   /** Optional override for the history DB location. */
+  /**
+   * @deprecated Ignored. History moved into the shared Postgres database
+   * (migrations 200–299), so there is no separate file to point at. Kept only so
+   * an existing hub.yaml still parses.
+   */
   history_db?: string;
 }
 

@@ -1,28 +1,38 @@
 /**
- * Per-gaggle HTTP API server.
+ * Per-gaggle HTTP API.
  *
- * Each `gaggle start` process can optionally bring up this server on a
- * local port (assigned by the hub or auto-allocated). It exposes:
+ * Each `gaggle start` process brings this up on a local port. It serves two
+ * distinct things, and the split matters:
  *
- *   GET  /healthz                — liveness probe
- *   GET  /api/state              — JSON snapshot of OrchestratorState
- *   GET  /api/logs?since=<iso>   — recent log events (in-memory ring buffer)
- *   GET  /api/stream             — WebSocket: live state + log events
+ *   - **Live worker telemetry** — pids, token counts, the current output line.
+ *     High-frequency, per-process, and meaningless once the process exits, which
+ *     is exactly why it is served from memory here rather than written to the
+ *     database.
+ *   - **The control plane**, mounted at `/api/control/*`. The same routes the hub
+ *     serves, so a single gaggle is usable without a nest.
  *
- * The server is read-only by design. The hub aggregates from this API to
- * build the unified dashboard.
+ * What it no longer serves is the board's state: pending targets, gates, retry
+ * queues and state-machine maps used to be reported from memory here, and are now
+ * read from Postgres by whoever is asking.
  */
 
 import type { Server, ServerWebSocket } from 'bun';
-import type { OrchestratorState, LiveSession, SupervisedGateEntry, FailedTargetSummary } from '../domain/types.ts';
+import type { LiveSession, OrchestratorState } from '../domain/types.ts';
 import { subscribeLogs, type LogEvent } from '../util/logger.ts';
+import type { ControlApi } from '../control/api.ts';
+import { crossSiteWrite } from './cross-site.ts';
 
 export interface GaggleApiOptions {
   port: number;
   host?: string;
   workspaceName: string;
   getState: () => OrchestratorState;
-  onRedispatch?: (issue_id: string, repo_alias: string) => Promise<void>;
+  /** The control plane, when it is open. Absent until `start()` completes. */
+  control?: () => ControlApi | null;
+  /** Re-dispatch a target by id. */
+  onRedispatch?: (target_id: string) => Promise<void>;
+  /** Run a ticket-sync pass now — needs this process's tracker credentials. */
+  onSync?: () => Promise<unknown>;
   /** How many log events to retain in memory (ring buffer). Default 1000. */
   logBufferSize?: number;
 }
@@ -48,12 +58,12 @@ function liveSessionToJson(s: LiveSession): unknown {
       url: s.issue.url,
     },
     repo_alias: s.repo_alias,
-    archon_pid: s.archon_pid,
-    archon_db_run_id: s.archon_db_run_id,
-    archon_workflow: s.archon_workflow,
-    last_archon_event: s.last_archon_event,
-    last_archon_timestamp: s.last_archon_timestamp,
-    last_archon_message: s.last_archon_message,
+    run_pid: s.run_pid,
+    run_id: s.run_id,
+    workflow: s.workflow,
+    last_event: s.last_event,
+    last_event_at: s.last_event_at,
+    last_message: s.last_message,
     claude_input_tokens: s.claude_input_tokens,
     claude_output_tokens: s.claude_output_tokens,
     claude_total_tokens: s.claude_total_tokens,
@@ -63,80 +73,17 @@ function liveSessionToJson(s: LiveSession): unknown {
   };
 }
 
-function gateToJson(g: SupervisedGateEntry): unknown {
-  return {
-    run_id: g.run_id,
-    issue_id: g.issue_id,
-    issue_identifier: g.issue.identifier,
-    issue_title: g.issue.title,
-    repo_alias: g.repo_alias,
-    paused_at: g.paused_at,
-    gate_message: g.gate_message,
-    comment_id: g.comment_id,
-    attempt: g.attempt,
-  };
-}
-
 function stateToJson(workspaceName: string, state: OrchestratorState): unknown {
   return {
     workspace: workspaceName,
     poll_interval_ms: state.poll_interval_ms,
     max_concurrent_agents: state.max_concurrent_agents,
     slots_used: state.running.size,
-    running: Array.from(state.running.entries()).map(([key, s]) => ({
-      worker_key: key,
+    running: Array.from(state.running.entries()).map(([target_id, s]) => ({
+      target_id,
       ...(liveSessionToJson(s) as object),
     })),
-    supervised_gates: Array.from(state.supervised_gates.entries()).map(([key, g]) => ({
-      worker_key: key,
-      ...(gateToJson(g) as object),
-    })),
-    pending_targets: Array.from(state.pending_targets.entries()).map(([issue_id, targets]) => ({
-      issue_id,
-      issue_identifier: state.pending_issues.get(issue_id)?.identifier ?? null,
-      issue_title: state.pending_issues.get(issue_id)?.title ?? null,
-      targets: targets.map((t) => ({
-        repo_alias: t.repo_alias,
-        archon_workflow: t.archon_workflow,
-        depends_on: t.depends_on ?? [],
-      })),
-    })),
-    retry_attempts: Array.from(state.retry_attempts.entries()).map(([key, r]) => ({
-      worker_key: key,
-      issue_identifier: r.identifier,
-      repo_alias: r.repo_alias,
-      attempt: r.attempt,
-      due_at_ms: r.due_at_ms,
-      error: r.error,
-    })),
-    claimed: (() => {
-      const out: string[] = [];
-      for (const [pid, sm] of state.parent_machine_states) {
-        if (sm === 'analyzing' || sm === 'claimed') out.push(pid);
-      }
-      return out;
-    })(),
-    completed_count: (() => {
-      let n = 0;
-      for (const [, sm] of state.target_machine_states) if (sm === 'succeeded') n++;
-      return n;
-    })(),
     claude_totals: state.claude_totals,
-    detached_archon_runs: Array.from(state.detached_archon_runs.entries()).map(([key, d]) => ({
-      worker_key: key,
-      archon_run_id: d.archon_run_id,
-      issue_identifier: d.parent_issue.identifier,
-      repo_alias: d.repo_alias,
-      recovered_at: d.recovered_at,
-    })),
-    failed: Array.from(state.failed_targets.values()).map((info): FailedTargetSummary => ({
-      issue_id: info.issue.id,
-      issue_identifier: info.issue.identifier,
-      issue_title: info.issue.title,
-      repo_alias: info.repo_target.repo_alias,
-      reason: info.reason,
-      failed_at: info.failed_at,
-    })),
   };
 }
 
@@ -165,6 +112,11 @@ export function startGaggleApi(opts: GaggleApiOptions): GaggleApiHandle {
     hostname: host,
     async fetch(req, srv) {
       const url = new URL(req.url);
+      // Same reasoning as the hub's: this surface also mounts /api/control/*, and
+      // it binds loopback with no auth in front of it. See `crossSiteWrite`.
+      if (crossSiteWrite(req)) {
+        return Response.json({ error: 'cross-site requests are not accepted' }, { status: 403 });
+      }
       if (url.pathname === '/api/stream') {
         const ok = srv.upgrade(req, { data: { kind: 'stream' } });
         if (ok) return undefined;
@@ -174,35 +126,72 @@ export function startGaggleApi(opts: GaggleApiOptions): GaggleApiHandle {
         return new Response('ok', { headers: { 'content-type': 'text/plain' } });
       }
       if (url.pathname === '/api/state') {
-        const json = stateToJson(opts.workspaceName, opts.getState());
-        return Response.json(json);
+        return Response.json(stateToJson(opts.workspaceName, opts.getState()));
       }
       if (url.pathname === '/api/logs') {
         const since = url.searchParams.get('since');
         const events = since ? logBuffer.filter((e) => e.ts > since) : logBuffer.slice();
         return Response.json({ workspace: opts.workspaceName, events });
       }
+
+      // ── control plane ─────────────────────────────────────────────────
+      if (url.pathname.startsWith('/api/control/')) {
+        const api = opts.control?.() ?? null;
+        if (!api) {
+          return Response.json({ error: 'control plane not open' }, { status: 503 });
+        }
+        let body: unknown;
+        if (req.method === 'POST' || req.method === 'PATCH') {
+          const raw = await req.text();
+          if (raw.length > 0) {
+            try {
+              body = JSON.parse(raw);
+            } catch {
+              return Response.json({ error: 'invalid JSON body' }, { status: 400 });
+            }
+          }
+        }
+        const res = await api.handle({
+          method: req.method,
+          path: url.pathname.slice('/api/control'.length) || '/',
+          query: Object.fromEntries(url.searchParams),
+          body,
+        });
+        return Response.json(res.body, { status: res.status });
+      }
+
+      if (url.pathname === '/sync' && req.method === 'POST') {
+        if (!opts.onSync) {
+          return Response.json({ error: 'sync not configured' }, { status: 503 });
+        }
+        try {
+          return Response.json({ ok: true, result: await opts.onSync() });
+        } catch (err) {
+          return Response.json({ error: (err as Error).message }, { status: 500 });
+        }
+      }
+
       if (url.pathname === '/redispatch' && req.method === 'POST') {
         if (!opts.onRedispatch) {
           return Response.json({ error: 'redispatch not configured' }, { status: 503 });
         }
-        let body: { issue_id?: string; repo_alias?: string };
+        let body: { target_id?: string };
         try {
-          body = await req.json() as { issue_id?: string; repo_alias?: string };
+          body = (await req.json()) as { target_id?: string };
         } catch {
           return Response.json({ error: 'invalid JSON body' }, { status: 400 });
         }
-        const { issue_id, repo_alias } = body;
-        if (!issue_id || !repo_alias) {
-          return Response.json({ error: 'issue_id and repo_alias required' }, { status: 400 });
+        if (!body.target_id) {
+          return Response.json({ error: 'target_id required' }, { status: 400 });
         }
         try {
-          await opts.onRedispatch(issue_id, repo_alias);
+          await opts.onRedispatch(body.target_id);
           return Response.json({ ok: true });
         } catch (err) {
           return Response.json({ error: (err as Error).message }, { status: 400 });
         }
       }
+
       return new Response('not found', { status: 404 });
     },
     websocket: {
@@ -223,13 +212,13 @@ export function startGaggleApi(opts: GaggleApiOptions): GaggleApiHandle {
         subs.delete(ws);
       },
       message() {
-        /* clients are read-only */
+        /* clients are read-only on this socket */
       },
     },
   });
 
-  // Push state updates on an interval so the dashboard reflects live changes
-  // even when no log events fire.
+  // Push state on an interval so the dashboard reflects live changes even when
+  // no log events fire.
   const ticker = setInterval(() => {
     if (subs.size === 0) return;
     const payload = JSON.stringify({

@@ -60,13 +60,6 @@ function formatAgo(iso) {
   return `${Math.floor(ms / 86_400_000)}d ago`;
 }
 
-function formatAgoMs(ms) {
-  const d = Date.now() - ms;
-  if (d < 60_000) return `${Math.floor(d / 1000)}s`;
-  if (d < 3_600_000) return `${Math.floor(d / 60_000)}m`;
-  return `${Math.floor(d / 3_600_000)}h`;
-}
-
 // ─── Connection ─────────────────────────────────────────────────────────────
 let ws = null;
 
@@ -102,7 +95,6 @@ function handleMessage(msg) {
   } else if (msg.type === 'state') {
     state.states[msg.event.workspace] = msg.event.state;
     renderStats();
-    renderPipeline();
     renderWorkers();
     renderGaggles();
   } else if (msg.type === 'log') {
@@ -113,6 +105,9 @@ function handleMessage(msg) {
     state.gaggles = msg.gaggles ?? [];
     renderTabs();
     renderGaggles();
+  } else if (msg.type === 'control-changed') {
+    // Someone acted on a ticket — refresh now instead of waiting for the poll.
+    void refreshBoard();
   }
 }
 
@@ -171,10 +166,12 @@ function renderAll() {
   renderStats();
   renderConnStat();
   renderArchonChip();
-  renderPipeline();
   renderWorkers();
   renderGaggles();
   renderLogs();
+  // The board is workspace-scoped, so a tab change has to refetch rather than
+  // re-render what is already in memory.
+  void refreshBoard();
 }
 
 function renderArchonChip() {
@@ -240,72 +237,18 @@ function renderStats() {
   $('#tokens-stat').textContent = `${tokens.toLocaleString()} tokens`;
 }
 
-function renderPipeline() {
-  const names = visibleWorkspaceNames();
-  let running = 0, gated = 0, queued = 0, retries = 0, failed = 0;
-  const issuesByKey = new Map(); // issue_identifier -> { id, title, workspace, targets: [{repo, status}] }
+// The Pipeline panel is gone: it summarised queued targets, open gates, retries
+// and failures from each gaggle's in-memory state, all of which the Board and
+// Gates panels now show from the control plane — with real statuses, and even
+// when no gaggle process is running.
 
-  for (const name of names) {
-    const s = state.states[name];
-    if (!s) continue;
-    running += s.running?.length ?? 0;
-    gated += s.supervised_gates?.length ?? 0;
-    queued += (s.pending_targets ?? []).reduce((acc, p) => acc + p.targets.length, 0);
-    retries += s.retry_attempts?.length ?? 0;
-    failed += s.failed?.length ?? 0;
-
-    for (const w of s.running ?? []) {
-      const key = `${name}:${w.issue.identifier}`;
-      if (!issuesByKey.has(key)) {
-        issuesByKey.set(key, { id: w.issue.identifier, title: w.issue.title, workspace: name, targets: [] });
-      }
-      issuesByKey.get(key).targets.push({ repo: w.repo_alias, status: 'running' });
-    }
-    for (const g of s.supervised_gates ?? []) {
-      const key = `${name}:${g.issue_identifier}`;
-      if (!issuesByKey.has(key)) {
-        issuesByKey.set(key, { id: g.issue_identifier, title: g.issue_title, workspace: name, targets: [] });
-      }
-      issuesByKey.get(key).targets.push({ repo: g.repo_alias, status: 'gate' });
-    }
-    for (const p of s.pending_targets ?? []) {
-      const key = `${name}:${p.issue_identifier ?? p.issue_id}`;
-      if (!issuesByKey.has(key)) {
-        issuesByKey.set(key, { id: p.issue_identifier ?? p.issue_id, title: p.issue_title ?? '', workspace: name, targets: [] });
-      }
-      for (const t of p.targets) {
-        issuesByKey.get(key).targets.push({ repo: t.repo_alias, status: 'queued' });
-      }
-    }
-  }
-
-  const summary = $('#pipeline-summary');
-  summary.innerHTML = '';
-  summary.append(
-    el('div', { class: 'item' }, [el('span', { class: 'count', style: { color: 'var(--green)' } }, String(running)), el('span', { class: 'label' }, 'running')]),
-    el('div', { class: 'item' }, [el('span', { class: 'count', style: { color: 'var(--amber)' } }, String(gated)), el('span', { class: 'label' }, 'gate wait')]),
-    el('div', { class: 'item' }, [el('span', { class: 'count', style: { color: 'var(--purple)' } }, String(queued)), el('span', { class: 'label' }, 'queued')]),
-    el('div', { class: 'item' }, [el('span', { class: 'count', style: { color: 'var(--red)' } }, String(failed)), el('span', { class: 'label' }, 'failed')]),
-  );
-
-  const list = $('#pipeline-list');
-  list.innerHTML = '';
-  if (issuesByKey.size === 0) {
-    list.appendChild(el('div', { class: 'empty' }, 'No active issues.'));
-    return;
-  }
-  for (const { id, title, workspace, targets } of issuesByKey.values()) {
-    const chips = targets.map((t) => el('span', { class: `target-chip ${t.status}` }, `${t.repo}`));
-    list.appendChild(
-      el('div', { class: 'pipeline-issue' }, [
-        el('div', { class: 'id', style: { color: colorFor(workspace) } }, id),
-        el('div', { class: 'title' }, title || ''),
-        el('div', { class: 'targets' }, chips),
-      ]),
-    );
-  }
-}
-
+/**
+ * Live workers: what each subprocess is doing right now.
+ *
+ * Deliberately only the live half. Queued, gated and failed work belongs to the
+ * Board, which reads the durable record; this reads per-process telemetry that
+ * exists nowhere else and disappears when the process does.
+ */
 function renderWorkers() {
   const names = visibleWorkspaceNames();
   const root = $('#workers-list');
@@ -313,126 +256,45 @@ function renderWorkers() {
 
   const cards = [];
   for (const name of names) {
-    const s = state.states[name];
-    if (!s) continue;
-    for (const w of s.running ?? []) cards.push({ name, kind: 'running', w });
-    for (const g of s.supervised_gates ?? []) cards.push({ name, kind: 'gate', w: g });
-    for (const f of s.failed ?? []) cards.push({ name, kind: 'failed', w: f });
+    for (const w of state.states[name]?.running ?? []) cards.push({ name, w });
   }
 
   if (cards.length === 0) {
-    root.appendChild(el('div', { class: 'empty' }, 'No workers.'));
+    root.appendChild(el('div', { class: 'empty' }, 'No workers running.'));
     return;
   }
 
-  for (const { name, kind, w } of cards) {
-    if (kind === 'running') {
-      const tokens = w.claude_total_tokens ?? 0;
-      const pct = Math.min(100, Math.round((tokens / 200000) * 100));
-      const directUrl = archonRunUrl(w.archon_db_run_id);
-      const indexUrl = archonRunsIndexUrl();
-      const linkText = directUrl ? 'View in Archon ↗' : 'Open Archon runs ↗';
-      const linkAttrs = directUrl
-        ? { href: directUrl, target: '_blank', rel: 'noopener' }
-        : indexUrl
-          ? {
-              href: indexUrl,
-              target: '_blank',
-              rel: 'noopener',
-              class: 'fallback',
-              title: 'Run id not captured yet — open Archon runs index',
-            }
-          : { class: 'disabled', title: 'Archon unavailable' };
-      root.appendChild(
-        el('div', { class: 'worker-card' }, [
-          el('div', { class: 'head' }, [
-            el('div', { class: 'who' }, [
-              el('span', { class: 'ws-color', style: { background: colorFor(name) } }),
-              `${w.issue.identifier} · ${w.repo_alias}`,
-            ]),
-            el('span', { class: 'badge running' }, 'running'),
+  for (const { name, w } of cards) {
+    const tokens = w.claude_total_tokens ?? 0;
+    const pct = Math.min(100, Math.round((tokens / 200000) * 100));
+    const runUrl = archonRunUrl(w.run_id);
+    const indexUrl = archonRunsIndexUrl();
+    const linkAttrs = runUrl
+      ? { href: runUrl, target: '_blank', rel: 'noopener' }
+      : indexUrl
+        ? { href: indexUrl, target: '_blank', rel: 'noopener', class: 'fallback', title: 'Run id not captured yet' }
+        : { class: 'disabled', title: 'Executor UI unavailable' };
+
+    root.appendChild(
+      el('div', { class: 'worker-card' }, [
+        el('div', { class: 'head' }, [
+          el('div', { class: 'who' }, [
+            el('span', { class: 'ws-color', style: { background: colorFor(name) } }),
+            `${w.issue.identifier} · ${w.repo_alias}`,
           ]),
-          el('div', { class: 'meta' }, `turn ${w.turn_count} · ${formatAgo(w.started_at)}`),
-          el('div', { class: 'meta' }, `${tokens.toLocaleString()} tokens`),
-          el('div', { class: 'token-bar' }, [el('div', { class: 'fill', style: { width: `${pct}%` } })]),
-          w.last_archon_message
-            ? el('div', { class: 'meta', style: { fontStyle: 'italic', marginTop: '4px' } }, w.last_archon_message.slice(0, 120))
-            : null,
-          el('div', { class: 'actions' }, [el('a', linkAttrs, linkText)]),
+          el('span', { class: 'badge running' }, 'running'),
         ]),
-      );
-    } else if (kind === 'gate') {
-      const directUrl = archonRunUrl(w.run_id);
-      const indexUrl = archonRunsIndexUrl();
-      const linkText = directUrl ? 'View in Archon ↗' : 'Open Archon runs ↗';
-      const linkAttrs = directUrl
-        ? { href: directUrl, target: '_blank', rel: 'noopener' }
-        : indexUrl
-          ? { href: indexUrl, target: '_blank', rel: 'noopener', class: 'fallback' }
-          : { class: 'disabled' };
-      root.appendChild(
-        el('div', { class: 'worker-card gated' }, [
-          el('div', { class: 'head' }, [
-            el('div', { class: 'who' }, [
-              el('span', { class: 'ws-color', style: { background: colorFor(name) } }),
-              `${w.issue_identifier} · ${w.repo_alias}`,
-            ]),
-            el('span', { class: 'badge gate' }, `gate · ${formatAgoMs(w.paused_at)}`),
-          ]),
-          el('div', { class: 'meta' }, w.issue_title || ''),
-          el('div', { class: 'gate-msg' }, w.gate_message || '(no message)'),
-          el('div', { class: 'actions' }, [el('a', linkAttrs, linkText)]),
-        ]),
-      );
-    } else if (kind === 'failed') {
-      const agoStr = w.failed_at ? formatAgoMs(w.failed_at) : 'unknown time ago';
-      const reasonText = w.reason ?? 'see Linear comment for details';
-      const btn = el('button', { class: 'redispatch-btn' }, 'Re-dispatch');
-      btn.addEventListener('click', async () => {
-        btn.disabled = true;
-        btn.textContent = 'Dispatching…';
-        const actionsEl = btn.parentElement;
-        const existing = actionsEl?.querySelector('.redispatch-error');
-        if (existing) existing.remove();
-        try {
-          const res = await fetch(
-            `/api/gaggles/${encodeURIComponent(name)}/targets/redispatch`,
-            {
-              method: 'POST',
-              headers: { 'content-type': 'application/json' },
-              body: JSON.stringify({ issue_id: w.issue_id, repo_alias: w.repo_alias }),
-            },
-          );
-          if (!res.ok) {
-            const data = await res.json().catch(() => ({}));
-            throw new Error(data.error ?? `HTTP ${res.status}`);
-          }
-          btn.closest('.worker-card')?.remove();
-        } catch (err) {
-          btn.disabled = false;
-          btn.textContent = 'Re-dispatch';
-          const errEl = el('span', { class: 'redispatch-error' }, err.message ?? 'failed');
-          btn.parentElement?.appendChild(errEl);
-        }
-      });
-      root.appendChild(
-        el('div', { class: 'worker-card failed' }, [
-          el('div', { class: 'head' }, [
-            el('div', { class: 'who' }, [
-              el('span', { class: 'ws-color', style: { background: colorFor(name) } }),
-              `${w.issue_identifier} · ${w.repo_alias}`,
-            ]),
-            el('span', { class: 'badge failed' }, `failed · ${agoStr}`),
-          ]),
-          el('div', { class: 'meta' }, w.issue_title || ''),
-          el('div', { class: 'fail-reason' }, reasonText),
-          el('div', { class: 'actions' }, [btn]),
-        ]),
-      );
-    }
+        el('div', { class: 'meta' }, `turn ${w.turn_count} · ${formatAgo(w.started_at)}`),
+        el('div', { class: 'meta' }, `${tokens.toLocaleString()} tokens`),
+        el('div', { class: 'token-bar' }, [el('div', { class: 'fill', style: { width: `${pct}%` } })]),
+        w.last_message
+          ? el('div', { class: 'meta', style: { fontStyle: 'italic', marginTop: '4px' } }, w.last_message.slice(0, 120))
+          : null,
+        el('div', { class: 'actions' }, [el('a', linkAttrs, runUrl ? 'View run ↗' : 'Open runs ↗')]),
+      ]),
+    );
   }
 }
-
 // ─── Workspace controls ──────────────────────────────────────────────────────
 async function apiPost(path) {
   try {
@@ -486,8 +348,10 @@ function renderGaggles() {
     const s = state.states[w.name];
     const slots = s ? `${s.slots_used}/${s.max_concurrent_agents}` : '—';
     const runCount = s?.running?.length ?? 0;
-    const gateCount = s?.supervised_gates?.length ?? 0;
-    const queuedCount = (s?.pending_targets ?? []).reduce((acc, p) => acc + p.targets.length, 0);
+    // Gate and queue counts come from the board, which is workspace-scoped and
+    // read from the control plane — a stopped gaggle still has queued work, and a
+    // count taken from its (absent) in-memory state would read zero.
+    const gateCount = state.board.gates.filter((g) => g.workspace === w.name).length;
     const isStopped = w.status === 'stopped' || w.status === 'crashed';
 
     const stopBtn = el('button', {
@@ -521,7 +385,6 @@ function renderGaggles() {
           el('span', { class: 'pill' }, `${slots} slots`),
           el('span', { class: 'pill', style: { color: 'var(--green)' } }, `● ${runCount}`),
           el('span', { class: 'pill', style: { color: 'var(--amber)' } }, `⏸ ${gateCount}`),
-          el('span', { class: 'pill', style: { color: 'var(--purple)' } }, `⏳ ${queuedCount}`),
         ]),
       ]),
     );
@@ -624,9 +487,363 @@ $('#btn-clear-logs').addEventListener('click', () => {
   renderLogs();
 });
 
+// ─── Board: tickets and their statuses ──────────────────────────────────────
+//
+// The control plane is the source of truth, so the board reads straight from it
+// rather than from any gaggle's in-memory state. That is why it still renders
+// with every gaggle process stopped.
+
+const TICKET_STATUS_ORDER = [
+  'running',
+  'analyzed',
+  'analysis_requested',
+  'analyzing',
+  'analysis_failed',
+  'imported',
+  'done',
+  'cancelled',
+  'archived',
+];
+
+const STATUS_COLOR = {
+  imported: 'var(--gray)',
+  analysis_requested: 'var(--purple)',
+  analyzing: 'var(--purple)',
+  analyzed: 'var(--accent)',
+  analysis_failed: 'var(--red)',
+  running: 'var(--green)',
+  done: 'var(--text-faint)',
+  cancelled: 'var(--text-faint)',
+  archived: 'var(--text-faint)',
+  // targets
+  excluded: 'var(--text-faint)',
+  blocked: 'var(--amber)',
+  ready: 'var(--accent)',
+  dispatching: 'var(--purple)',
+  gate_waiting: 'var(--amber)',
+  succeeded: 'var(--green)',
+  failed: 'var(--red)',
+};
+
+/** Actions offered per ticket status. Keeps the UI and the state machine aligned. */
+const TICKET_ACTIONS = {
+  imported: [
+    ['analyze', 'Analyze', 'primary'],
+    ['archive', 'Archive', ''],
+  ],
+  analysis_failed: [
+    ['analyze', 'Retry analysis', 'primary'],
+    ['archive', 'Archive', ''],
+  ],
+  analyzed: [
+    ['start', 'Start', 'primary'],
+    ['analyze', 'Re-analyze', ''],
+    ['archive', 'Archive', ''],
+  ],
+  running: [['cancel', 'Cancel', 'stop']],
+  archived: [['restore', 'Restore', '']],
+  // Both of these are waiting on a daemon. A ticket whose workspace is stopped or
+  // misconfigured would sit here with no way out at all if Cancel were missing.
+  analysis_requested: [['cancel', 'Cancel', 'stop']],
+  analyzing: [['cancel', 'Cancel', 'stop']],
+};
+
+state.board = { tickets: [], counts: {}, gates: [], cursor: 0, filter: '', search: '', expanded: new Set(), available: true };
+
+async function controlGet(path) {
+  const res = await fetch(`/api/control${path}`);
+  if (res.status === 503) {
+    state.board.available = false;
+    return null;
+  }
+  state.board.available = true;
+  if (!res.ok) return null;
+  return res.json();
+}
+
+async function controlPost(path, body) {
+  const res = await fetch(`/api/control${path}`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(body ?? {}),
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    // A 409 is the normal answer when the world moved on — surface it rather than
+    // silently doing nothing, so the operator knows their click was rejected.
+    alert(data.error ?? `Request failed (HTTP ${res.status})`);
+  }
+  await refreshBoard();
+  return res.ok;
+}
+
+async function refreshBoard() {
+  const ws = state.selected === 'all' ? '' : `?workspace=${encodeURIComponent(state.selected)}`;
+  const [board, gates] = await Promise.all([
+    controlGet(`/board${ws}`),
+    controlGet(`/gates${ws}`),
+  ]);
+  if (board) {
+    state.board.tickets = board.tickets ?? [];
+    state.board.counts = board.counts ?? {};
+    state.board.cursor = board.latest_event_id ?? 0;
+  }
+  if (gates) state.board.gates = gates.gates ?? [];
+  renderBoard();
+  renderGates();
+}
+
+function statusPill(status) {
+  return el('span', {
+    class: 'status-pill',
+    style: { color: STATUS_COLOR[status] ?? 'var(--text-dim)', borderColor: STATUS_COLOR[status] ?? 'var(--border)' },
+  }, status.replace(/_/g, ' '));
+}
+
+function renderBoard() {
+  const list = $('#board-list');
+  list.innerHTML = '';
+
+  if (!state.board.available) {
+    list.appendChild(el('div', { class: 'empty' },
+      'Control plane unavailable — check database.url and run `gaggle doctor`.'));
+    $('#board-filters').innerHTML = '';
+    return;
+  }
+
+  renderBoardFilters();
+
+  const term = state.board.search.toLowerCase();
+  const rows = state.board.tickets
+    .filter((r) => !state.board.filter || r.ticket.status === state.board.filter)
+    .filter((r) => !term
+      || r.ticket.identifier.toLowerCase().includes(term)
+      || r.ticket.title.toLowerCase().includes(term))
+    .sort((a, b) =>
+      TICKET_STATUS_ORDER.indexOf(a.ticket.status) - TICKET_STATUS_ORDER.indexOf(b.ticket.status)
+      || (a.ticket.priority ?? 99) - (b.ticket.priority ?? 99)
+      || a.ticket.identifier.localeCompare(b.ticket.identifier));
+
+  if (rows.length === 0) {
+    list.appendChild(el('div', { class: 'empty' },
+      state.board.tickets.length === 0
+        ? 'No tickets imported yet. Press Sync to import from the tracker.'
+        : 'No tickets match the current filter.'));
+    return;
+  }
+
+  for (const row of rows) list.appendChild(ticketRow(row));
+}
+
+function renderBoardFilters() {
+  const box = $('#board-filters');
+  box.innerHTML = '';
+  const total = Object.values(state.board.counts).reduce((a, b) => a + b, 0);
+  const chips = [['', 'all', total], ...TICKET_STATUS_ORDER
+    .filter((s) => (state.board.counts[s] ?? 0) > 0)
+    .map((s) => [s, s.replace(/_/g, ' '), state.board.counts[s]])];
+
+  for (const [value, label, count] of chips) {
+    box.appendChild(el('button', {
+      class: `filter-chip${state.board.filter === value ? ' active' : ''}`,
+      onclick: () => {
+        state.board.filter = value;
+        renderBoard();
+      },
+    }, `${label} ${count}`));
+  }
+}
+
+function ticketRow({ ticket, targets }) {
+  const expanded = state.board.expanded.has(ticket.id);
+  const head = el('div', { class: 'ticket-head' }, [
+    el('button', {
+      class: 'ticket-toggle',
+      title: expanded ? 'Collapse' : 'Expand',
+      onclick: () => {
+        if (expanded) state.board.expanded.delete(ticket.id);
+        else state.board.expanded.add(ticket.id);
+        renderBoard();
+      },
+    }, expanded ? '▾' : '▸'),
+    ticket.url
+      ? el('a', { class: 'ticket-key', href: ticket.url, target: '_blank', rel: 'noopener' }, ticket.identifier)
+      : el('span', { class: 'ticket-key' }, ticket.identifier),
+    el('span', { class: 'ticket-title', title: ticket.title }, ticket.title),
+    statusPill(ticket.status),
+    el('span', { class: 'target-chips' }, targets.map((t) =>
+      el('span', {
+        class: 'target-chip',
+        title: `${t.repo_alias}: ${t.status}${t.failure_reason ? ` — ${t.failure_reason}` : ''}`,
+        style: { color: STATUS_COLOR[t.status] ?? 'var(--text-dim)' },
+      }, t.repo_alias))),
+    el('span', { class: 'ticket-actions' }, (TICKET_ACTIONS[ticket.status] ?? []).map(([action, label, kind]) =>
+      el('button', {
+        class: `nest-btn ${kind}`,
+        onclick: () => controlPost(`/tickets/${ticket.id}/${action}`),
+      }, label))),
+  ]);
+
+  const badges = [];
+  if (ticket.external_terminal_at) {
+    badges.push(el('span', { class: 'badge warn' },
+      'closed in the tracker while running — cancel it or let it finish'));
+  }
+  if (ticket.analysis_error) {
+    badges.push(el('span', { class: 'badge err' }, ticket.analysis_error));
+  }
+
+  const children = [head];
+  if (badges.length) children.push(el('div', { class: 'ticket-badges' }, badges));
+  if (expanded) children.push(ticketDetail(ticket, targets));
+  return el('div', { class: 'ticket-row' }, children);
+}
+
+function ticketDetail(ticket, targets) {
+  const parts = [];
+  if (ticket.analysis_summary) {
+    parts.push(el('div', { class: 'detail-summary' }, ticket.analysis_summary));
+  }
+  if (targets.length === 0) {
+    parts.push(el('div', { class: 'empty' }, 'No targets yet — press Analyze to work out which repos are involved.'));
+  } else {
+    parts.push(el('div', { class: 'target-table' }, targets.map((t) => targetRow(ticket, t))));
+  }
+  return el('div', { class: 'ticket-detail' }, parts);
+}
+
+function targetRow(ticket, t) {
+  const actions = [];
+  const push = (action, label, kind) => actions.push(el('button', {
+    class: `nest-btn ${kind ?? ''}`,
+    onclick: () => controlPost(`/targets/${t.id}/${action}`),
+  }, label));
+
+  if (t.status === 'failed' || t.status === 'cancelled') {
+    push('redispatch', 'Re-dispatch', 'primary');
+    // The only way to resolve a target you have decided not to pursue. Without it
+    // one permanently-failed target keeps its ticket `running` forever.
+    push('exclude', 'Give up on this');
+  }
+  if (['blocked', 'ready'].includes(t.status)) push('exclude', 'Exclude');
+  if (t.status === 'excluded') push('include', 'Include');
+  if (['dispatching', 'running', 'gate_waiting'].includes(t.status)) {
+    push('cancel', t.cancel_requested ? 'Cancelling…' : 'Cancel', 'stop');
+  }
+
+  return el('div', { class: 'target-line' }, [
+    el('span', { class: 'target-alias' }, t.repo_alias),
+    statusPill(t.status),
+    el('span', { class: 'target-workflow', title: t.workflow }, t.workflow),
+    el('span', { class: 'target-meta' },
+      [t.attempt > 0 ? `attempt ${t.attempt + 1}` : '', t.failure_reason ?? '']
+        .filter(Boolean).join(' · ')),
+    el('span', { class: 'target-actions' }, actions),
+  ]);
+}
+
+// ─── Gates: the only place a gate gets answered ──────────────────────────────
+
+function renderGates() {
+  const panel = $('#gates-panel');
+  const list = $('#gates-list');
+  const gates = state.board.gates;
+  panel.classList.toggle('hidden', gates.length === 0);
+  $('#gates-count').textContent = gates.length ? `${gates.length} waiting` : '';
+  list.innerHTML = '';
+
+  for (const g of gates) {
+    const input = el('textarea', {
+      class: 'gate-input',
+      rows: '2',
+      placeholder: 'Your answer, or a reason for rejecting…',
+    });
+    const pending = g.pending_decision;
+
+    list.appendChild(el('div', { class: 'gate-card' }, [
+      el('div', { class: 'gate-head' }, [
+        el('span', { class: 'ticket-key' }, `${g.identifier} · ${g.repo_alias}`),
+        el('span', { class: 'gate-age' }, formatAgo(g.gate_opened_at)),
+        g.rework_attempts > 0
+          ? el('span', { class: 'badge' }, `revision ${g.rework_attempts}`)
+          : null,
+        pending ? el('span', { class: 'badge warn' }, `${pending} — waiting for the daemon`) : null,
+      ]),
+      el('pre', { class: 'gate-message' }, g.gate_message),
+      pending ? null : el('div', { class: 'gate-actions' }, [
+        input,
+        el('button', {
+          class: 'nest-btn primary',
+          onclick: () => controlPost(`/gates/${g.target_id}/approve`, { comment: input.value || null }),
+        }, 'Approve'),
+        el('button', {
+          class: 'nest-btn stop',
+          onclick: () => {
+            if (!input.value.trim()) {
+              alert('A rejection needs a reason so the rework has something to act on.');
+              return;
+            }
+            controlPost(`/gates/${g.target_id}/reject`, { reason: input.value });
+          },
+        }, 'Reject'),
+        // The third answer to a gate: this work is blocked on a change somewhere
+        // else. Files a blocker issue in the tracker and parks the target until it
+        // is resolved. The whole path existed server-side with nothing to trigger it.
+        el('button', {
+          class: 'nest-btn',
+          title: 'File a blocker and park this target until it is resolved',
+          onclick: () => {
+            const title = prompt('What is blocking this? (becomes the blocker issue title)');
+            if (!title || !title.trim()) return;
+            controlPost(`/gates/${g.target_id}/create-blocker`, {
+              title: title.trim(),
+              description: input.value || '',
+            });
+          },
+        }, 'Blocked by…'),
+      ]),
+    ]));
+  }
+}
+
+// ─── Board wiring ───────────────────────────────────────────────────────────
+
+$('#board-search').addEventListener('input', (e) => {
+  state.board.search = e.target.value;
+  renderBoard();
+});
+
+$('#btn-sync').addEventListener('click', async (e) => {
+  const btn = e.target;
+  btn.disabled = true;
+  btn.textContent = '⟳ Syncing…';
+  try {
+    const ws = state.selected === 'all' ? '' : `?workspace=${encodeURIComponent(state.selected)}`;
+    const res = await fetch(`/api/control/sync${ws}`, { method: 'POST' });
+    if (!res.ok) {
+      const data = await res.json().catch(() => ({}));
+      alert(data.error ?? 'Sync failed — is a gaggle running?');
+    }
+    await refreshBoard();
+  } finally {
+    btn.disabled = false;
+    btn.textContent = '⟳ Sync';
+  }
+});
+
+// Poll the cursor rather than the whole board: it is one integer, and refetching
+// only when it moves keeps a large board cheap.
+setInterval(async () => {
+  const ws = state.selected === 'all' ? '' : `?workspace=${encodeURIComponent(state.selected)}`;
+  const cur = await controlGet(`/cursor${ws}`);
+  if (cur && cur.latest_event_id !== state.board.cursor) await refreshBoard();
+}, 3000);
+
 // Refresh "ago" labels on a steady tick.
 setInterval(() => {
   renderWorkers();
+  renderGates();
 }, 5000);
 
+// bootstrap() ends in renderAll(), which refreshes the board — no second call.
 bootstrap();

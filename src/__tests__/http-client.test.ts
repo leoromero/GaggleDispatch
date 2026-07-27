@@ -5,7 +5,7 @@
  */
 
 import { describe, expect, test } from 'bun:test';
-import { RecordingHttpClient, type RecordedCall } from '../tracker/http-client.ts';
+import { FetchHttpClient, RecordingHttpClient, type RecordedCall } from '../tracker/http-client.ts';
 
 describe('RecordingHttpClient', () => {
   test('captures method, url, headers, and parsed JSON body', async () => {
@@ -95,5 +95,64 @@ describe('RecordingHttpClient', () => {
     http.enqueue('ok');
     await http.fetch('https://x', { method: 'POST', body: 'not-json' });
     expect(http.calls[0]?.body).toBe('not-json');
+  });
+});
+
+// ─── the deadline ───────────────────────────────────────────────────────────
+//
+// A tracker that is *down* refuses the connection and the call throws, which was
+// always handled. A tracker that is *degraded* accepts and never answers, and Bun
+// applies no response deadline of its own — so `fetch` simply never settled. That
+// composed into a permanently wedged daemon: the outbox drainer awaited it inside
+// a transaction, and the orchestrator rescheduled its next tick only in a
+// `finally` that therefore never ran. A hang is not a throw.
+
+describe('FetchHttpClient — the response deadline', () => {
+  /** A server that accepts the connection and never replies. */
+  function stalling(): { url: string; stop: () => void } {
+    const server = Bun.serve({ port: 0, fetch: () => new Promise<Response>(() => {}) });
+    return { url: `http://127.0.0.1:${server.port}/`, stop: () => server.stop(true) };
+  }
+
+  test('a stalled server aborts rather than hanging forever', async () => {
+    const s = stalling();
+    try {
+      const started = Date.now();
+      await expect(new FetchHttpClient(250).fetch(s.url)).rejects.toThrow();
+      // The point is that it settles at all; the bound just proves it was the
+      // deadline and not something else.
+      expect(Date.now() - started).toBeLessThan(5000);
+    } finally {
+      s.stop();
+    }
+  });
+
+  test("a caller's own signal still works — the deadline is added, not substituted", async () => {
+    // Overwriting `init.signal` would silently disable the caller's cancellation,
+    // which is a worse bug than the one the deadline fixes. The deadline here is
+    // far longer than the test, so only the caller's abort can settle this.
+    const s = stalling();
+    const ctrl = new AbortController();
+    try {
+      const inflight = new FetchHttpClient(60_000)
+        .fetch(s.url, { signal: ctrl.signal })
+        .then(() => 'responded')
+        .catch((err: Error) => err.name);
+      ctrl.abort();
+      expect(await inflight).toBe('AbortError');
+    } finally {
+      s.stop();
+    }
+  });
+
+  test('a healthy response is untouched by the deadline', async () => {
+    const server = Bun.serve({ port: 0, fetch: () => Response.json({ ok: 1 }) });
+    try {
+      const res = await new FetchHttpClient(5_000).fetch(`http://127.0.0.1:${server.port}/`);
+      expect(res.ok).toBe(true);
+      expect(await res.json()).toEqual({ ok: 1 });
+    } finally {
+      server.stop(true);
+    }
   });
 });

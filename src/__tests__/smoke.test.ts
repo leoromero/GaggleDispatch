@@ -6,15 +6,8 @@ import { loadWorkflowDefinition, splitFrontMatter } from '../config/loader.ts';
 import { buildServiceConfig } from '../config/service-config.ts';
 import { parseGaggleMd } from '../registry/gaggle-md.ts';
 import { applyNameCollisions } from '../registry/repo-syncer.ts';
-import { blockersSatisfied, isBlockerSatisfied, repoTargetReady } from '../orchestrator/readiness.ts';
-import {
-  availableSlots,
-  buildSessionId,
-  createInitialState,
-  noRetryEntriesFor,
-  noRunningWorkersFor,
-  workerKey,
-} from '../orchestrator/state.ts';
+import { blockersSatisfied, isBlockerSatisfied } from '../orchestrator/readiness.ts';
+import { buildSessionId, createInitialState } from '../orchestrator/state.ts';
 import { buildGaggleEnv } from '../workspace/message.ts';
 import { sanitizeId, deriveRepoSlug, parseGithubOwnerRepo, isInside, expandPath, expandEnvString } from '../util/paths.ts';
 import { buildIssueMessage } from '../workspace/message.ts';
@@ -351,60 +344,8 @@ describe('readiness predicate', () => {
     });
   });
 
-  describe('repoTargetReady', () => {
-    const makeTarget = (depends_on: string[], ready_when = 'merged'): RepoTarget => ({
-      repo_url: '', repo_alias: 'fe', local_path: '/fe',
-      archon_workflow: 'wf', rationale: 'r', components: [],
-      depends_on, ready_when,
-    });
-
-    test('returns true when target has no dependencies', () => {
-      const state = createInitialState({ polling: { interval_ms: 1 }, agent: { max_concurrent_agents: 2 } } as unknown as ServiceConfig);
-      expect(repoTargetReady(makeTarget([]), 'p1', state, mergedCfg)).toBe(true);
-    });
-
-    test('returns false when upstream sub-issue not in sibling_subissues yet', () => {
-      const state = createInitialState({ polling: { interval_ms: 1 }, agent: { max_concurrent_agents: 2 } } as unknown as ServiceConfig);
-      // No sibling_subissues entry → upstream not dispatched
-      expect(repoTargetReady(makeTarget(['be']), 'p1', state, mergedCfg)).toBe(false);
-    });
-
-    test('returns true when upstream is in sibling_subissues and snapshot is Done', () => {
-      const state = createInitialState({ polling: { interval_ms: 1 }, agent: { max_concurrent_agents: 2 } } as unknown as ServiceConfig);
-      state.sibling_subissues.set('p1', new Map([['be', 'sub-be']]));
-      state.subissue_snapshot.set('sub-be', { state: 'Done', labels: [], refreshed_at: Date.now() });
-      expect(repoTargetReady(makeTarget(['be']), 'p1', state, mergedCfg)).toBe(true);
-    });
-
-    test('returns false when upstream snapshot state is In Progress', () => {
-      const state = createInitialState({ polling: { interval_ms: 1 }, agent: { max_concurrent_agents: 2 } } as unknown as ServiceConfig);
-      state.sibling_subissues.set('p1', new Map([['be', 'sub-be']]));
-      state.subissue_snapshot.set('sub-be', { state: 'In Progress', labels: [], refreshed_at: Date.now() });
-      expect(repoTargetReady(makeTarget(['be']), 'p1', state, mergedCfg)).toBe(false);
-    });
-
-    test('returns true when upstream is in target_machine_states succeeded (no sibling entry needed)', () => {
-      const state = createInitialState({ polling: { interval_ms: 1 }, agent: { max_concurrent_agents: 2 } } as unknown as ServiceConfig);
-      state.target_machine_states.set(workerKey('p1', 'be'), 'succeeded');
-      // No sibling_subissues — relies on completed set
-      expect(repoTargetReady(makeTarget(['be']), 'p1', state, mergedCfg)).toBe(true);
-    });
-
-    test('completed shortcut only applies for merged readiness; deployed requires snapshot', () => {
-      const deployedTarget = makeTarget(['be'], 'deployed');
-      const state = createInitialState({ polling: { interval_ms: 1 }, agent: { max_concurrent_agents: 2 } } as unknown as ServiceConfig);
-      // Key in completed but no sibling entry or snapshot → ready_when=deployed does NOT short-circuit
-      state.target_machine_states.set(workerKey('p1', 'be'), 'succeeded');
-      expect(repoTargetReady(deployedTarget, 'p1', state, baseCfg)).toBe(false);
-    });
-
-    test('returns false when sibling entry exists but snapshot is missing', () => {
-      const state = createInitialState({ polling: { interval_ms: 1 }, agent: { max_concurrent_agents: 2 } } as unknown as ServiceConfig);
-      state.sibling_subissues.set('p1', new Map([['be', 'sub-be']]));
-      // Snapshot not set → not ready
-      expect(repoTargetReady(makeTarget(['be']), 'p1', state, mergedCfg)).toBe(false);
-    });
-  });
+  // The `repoTargetReady` suite moved to control-readiness.test.ts, which asserts
+  // the same merged-vs-deployed rules against control-plane rows.
 });
 
 describe('buildGaggleEnv', () => {
@@ -416,7 +357,7 @@ describe('buildGaggleEnv', () => {
     };
     const target: RepoTarget = {
       repo_url: 'https://github.com/o/r', repo_alias: 'repo-r', local_path: '/r',
-      archon_workflow: 'gaggle/fix', rationale: 'why', components: [],
+      workflow: 'gaggle/fix', rationale: 'why', components: [],
     };
     const analysis: IssueAnalysis = { issue_id: 'i1', analysis_summary: 'summary', repo_targets: [] };
     const env = buildGaggleEnv({ issue, repo_target: target, analysis, attempt: null });
@@ -435,7 +376,7 @@ describe('buildGaggleEnv', () => {
       priority: 0, state: 'In Progress', branch_name: null, url: null,
       labels: [], blocked_by: [], created_at: null, updated_at: null,
     };
-    const target: RepoTarget = { repo_url: '', repo_alias: 'r', local_path: '', archon_workflow: '', rationale: '', components: [] };
+    const target: RepoTarget = { repo_url: '', repo_alias: 'r', local_path: '', workflow: '', rationale: '', components: [] };
     const analysis: IssueAnalysis = { issue_id: 'i1', analysis_summary: '', repo_targets: [] };
     expect(buildGaggleEnv({ issue, repo_target: target, analysis, attempt: 2 }).GAGGLE_ATTEMPT).toBe('2');
   });
@@ -450,7 +391,7 @@ describe('issue message construction', () => {
     };
     const target: RepoTarget = {
       repo_url: 'https://github.com/o/r', repo_alias: 'r', local_path: '/r',
-      archon_workflow: 'gaggle/gaggle-fix-issue', rationale: 'why', components: ['c'],
+      workflow: 'gaggle/gaggle-fix-issue', rationale: 'why', components: ['c'],
     };
     const analysis: IssueAnalysis = {
       issue_id: 'iss-1', analysis_summary: 'sum', repo_targets: [target],
@@ -465,50 +406,25 @@ describe('issue message construction', () => {
 });
 
 describe('orchestrator state', () => {
-  test('createInitialState produces empty maps/sets', () => {
+  test('createInitialState carries config through and holds no durable state', () => {
     const cfg = { polling: { interval_ms: 1 }, agent: { max_concurrent_agents: 2 } } as unknown as ServiceConfig;
     const s = createInitialState(cfg);
     expect(s.running.size).toBe(0);
-    expect(s.parent_machine_states.size).toBe(0);
-    expect(s.target_machine_states.size).toBe(0);
     expect(s.poll_interval_ms).toBe(1);
-  });
-
-  test('workerKey produces deterministic "id__alias" string', () => {
-    expect(workerKey('issue-1', 'repo-a')).toBe('issue-1__repo-a');
-    expect(workerKey('i', 'r')).toBe('i__r');
+    expect(s.max_concurrent_agents).toBe(2);
+    expect(s.claude_totals.total_tokens).toBe(0);
+    // Telemetry only. Everything a decision depends on lives in Postgres, which
+    // is what makes recovery a query rather than a reconstruction.
+    expect(Object.keys(s).sort()).toEqual([
+      'claude_totals',
+      'max_concurrent_agents',
+      'poll_interval_ms',
+      'running',
+    ]);
   });
 
   test('buildSessionId encodes identifier, alias, and attempt', () => {
     expect(buildSessionId('SYM-1', 'repo-a', null)).toBe('SYM-1__repo-a__0');
     expect(buildSessionId('SYM-1', 'repo-a', 3)).toBe('SYM-1__repo-a__3');
-  });
-
-  test('availableSlots returns max_concurrent - running.size, floored at 0', () => {
-    const s = createInitialState({ polling: { interval_ms: 1 }, agent: { max_concurrent_agents: 3 } } as unknown as ServiceConfig);
-    expect(availableSlots(s)).toBe(3);
-    s.running.set('k1', {} as never);
-    s.running.set('k2', {} as never);
-    expect(availableSlots(s)).toBe(1);
-    s.running.set('k3', {} as never);
-    expect(availableSlots(s)).toBe(0);
-    s.running.set('k4', {} as never);
-    expect(availableSlots(s)).toBe(0); // never goes negative
-  });
-
-  test('noRunningWorkersFor returns true when no key starts with issue_id', () => {
-    const s = createInitialState({ polling: { interval_ms: 1 }, agent: { max_concurrent_agents: 2 } } as unknown as ServiceConfig);
-    expect(noRunningWorkersFor(s, 'p1')).toBe(true);
-    s.running.set('p1__repo-a', {} as never);
-    expect(noRunningWorkersFor(s, 'p1')).toBe(false);
-    expect(noRunningWorkersFor(s, 'p2')).toBe(true); // p2 has no workers
-  });
-
-  test('noRetryEntriesFor returns true when no retry key starts with issue_id', () => {
-    const s = createInitialState({ polling: { interval_ms: 1 }, agent: { max_concurrent_agents: 2 } } as unknown as ServiceConfig);
-    expect(noRetryEntriesFor(s, 'p1')).toBe(true);
-    s.retry_attempts.set('p1__repo-b', {} as never);
-    expect(noRetryEntriesFor(s, 'p1')).toBe(false);
-    expect(noRetryEntriesFor(s, 'p2')).toBe(true);
   });
 });

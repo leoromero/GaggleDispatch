@@ -1,0 +1,35 @@
+# Postgres for GaggleDispatch.
+#
+#   docker compose up -d
+#   export DATABASE_URL=postgres://gaggle:gaggle@localhost:55432/gaggle
+#
+# Port 55432 rather than 5432 so this never collides with a Postgres the
+# developer already runs locally.
+#
+# The `gaggle_test` database backs the store conformance suite:
+#   TEST_DATABASE_URL=postgres://gaggle:gaggle@localhost:55432/gaggle_test bun test
+
+services:
+  postgres:
+    # 16 is the floor: the schema needs GENERATED ALWAYS AS IDENTITY, jsonb `||`,
+    # and partial unique indexes. Newer majors are fine.
+    image: postgres:16-alpine
+    container_name: gaggle-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: gaggle
+      POSTGRES_PASSWORD: gaggle
+      POSTGRES_DB: gaggle
+    ports:
+      - '55432:5432'
+    volumes:
+      - gaggle-pgdata:/var/lib/postgresql/data
+      - ./scripts/init-test-db.sql:/docker-entrypoint-initdb.d/10-test-db.sql:ro
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U gaggle -d gaggle']
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  gaggle-pgdata:
