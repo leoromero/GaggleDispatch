@@ -68,7 +68,7 @@ export interface WorkerLauncher {
       onGatePaused: (runId: string, message: string) => void;
       onExit: (event: { type: string; exit_code?: number }) => void;
     };
-  }): Promise<{ cancel: (reason?: string) => void }>;
+  }): Promise<{ cancel: (reason?: string) => void; run_id: string | null }>;
 }
 
 export interface EngineExecutorDeps {
@@ -93,12 +93,6 @@ export class EngineExecutorAdapter implements ExecutorPort {
     const { ticket, target } = ctx;
     const repoTarget = repoTargetFrom(ticket, target);
 
-    // The engine writes the run row before `startRun` resolves, so unlike the
-    // subprocess this replaced, the id is known by the time we return it. The
-    // callback still fires — the port allows either — and reporting it twice is
-    // idempotent.
-    let runId: string | null = null;
-
     const handle = await this.deps.launch({
       ticket,
       target,
@@ -113,7 +107,6 @@ export class EngineExecutorAdapter implements ExecutorPort {
           /* Telemetry is the orchestrator's concern, not the control plane's. */
         },
         onRunId: (id) => {
-          runId = id;
           void this.deps.sink().recordRunId(target.id, id).catch((err) => {
             logger.warn('Could not record the run id', { error: (err as Error).message });
           });
@@ -129,7 +122,14 @@ export class EngineExecutorAdapter implements ExecutorPort {
     });
 
     this.live.set(target.id, handle);
-    return { run_id: runId };
+    // From the launcher's return value, not from the `onRunId` callback. The
+    // engine writes the run row inside `startRun`, but it emits `run_started`
+    // from inside the run loop, which `startRun` does not await — so the
+    // callback lands *after* this returns, and reading it here always yielded
+    // null. A null run id makes the target invisible to `reconcileRuns` and
+    // hands it to the orphan sweep, which requeues and re-dispatches it a
+    // couple of minutes into a perfectly healthy run.
+    return { run_id: handle.run_id };
   }
 
   async killRun(runId: string | null, ctx: DispatchContext): Promise<void> {

@@ -107,31 +107,17 @@ body {
   margin-top: 4px;
 }
 
-.worker-card .actions a {
+.worker-card .actions .run-id {
   font-size: 11px;
-  color: var(--accent);
-  text-decoration: none;
-}
-
-.worker-card .actions a:hover {
-  text-decoration: underline;
-}
-
-.worker-card .actions a.disabled {
-  color: var(--text-faint);
-  text-decoration: line-through;
-  cursor: not-allowed;
-  pointer-events: none;
-}
-
-.worker-card .actions a.fallback {
+  font-family: var(--mono, ui-monospace, SFMono-Regular, Menlo, monospace);
   color: var(--text-dim);
+}
+
+.worker-card .actions .run-id.disabled {
+  color: var(--text-faint);
   font-style: italic;
 }
 
-.worker-card .actions a.fallback:hover {
-  color: var(--accent);
-}
 
 main {
   display: grid;

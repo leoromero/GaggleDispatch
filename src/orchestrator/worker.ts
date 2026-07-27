@@ -54,6 +54,15 @@ export interface WorkerStartArgs {
 export interface RunningWorker {
   cancel: (reason?: string) => void;
   done: Promise<void>;
+  /**
+   * The run id, or null when the run never started.
+   *
+   * Known synchronously: the engine writes the run row inside `startRun`. The
+   * `run_started` event carries it too, but that fires from inside the run
+   * loop, which `startRun` does not await — so a caller that waited for the
+   * event would be handed null and act on it.
+   */
+  run_id: string | null;
 }
 
 /**
@@ -120,7 +129,7 @@ export async function spawnWorker(args: WorkerStartArgs, cb: WorkerCallbacks): P
   } catch (err) {
     log.error('before_run hook failed', { error: (err as Error).message });
     cb.onExit({ type: 'run_failed', exit_code: 99 });
-    return { cancel: () => {}, done: Promise.resolve() };
+    return { cancel: () => {}, done: Promise.resolve(), run_id: null };
   }
 
   const message =
@@ -162,7 +171,7 @@ export async function spawnWorker(args: WorkerStartArgs, cb: WorkerCallbacks): P
     log.error('Could not start the workflow', { error: (err as Error).message });
     cb.onOutput(`✗ ${(err as Error).message}`);
     cb.onExit({ type: 'run_failed', exit_code: 98 });
-    return { cancel: () => {}, done: Promise.resolve() };
+    return { cancel: () => {}, done: Promise.resolve(), run_id: null };
   }
 
   // The run id reaches the caller through the `run_started` event, which
@@ -174,7 +183,7 @@ export async function spawnWorker(args: WorkerStartArgs, cb: WorkerCallbacks): P
   // the resumed run actually finished. The orchestrator runs it from
   // handleWorkerExit, which is the one place that knows an outcome is final.
 
-  return { cancel: handle.cancel, done: handle.done };
+  return { cancel: handle.cancel, done: handle.done, run_id: handle.run_id };
 }
 
 export function buildLiveSession(args: {

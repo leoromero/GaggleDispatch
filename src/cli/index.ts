@@ -28,7 +28,12 @@ import {
 } from './hub.ts';
 import { GaggleError } from '../domain/errors.ts';
 
-const program = new Command();
+/**
+ * Exported so a test can walk the command tree. Registration is module-level,
+ * so a duplicate command throws at import — which is worth catching in a test
+ * rather than on an operator's first invocation.
+ */
+export const program = new Command();
 program
   .name('gaggle')
   .description('GaggleDispatch — federated multi-repo AI coding orchestrator')
@@ -71,15 +76,6 @@ workflow
   .option('--json', 'machine-readable output')
   .action(async (name: string | undefined, opts: { dir?: string; json?: boolean }) => {
     await runWorkflowValidate(name, { cwd: program.opts().cwd, dir: opts.dir, json: opts.json });
-  });
-
-// ── doctor ─────────────────────────────────────────────────────────────
-program
-  .command('doctor')
-  .description('Check that this host can run workflows (bash, git, gh, database)')
-  .option('--json', 'machine-readable output')
-  .action(async (opts: { json?: boolean }) => {
-    await runDoctor({ cwd: program.opts().cwd, json: opts.json });
   });
 
 // ── db ────────────────────────────────────────────────────────────────
@@ -285,11 +281,16 @@ auth
     await runAuthLinear({ cwd: program.opts().cwd });
   });
 
-program.parseAsync(process.argv).catch((err) => {
-  if (err instanceof GaggleError) {
-    console.error(chalk.red(`✗ [${err.code}] ${err.message}`));
-  } else {
-    console.error(chalk.red(`✗ ${(err as Error).message ?? err}`));
-  }
-  process.exit(1);
-});
+// Only when run as the binary. Importing this file — which the entry-point
+// test does — must register the commands without also executing one against
+// the importer's argv.
+if (import.meta.main) {
+  program.parseAsync(process.argv).catch((err) => {
+    if (err instanceof GaggleError) {
+      console.error(chalk.red(`✗ [${err.code}] ${err.message}`));
+    } else {
+      console.error(chalk.red(`✗ ${(err as Error).message ?? err}`));
+    }
+    process.exit(1);
+  });
+}

@@ -232,11 +232,12 @@ function renderWorkers() {
     const tokens = w.claude_total_tokens ?? 0;
     const pct = Math.min(100, Math.round((tokens / 200000) * 100));
     // The engine runs in this process, so there is no external run page to
-    // link to. The run id is still worth showing: it is what `gaggle run` and
-    // the workflow_runs table are keyed by.
-    const linkAttrs = w.run_id
-      ? { class: 'run-id', title: `run ${w.run_id}` }
-      : { class: 'disabled', title: 'Run not started yet' };
+    // link to. The run id is still worth showing: it is what `workflow_runs`
+    // is keyed by, and what an operator needs to grep a log with.
+    const runLabel = w.run_id ? `run ${w.run_id.slice(0, 8)}` : 'starting…';
+    const runAttrs = w.run_id
+      ? { class: 'run-id', title: w.run_id }
+      : { class: 'run-id disabled', title: 'Run not started yet' };
 
     root.appendChild(
       el('div', { class: 'worker-card' }, [
@@ -253,7 +254,7 @@ function renderWorkers() {
         w.last_message
           ? el('div', { class: 'meta', style: { fontStyle: 'italic', marginTop: '4px' } }, w.last_message.slice(0, 120))
           : null,
-        el('div', { class: 'actions' }, [el('a', linkAttrs, runUrl ? 'View run ↗' : 'Open runs ↗')]),
+        el('div', { class: 'actions' }, [el('span', runAttrs, runLabel)]),
       ]),
     );
   }

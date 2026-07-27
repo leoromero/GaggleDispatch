@@ -158,16 +158,26 @@ export class Orchestrator {
     this.scheduleTick(0);
   }
 
+  /**
+   * Stop ticking and put the in-flight runs somewhere recoverable.
+   *
+   * Deliberately **not** `session.cancel()`. Cancelling marks a run `cancelled`
+   * and throws away work a restart could finish — and it only sets a flag, so
+   * with `process.exit(0)` following immediately the runner never unwinds and
+   * the row is left `running` under a live lease. Startup recovery looks only
+   * for runs whose lease has *lapsed*, and only at startup, so a restart inside
+   * the 60s TTL — which is every ordinary restart — walks straight past them
+   * and nothing adopts them afterwards.
+   *
+   * `executor.shutdown()` suspends instead: the row and its in-flight nodes stay
+   * `running`, the lease is dropped, and the next start picks them up with the
+   * `at_most_once` gate intact. Awaited, because the process exits the moment
+   * this returns.
+   */
   async stop(): Promise<void> {
     this.stopped = true;
     if (this.tickTimer) clearTimeout(this.tickTimer);
-    for (const [, session] of this.state.running) {
-      try {
-        session.cancel?.();
-      } catch {
-        /* best effort */
-      }
-    }
+    await this.deps.executor.shutdown();
     await this.control?.close();
   }
 
@@ -255,7 +265,7 @@ export class Orchestrator {
       onGatePaused: (runId: string, message: string) => void;
       onExit: (event: { type: string; exit_code?: number }) => void;
     };
-  }): Promise<{ cancel: (reason?: string) => void }> {
+  }): Promise<{ cancel: (reason?: string) => void; run_id: string | null }> {
     const { ticket, target, callbacks } = args;
     const key = target.id;
     const log = logger.child({
@@ -337,9 +347,12 @@ export class Orchestrator {
       );
 
       const s = this.state.running.get(key);
-      if (s) s.cancel = handle.cancel;
-      log.info('Worker spawned', { workflow: args.repo_target.workflow });
-      return { cancel: handle.cancel };
+      if (s) {
+        s.cancel = handle.cancel;
+        s.run_id = handle.run_id;
+      }
+      log.info("Worker spawned", { workflow: args.repo_target.workflow, run_id: handle.run_id ?? undefined });
+      return { cancel: handle.cancel, run_id: handle.run_id };
     } catch (err) {
       this.state.running.delete(key);
       throw err;

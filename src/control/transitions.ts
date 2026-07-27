@@ -541,7 +541,15 @@ export function targetTransition(
 
   if (from === 'dispatching') {
     if (event.kind === 'run_started') {
-      return done('running', { run_id: event.run_id }, applyTargetLabel(ctx, trackerId, 'claimed'));
+      // Only when the event carries one. `patchObject` skips `undefined` but
+      // writes an explicit `null`, so an executor that reports its id
+      // asynchronously — legitimate, the port allows it — would have the id it
+      // just recorded overwritten by the `run_started` that follows.
+      return done(
+        'running',
+        event.run_id ? { run_id: event.run_id } : {},
+        applyTargetLabel(ctx, trackerId, 'claimed'),
+      );
     }
     if (event.kind === 'run_failed') return failTarget(from, ctx, trackerId, event.reason, actor);
     return reject();

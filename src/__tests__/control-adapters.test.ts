@@ -189,6 +189,7 @@ function makeAdapter(
   engine: ReturnType<typeof fakeEngine>,
   sink: RecordingSink,
   launch?: (cb: Callbacks) => void,
+  launchedRunId: string | null = 'run-1',
 ) {
   const cancels: string[] = [];
   let captured: Callbacks | null = null;
@@ -197,7 +198,9 @@ function makeAdapter(
     launch: async (args) => {
       captured = args.callbacks;
       launch?.(args.callbacks);
-      return { cancel: (r?: string) => cancels.push(r ?? 'cancelled') };
+      // The real launcher returns the id `startRun` already wrote. A fake that
+      // returns null here would hide exactly the bug this shape exists to stop.
+      return { cancel: (r?: string) => cancels.push(r ?? 'cancelled'), run_id: launchedRunId };
     },
     sink: () => sink,
   });
