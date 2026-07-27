@@ -69,11 +69,15 @@ describe('withLock', () => {
       await new Promise((r) => setTimeout(r, 50));
       outerReleased = true;
     });
-    // Wait a tick to make sure the holder file is written before checking
-    await new Promise((r) => setTimeout(r, 5));
-    // The .holder.json sidecar exists while the lock is held
+    // Poll rather than sleep a fixed 5ms: the sidecar is written by an async
+    // call inside withLock, and under a loaded suite 5ms is not reliably
+    // enough — this failed only when the whole suite ran in parallel.
     const holderPath = `${target}.holder.json`;
     const fs = await import('node:fs');
+    const deadline = Date.now() + 2_000;
+    while (!fs.existsSync(holderPath) && Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 5));
+    }
     expect(fs.existsSync(holderPath)).toBe(true);
     const holder = JSON.parse(fs.readFileSync(holderPath, 'utf8'));
     expect(holder.command).toBe('long-running');
