@@ -9,7 +9,7 @@
 
 import type { IssueAnalysis, RegistryContext, ServiceConfig } from '../../domain/types.ts';
 import { logger } from '../../util/logger.ts';
-import { issueFromTicket } from './archon.ts';
+import { issueFromTicket } from './executor.ts';
 import type { AnalysisResult, AnalyzerPort, SlotPort } from '../ports.ts';
 import type { TicketRow } from '../types.ts';
 

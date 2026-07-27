@@ -1,11 +1,12 @@
 /**
  * Issue Analyzer (Section 7.2).
  *
- * Uses the Claude Agent SDK (same runtime as Archon) so Claude can explore the
+ * Uses the Claude Agent SDK — the same runtime the workflow engine uses — so
+ * Claude can explore the
  * local repo checkouts to inform its routing decision — reading gaggle.md files,
  * directory layouts, package manifests, etc.
  *
- * Authentication mirrors Archon's logic:
+ * Authentication resolution order:
  *   1. CLAUDE_API_KEY (or ANTHROPIC_API_KEY as alias) — explicit API key
  *   2. CLAUDE_CODE_OAUTH_TOKEN — explicit OAuth token
  *   3. CLAUDE_USE_GLOBAL_AUTH=true — piggyback on `claude /login` session (default)
@@ -119,9 +120,9 @@ export class IssueAnalyzer {
         continue;
       }
 
-      let archonWf: string;
+      let workflowName: string;
       if (matched.available_workflows.includes(complexityWorkflow)) {
-        archonWf = complexityWorkflow;
+        workflowName = complexityWorkflow;
       } else {
         logger.warn('Complexity-derived workflow not in available_workflows — falling back to repo default', {
           issue_id: issue.id,
@@ -129,14 +130,14 @@ export class IssueAnalyzer {
           desired: complexityWorkflow,
           fallback: matched.default_workflow || this.cfg.executor.default_workflow,
         });
-        archonWf = matched.default_workflow || this.cfg.executor.default_workflow;
+        workflowName = matched.default_workflow || this.cfg.executor.default_workflow;
       }
 
       const target: RepoTarget = {
         repo_url: matched.url,
         repo_alias: sanitizeId(matched.name),
         local_path: matched.local_path,
-        workflow: archonWf,
+        workflow: workflowName,
         rationale: typeof obj.rationale === 'string' ? obj.rationale : '',
         components: Array.isArray(obj.components)
           ? (obj.components as unknown[]).filter((c): c is string => typeof c === 'string')
@@ -228,7 +229,7 @@ async function runClaudeQuery(
 
 /**
  * Build the subprocess env with Claude auth.
- * Mirrors Archon's buildSubprocessEnv / server startup logic:
+ * Subprocess env for Claude auth:
  *   - Honour CLAUDE_API_KEY or CLAUDE_CODE_OAUTH_TOKEN if present.
  *   - Accept ANTHROPIC_API_KEY as an alias for CLAUDE_API_KEY.
  *   - Default to CLAUDE_USE_GLOBAL_AUTH=true (piggyback on `claude /login`).

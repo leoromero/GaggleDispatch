@@ -5,15 +5,19 @@
 import chalk from 'chalk';
 import { existsSync, mkdirSync } from 'node:fs';
 import { join, resolve as resolvePath } from 'node:path';
-import { loadConfig, fatal, info, success } from './common.ts';
-import { withLock } from '../util/lock.ts';
+import { buildExecutor, loadConfig, fatal, info, success, withStore } from './common.ts';
 import { run } from '../util/subprocess.ts';
 import { deriveRepoSlug, parseGithubOwnerRepo } from '../util/paths.ts';
 import { runSyncPass } from '../registry/repo-syncer.ts';
 import { resolveReposDir } from '../registry/synced-registry.ts';
-import { loadScaffoldJobs, removeJobBySlug, upsertJob, writeScaffoldJobs } from '../registry/scaffold-jobs.ts';
+import {
+  findScaffoldJob,
+  loadScaffoldJobs,
+  removeScaffoldJob,
+  saveScaffoldJob,
+} from '../registry/scaffold-jobs.ts';
 import type { ScaffoldJob } from '../domain/types.ts';
-import { ArchonClient } from '../executor/archon-client.ts';
+import { PostgresStore } from '../executor/store/postgres.ts';
 import { syncWorkflowTemplates } from '../workspace/templates.ts';
 
 const DEFAULT_SCAFFOLD_WORKFLOW = 'gaggle/gaggle-scaffold';
@@ -74,12 +78,12 @@ export async function runRepoScaffold(args: ScaffoldArgs): Promise<void> {
   const checkout = join(resolveReposDir(cfg), slug);
   if (!existsSync(checkout)) {
     info(`Local checkout for ${slug} not found; syncing this repo first.`);
-    await runSyncPass(cfg, { onlySlug: slug, quiet: true });
+    await withStore(cfg, (st) => runSyncPass(cfg, { store: st, onlySlug: slug, quiet: true }));
     if (!existsSync(checkout)) fatal(`Sync did not produce a local checkout at ${checkout}.`);
   }
 
   // Check for in-flight job.
-  const jobsBefore = loadScaffoldJobs(cfg.registry.base_folder);
+  const jobsBefore = await withStore(cfg, (st) => loadScaffoldJobs(st));
   const existing = jobsBefore.jobs.find((j) => j.slug === slug);
   if (args.async && existing && (existing.last_status === 'running' || existing.last_status === 'paused' || existing.last_status === 'pending')) {
     fatal(
@@ -90,94 +94,95 @@ export async function runRepoScaffold(args: ScaffoldArgs): Promise<void> {
   const branch = args.branch ?? `gaggle/scaffold-${Math.floor(Date.now() / 1000)}`;
   const message = args.message ?? DEFAULT_PROMPT;
 
-  // Sync workflow templates into the checkout so Archon can find gaggle/gaggle-scaffold.
+  // Sync workflow templates into the checkout so the engine can resolve
+  // gaggle/gaggle-scaffold from .gaggle/workflows/.
   const { copied, targetDir } = syncWorkflowTemplates(cfg, checkout);
   if (copied > 0) {
     info(`Synced ${copied} workflow template(s) to ${targetDir}`);
   }
 
-  const archonArgs = parseArchonCmd(cfg.executor.command, DEFAULT_SCAFFOLD_WORKFLOW, checkout, message);
+  const store = new PostgresStore(cfg.database.url, { maxConnections: 3 });
+  await store.migrate();
+  const executor = buildExecutor(cfg, store);
 
-  if (args.async) {
-    const proc = Bun.spawn(archonArgs, {
-      cwd: checkout,
-      stdout: 'ignore',
-      stderr: 'ignore',
-      stdin: 'ignore',
-    });
+  const job: ScaffoldJob = {
+    slug,
+    url: args.url,
+    checkout_path: checkout,
+    run_id: null,
+    workflow_name: DEFAULT_SCAFFOLD_WORKFLOW,
+    branch,
+    started_at: new Date().toISOString(),
+    last_polled_at: null,
+    last_status: 'pending',
+    pr_url: null,
+    last_error: null,
+  };
 
-    const job: ScaffoldJob = {
-      slug,
-      url: args.url,
-      checkout_path: checkout,
-      run_id: null,
-      workflow_name: DEFAULT_SCAFFOLD_WORKFLOW,
-      branch,
-      started_at: new Date().toISOString(),
-      last_polled_at: null,
-      last_status: 'pending',
-      pr_url: null,
-      last_error: null,
-    };
-    await withLock(join(cfg.registry.base_folder, '.gaggle.lock'), 'gaggle repo scaffold', async () => {
-      const jobs = loadScaffoldJobs(cfg.registry.base_folder);
-      writeScaffoldJobs(cfg.registry.base_folder, upsertJob(jobs, job));
-    });
+  try {
+    const handle = await executor.startRun(
+      {
+        workflow: DEFAULT_SCAFFOLD_WORKFLOW,
+        cwd: checkout,
+        message,
+        repo_slug: slug,
+        base_branch: args.fromBranch,
+      },
+      args.async ? () => {} : (e) => {
+        // Blocking mode mirrors the run to the terminal.
+        if (e.type === 'node_started') console.log(chalk.cyan(`▸ ${e.node_id}`));
+        else if (e.type === 'node_output') console.log(chalk.gray(`  ${e.line}`));
+        else if (e.type === 'node_failed') console.log(chalk.red(`✗ ${e.node_id}: ${e.error}`));
+      },
+    );
 
-    success(`Launched scaffold for ${slug} (pid ${proc.pid}, branch ${branch}).`);
-    info(`Run 'gaggle scaffold status' to check progress.`);
-    return;
-  }
+    // The run id is known immediately now, so the job record no longer has to
+    // be reconciled later by matching working paths and start times.
+    job.run_id = handle.run_id;
+    job.last_status = 'running';
+    // A single upsert — no lock needed now that this is not a whole-file
+    // read-modify-write.
+    await saveScaffoldJob(store, job);
 
-  // Blocking mode: stream Archon's output to the terminal.
-  console.log(chalk.cyan(`Running scaffold for ${slug} (blocking; Ctrl-C to cancel)...`));
-  const proc = Bun.spawn(archonArgs, {
-    cwd: checkout,
-    stdout: 'inherit',
-    stderr: 'inherit',
-    stdin: 'inherit',
-  });
-  const code = await proc.exited;
-  if (code === 0) {
-    success(`Scaffold completed for ${slug}.`);
-    const prUrl = await resolvePrUrl(args.url, branch);
-    if (prUrl) console.log(chalk.gray(`  PR: ${prUrl}`));
-    else console.log(chalk.yellow('  Could not resolve PR URL via gh; check the workflow output.'));
-  } else {
-    fatal(`Archon exited with code ${code}.`);
+    if (args.async) {
+      success(`Launched scaffold for ${slug} (run ${handle.run_id.slice(0, 8)}, branch ${branch}).`);
+      info(`Run 'gaggle scaffold status' to check progress.`);
+      // Detach: the run keeps going, and `scaffold status` follows it.
+      return;
+    }
+
+    console.log(chalk.cyan(`Running scaffold for ${slug} (blocking; Ctrl-C to cancel)...`));
+    await handle.done;
+
+    const final = await executor.getRun(handle.run_id);
+    if (final?.status === 'completed') {
+      success(`Scaffold completed for ${slug}.`);
+      const prUrl = await resolvePrUrl(args.url, branch);
+      if (prUrl) console.log(chalk.gray(`  PR: ${prUrl}`));
+      else console.log(chalk.yellow('  Could not resolve PR URL via gh; check the workflow output.'));
+    } else {
+      fatal(`Scaffold run ${final?.status ?? 'failed'}.`);
+    }
+  } finally {
+    if (!args.async) await store.close();
   }
 }
 
 export async function runScaffoldStatus(opts: { cwd?: string; json?: boolean; refreshPr?: boolean }): Promise<void> {
   const cfg = loadConfig({ cwd: opts.cwd });
   const baseFolder = cfg.registry.base_folder;
-  let jobs = loadScaffoldJobs(baseFolder);
+  let jobs = await withStore(cfg, (st) => loadScaffoldJobs(st));
   if (jobs.jobs.length === 0) {
     if (!opts.json) console.log(chalk.gray('No scaffold jobs.'));
     else console.log('[]');
     return;
   }
 
-  // Single global call: archon workflow status --json
-  let archonRuns: Array<{ id: string; working_path?: string; workflow_name?: string; status?: string; started_at?: string }> = [];
-  try {
-    const tokens = tokenizeCmd(cfg.executor.command);
-    const argv = [...tokens.slice(0, -1), 'status', '--json'];
-    const r = await run(argv);
-    if (r.exitCode === 0 && r.stdout.trim()) {
-      try {
-        const parsed = JSON.parse(r.stdout);
-        if (Array.isArray(parsed)) archonRuns = parsed;
-      } catch {
-        /* ignore */
-      }
-    }
-  } catch {
-    /* ignore */
-  }
-
-  await withLock(join(baseFolder, '.gaggle.lock'), 'gaggle scaffold status', async () => {
-    const fresh = loadScaffoldJobs(baseFolder);
+  // Run ids are recorded at launch, so status is a direct lookup rather than
+  // the working-path-and-timestamp matching the CLI used to need.
+  await withStore(cfg, async (store) => {
+    const executor = buildExecutor(cfg, store);
+    const fresh = await loadScaffoldJobs(store);
     const updated: typeof fresh.jobs = [];
 
     for (const job of fresh.jobs) {
@@ -185,30 +190,23 @@ export async function runScaffoldStatus(opts: { cwd?: string; json?: boolean; re
       next.last_polled_at = new Date().toISOString();
 
       if (next.run_id === null) {
-        const candidates = archonRuns.filter(
-          (r) =>
-            r.working_path === job.checkout_path &&
-            r.workflow_name === job.workflow_name &&
-            (!r.started_at || Date.parse(r.started_at) >= Date.parse(job.started_at) - 5_000),
-        );
-        if (candidates.length === 1) {
-          next.run_id = candidates[0]!.id;
-        } else if (candidates.length > 1) {
-          const sorted = candidates.sort((a, b) => Date.parse(b.started_at ?? '') - Date.parse(a.started_at ?? ''));
-          next.run_id = sorted[0]!.id;
-        } else if (Date.now() - Date.parse(job.started_at) > 30_000) {
+        // A job with no run id never got off the ground — the launch threw
+        // before the row was written. Previously this was the normal case,
+        // because the run id had to be discovered after the fact.
+        if (Date.now() - Date.parse(job.started_at) > 30_000) {
           next.last_status = 'unknown';
         }
-      }
-
-      if (next.run_id) {
-        const live = archonRuns.find((r) => r.id === next.run_id);
+      } else {
+        const live = await executor.getRun(next.run_id);
         if (live) {
-          next.last_status = (live.status as ScaffoldJob['last_status']) ?? next.last_status;
-        } else {
-          if (next.last_status !== 'completed' && next.last_status !== 'failed' && next.last_status !== 'cancelled') {
-            next.last_status = 'completed';
+          next.last_status = live.status as ScaffoldJob['last_status'];
+          if (live.status === 'failed') {
+            next.last_error = String(live.metadata.cancel_reason ?? 'run failed');
           }
+        } else {
+          // The row is gone (pruned, or a different database) — do not leave
+          // the job claiming to be running forever.
+          next.last_status = 'unknown';
         }
       }
 
@@ -219,7 +217,7 @@ export async function runScaffoldStatus(opts: { cwd?: string; json?: boolean; re
 
       updated.push(next);
     }
-    writeScaffoldJobs(baseFolder, { jobs: updated });
+    for (const j of updated) await saveScaffoldJob(store, j);
     jobs = { jobs: updated };
   });
 
@@ -240,37 +238,23 @@ export async function runScaffoldCancel(args: { slug: string; cwd?: string }): P
   const cfg = loadConfig({ cwd: args.cwd });
   const baseFolder = cfg.registry.base_folder;
 
-  await withLock(join(baseFolder, '.gaggle.lock'), 'gaggle scaffold cancel', async () => {
-    const jobs = loadScaffoldJobs(baseFolder);
-    const job = jobs.jobs.find((j) => j.slug === args.slug);
+  await withStore(cfg, async (store) => {
+    const job = await findScaffoldJob(store, args.slug);
     if (!job) fatal(`No scaffold job for slug '${args.slug}'.`);
     if (job!.run_id) {
       try {
-        await new ArchonClient(cfg.executor.api_url).abandonRun(job!.run_id);
-        info(`Sent abandon to Archon run ${job!.run_id}.`);
+        await buildExecutor(cfg, store).abandon(job!.run_id);
+        info(`Abandoned run ${job!.run_id}.`);
       } catch (err) {
         console.log(chalk.yellow(`  Could not abandon run: ${(err as Error).message}`));
       }
     }
-    writeScaffoldJobs(baseFolder, removeJobBySlug(jobs, args.slug));
+    await removeScaffoldJob(store, args.slug);
     success(`Removed scaffold job '${args.slug}'.`);
   });
 }
 
 // ─── helpers ────────────────────────────────────────────────────────────────
-function tokenizeCmd(s: string): string[] {
-  const out: string[] = [];
-  const re = /(?:[^\s"']+|"([^"]*)"|'([^']*)')+/g;
-  let m: RegExpExecArray | null;
-  while ((m = re.exec(s)) !== null) out.push(m[1] ?? m[2] ?? m[0]);
-  return out;
-}
-
-function parseArchonCmd(commandStr: string, workflow: string, cwd: string, message: string): string[] {
-  const tokens = tokenizeCmd(commandStr);
-  return [...tokens, workflow, '--cwd', cwd, message];
-}
-
 async function resolvePrUrl(url: string, branch: string): Promise<string | null> {
   try {
     const { owner, repo } = parseGithubOwnerRepo(url);

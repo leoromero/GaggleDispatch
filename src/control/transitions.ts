@@ -541,7 +541,15 @@ export function targetTransition(
 
   if (from === 'dispatching') {
     if (event.kind === 'run_started') {
-      return done('running', { run_id: event.run_id }, applyTargetLabel(ctx, trackerId, 'claimed'));
+      // Only when the event carries one. `patchObject` skips `undefined` but
+      // writes an explicit `null`, so an executor that reports its id
+      // asynchronously — legitimate, the port allows it — would have the id it
+      // just recorded overwritten by the `run_started` that follows.
+      return done(
+        'running',
+        event.run_id ? { run_id: event.run_id } : {},
+        applyTargetLabel(ctx, trackerId, 'claimed'),
+      );
     }
     if (event.kind === 'run_failed') return failTarget(from, ctx, trackerId, event.reason, actor);
     return reject();
@@ -607,6 +615,44 @@ export function targetTransition(
         effects: [...resumeState(ctx, trackerId), ...failed.effects],
       };
     }
+    // The question changed while the target was parked.
+    //
+    // Startup recovery does this: a crash while a run is at a gate leaves an
+    // `at_most_once` node interrupted, and recovery *appends* a warning to the
+    // pending gate rather than replacing it, because only one gate may be
+    // pending. Without this the control plane keeps the pre-crash question, and
+    // the operator approves having never been told a node may already have
+    // opened a pull request — which is the entire point of the marker.
+    //
+    // A no-op when the message is unchanged, so the reconciler observing the
+    // same gate tick after tick costs nothing.
+    if (event.kind === 'gate_opened') {
+      if (event.message === ctx.target.gate_message) {
+        return { from, to: from, patch: {}, effects: [], actor };
+      }
+      return done(
+        'gate_waiting',
+        {
+          gate_approval_id: event.approval_id,
+          gate_message: event.message,
+          gate_opened_at: nowIso(),
+        },
+        // A fresh comment, not a silent row update: the old question is already
+        // posted on the tracker and the operator is looking at it.
+        [
+          {
+            kind: 'tracker_post_comment',
+            external_id: trackerId,
+            body:
+              `⚠️ **The question changed** — the earlier request above is out of date.
+
+` +
+              gateComment(event.message),
+          },
+        ],
+      );
+    }
+
     const resume = resumeState(ctx, trackerId);
 
     if (event.kind === 'gate_approved') {
@@ -634,11 +680,17 @@ export function targetTransition(
       // operator ("reject: <feedback> triggers a revised plan"). Only once the
       // rework budget is spent does it become a failure.
       if (ctx.target.gate_rework_attempts >= ctx.max_gate_rework_attempts) {
+        // `kill_run`, not `reject_gate`. Rejecting resumes the run so `on_reject`
+        // can rework — which is the point of the budget, and this is the branch
+        // where the budget is spent. Resuming here would spend a model call
+        // reworking a plan for a target that has just been marked failed, and
+        // then park at the same gate forever holding its worktree, while the
+        // board says failed. The run is over; stop it.
         const failed = failTarget(from, ctx, trackerId, `gate rejected, rework attempts exhausted: ${event.reason}`, actor);
         return {
           ...failed,
           patch: { ...failed.patch, ...clearGate },
-          effects: [rejectEffect, ...resume, ...failed.effects],
+          effects: [{ kind: 'kill_run', run_id: ctx.target.run_id }, ...resume, ...failed.effects],
         };
       }
       return done(
@@ -653,28 +705,21 @@ export function targetTransition(
       return {
         ...failed,
         patch: { ...failed.patch, ...clearGate },
-        effects: [
-          {
-            kind: 'reject_gate',
-            approval_id: ctx.target.gate_approval_id,
-            run_id: ctx.target.run_id,
-            reason: 'Gate timeout — no operator response',
-          },
-          ...resume,
-          ...failed.effects,
-        ],
+        // See the rework-exhausted branch: a settled target does not rework.
+        // `resume` stays — it moves the tracker issue out of waiting-human, which
+        // is still right when the reason for waiting was a timeout.
+        effects: [{ kind: 'kill_run', run_id: ctx.target.run_id }, ...resume, ...failed.effects],
       };
     }
 
     if (event.kind === 'gate_blocker_created') {
       return done('blocked', clearGate, [
         { kind: 'create_blocker_issue', spec: event.blocker, blocks_external_id: trackerId },
-        {
-          kind: 'reject_gate',
-          approval_id: ctx.target.gate_approval_id,
-          run_id: ctx.target.run_id,
-          reason: `Blocker created: ${event.blocker.title}`,
-        },
+        // Blocked, not rejected: this target waits for someone else's work and
+        // will be dispatched again from scratch when it clears. Reworking now
+        // would answer a question nobody asked, and leave the run parked at the
+        // gate holding its worktree for however long the blocker takes.
+        { kind: 'kill_run', run_id: ctx.target.run_id },
         {
           kind: 'tracker_post_comment',
           external_id: ctx.ticket.external_id,

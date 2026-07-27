@@ -149,7 +149,7 @@ describe('IssueAnalyzer.analyze', () => {
     await expect(a.analyze(makeIssue(), ctx)).rejects.toBeInstanceOf(IssueAnalysisError);
   });
 
-  test('falls back to archon.default_workflow when registry repo has no default', async () => {
+  test('falls back to executor.default_workflow when registry repo has no default', async () => {
     const ctx = makeRegistryContext([
       makeRegistryRepo({
         name: 'repo-a',

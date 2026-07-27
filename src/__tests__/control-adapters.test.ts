@@ -1,24 +1,29 @@
 /**
  * The executor seam.
  *
- * These cover the two behaviours the old orchestrator got wrong or got right only
- * by accident: Archon exits 0 when a workflow *pauses*, and a run the executor has
- * never heard of is not a failed run. Both are the kind of thing that silently
- * corrupts a board, so both are pinned here.
+ * Most of what the Archon version of this file protected was the consequence of
+ * an out-of-process executor — a run id that arrived late, and a gate pause that
+ * looked exactly like a clean exit. The engine reports both explicitly, so those
+ * traps are gone rather than guarded.
+ *
+ * What is still worth pinning: a pause must never settle a target, a run the
+ * store has never heard of is not a *failed* run, and an outcome the control
+ * plane already recorded must not take the daemon down.
  */
 
 import { describe, expect, test } from 'bun:test';
 import {
-  ArchonExecutorAdapter,
-  ArchonRunStatusAdapter,
+  EngineExecutorAdapter,
+  EngineRunStatusAdapter,
   issueFromTicket,
   repoTargetFrom,
   type RunEventSink,
-} from '../control/adapters/archon.ts';
+} from '../control/adapters/executor.ts';
 import { ControlAnalyzerAdapter, MaxConcurrentSlots } from '../control/adapters/analyzer.ts';
 import { PrMergeWatcher } from '../orchestrator/pr-merge-watcher.ts';
-import type { ArchonRunDetail } from '../executor/archon-client.ts';
+import type { RunRecord } from '../executor/types.ts';
 import type { DispatchContext } from '../control/ports.ts';
+import { InvalidControlTransitionError } from '../control/transitions.ts';
 import type { Issue, IssueAnalysis, RegistryContext, ServiceConfig } from '../domain/types.ts';
 import type { TargetRow, TicketRow } from '../control/types.ts';
 import { makeServiceConfig } from './helpers/fixtures.ts';
@@ -121,341 +126,240 @@ class RecordingSink implements RunEventSink {
   }
 }
 
-/** Just enough ArchonClient for the adapter. */
-function fakeClient(over: Partial<{
-  detail: ArchonRunDetail | null;
-  detailError: string;
+/** Just enough GaggleExecutor for the adapter. */
+function fakeEngine(over: Partial<{
+  run: RunRecord | null;
+  getRunError: string;
   cancelled: string[];
-  rejected: Array<{ id: string; reason?: string }>;
+  decided: Array<{ id: string; decision: string; comment: string | null }>;
+  cancelThrows: boolean;
 }> = {}) {
   const cancelled: string[] = over.cancelled ?? [];
-  const rejected = over.rejected ?? [];
+  const decided = over.decided ?? [];
   return {
     cancelled,
-    rejected,
-    async getRunDetail(): Promise<ArchonRunDetail | null> {
-      if (over.detailError) throw new Error(over.detailError);
-      return over.detail ?? null;
+    decided,
+    async getRun(): Promise<RunRecord | null> {
+      if (over.getRunError) throw new Error(over.getRunError);
+      return over.run ?? null;
     },
-    async cancelRun(id: string): Promise<void> {
+    async cancel(id: string): Promise<void> {
+      if (over.cancelThrows) throw new Error('404 run not found');
       cancelled.push(id);
     },
-    async rejectRun(id: string, reason?: string): Promise<void> {
-      rejected.push({ id, reason });
+    async decideAndWatch(id: string, decision: string, comment: string | null) {
+      decided.push({ id, decision, comment });
+      return { run_id: id, cancel: () => {}, done: Promise.resolve() };
     },
   };
 }
 
-function detail(status: string, approvalMessage?: string): ArchonRunDetail {
+function detail(status: string, approvalMessage?: string): RunRecord {
   return {
-    run: {
-      id: 'run-1',
-      workflow_name: 'wf',
-      user_message: 'm',
-      status: status as never,
-      started_at: '2026-07-01T00:00:00.000Z',
-      completed_at: null,
-      last_activity_at: null,
-      working_path: null,
-      metadata: approvalMessage ? { approval: { message: approvalMessage } } : {},
-    },
-  } as unknown as ArchonRunDetail;
+    id: 'run-1',
+    workflow_name: 'wf',
+    user_message: 'm',
+    status: status as never,
+    started_at: '2026-07-01T00:00:00.000Z',
+    completed_at: null,
+    last_activity_at: null,
+    working_path: null,
+    metadata: approvalMessage ? { approval: { message: approvalMessage } } : {},
+  } as unknown as RunRecord;
 }
 
+/** Builds the adapter and hands back the callbacks the launcher was given. */
 function adapter(
-  client: ReturnType<typeof fakeClient>,
+  engine: ReturnType<typeof fakeEngine>,
   sink: RecordingSink,
-  launch?: () => Promise<{ cancel: (reason?: string) => void }>,
+  launch?: Parameters<typeof makeAdapter>[2],
+) {
+  return makeAdapter(engine, sink, launch);
+}
+
+type Callbacks = {
+  onOutput: (line: string) => void;
+  onRunId: (runId: string) => void;
+  onGatePaused: (runId: string, message: string) => void;
+  onExit: (event: { type: string; exit_code?: number }) => void;
+};
+
+function makeAdapter(
+  engine: ReturnType<typeof fakeEngine>,
+  sink: RecordingSink,
+  launch?: (cb: Callbacks) => void,
+  launchedRunId: string | null = 'run-1',
 ) {
   const cancels: string[] = [];
-  const a = new ArchonExecutorAdapter({
-    cfg: makeServiceConfig(),
-    client: client as never,
-    launch: launch ?? (async () => ({ cancel: (r?: string) => cancels.push(r ?? 'cancelled') })),
+  let captured: Callbacks | null = null;
+  const a = new EngineExecutorAdapter({
+    executor: engine as never,
+    launch: async (args) => {
+      captured = args.callbacks;
+      launch?.(args.callbacks);
+      // The real launcher returns the id `startRun` already wrote. A fake that
+      // returns null here would hide exactly the bug this shape exists to stop.
+      return { cancel: (r?: string) => cancels.push(r ?? 'cancelled'), run_id: launchedRunId };
+    },
     sink: () => sink,
   });
-  return { a, cancels };
+  return { a, cancels, cb: () => captured!, engine };
 }
 
 // ─── exit translation ───────────────────────────────────────────────────────
 
-describe('ArchonExecutorAdapter — exit translation', () => {
-  test('a clean exit on a completed run succeeds the target', async () => {
+describe('EngineExecutorAdapter — outcome translation', () => {
+  test('the run id is known synchronously, and recorded', async () => {
+    // The Archon adapter resolved with null and reported the id later off a log
+    // line. The engine writes the run row before startRun returns, so the id is
+    // available immediately — a target is never `running` with no id.
     const sink = new RecordingSink();
-    const client = fakeClient({ detail: detail('completed') });
-    let onExit!: (e: { type: string }) => void;
-    const { a } = adapter(client, sink, async () => ({ cancel: () => {} }));
+    const { a } = makeAdapter(fakeEngine(), sink, (cb) => cb.onRunId('run-1'));
 
-    // Drive the callbacks the launcher would have been handed.
+    const result = await a.spawnRun(ctx());
+
+    expect(result.run_id).toBe('run-1');
+    await Bun.sleep(5);
+    expect(sink.calls).toContainEqual(['recordRunId', 'tg-1', 'run-1']);
+  });
+
+  test('a completed run succeeds the target', async () => {
+    const sink = new RecordingSink();
+    const { a, cb } = makeAdapter(fakeEngine(), sink, (c) => c.onRunId('run-1'));
     await a.spawnRun(ctx());
-    // Re-launch capturing the callbacks this time.
-    const a2 = new ArchonExecutorAdapter({
-      cfg: makeServiceConfig(),
-      client: client as never,
-      launch: async (args) => {
-        onExit = args.callbacks.onExit;
-        args.callbacks.onRunId('9136a16135d082cb9f0ac75523b3b56e');
-        return { cancel: () => {} };
-      },
-      sink: () => sink,
-    });
-    await a2.spawnRun(ctx());
     sink.calls = [];
-    onExit({ type: 'run_succeeded' });
+
+    cb().onExit({ type: 'run_succeeded' });
     await Bun.sleep(5);
 
     expect(sink.kinds()).toEqual(['runSucceeded']);
   });
 
-  test('a clean exit on a PAUSED run opens a gate instead of succeeding', async () => {
-    // This is the trap: Archon exits 0 when a workflow pauses at a gate. Believing
-    // the exit code would mark a target succeeded halfway through its workflow.
+  test('a gate pause opens a gate and never settles the target', async () => {
+    // The behaviour the exit-code confirmation used to protect. It is now
+    // structural — a pause is its own event — but it is the single most
+    // damaging thing to get wrong, so it stays pinned.
     const sink = new RecordingSink();
-    const client = fakeClient({ detail: detail('paused', 'Approve the plan?') });
-    let onExit!: (e: { type: string }) => void;
-    const a = new ArchonExecutorAdapter({
-      cfg: makeServiceConfig(),
-      client: client as never,
-      launch: async (args) => {
-        onExit = args.callbacks.onExit;
-        args.callbacks.onRunId('run-1');
-        return { cancel: () => {} };
-      },
-      sink: () => sink,
-    });
-    await a.spawnRun(ctx());
-    sink.calls = [];
-
-    onExit({ type: 'run_succeeded' });
-    await Bun.sleep(5);
-
-    expect(sink.kinds()).not.toContain('runSucceeded');
-    expect(sink.calls.find((c) => c[0] === 'gateOpened')).toEqual([
-      'gateOpened',
-      'tg-1',
-      'run-1',
-      'Approve the plan?',
-    ]);
-  });
-
-  test('a clean exit with no run id at all is a failure, not a success', async () => {
-    const sink = new RecordingSink();
-    let onExit!: (e: { type: string }) => void;
-    const a = new ArchonExecutorAdapter({
-      cfg: makeServiceConfig(),
-      client: fakeClient() as never,
-      launch: async (args) => {
-        onExit = args.callbacks.onExit;
-        return { cancel: () => {} };
-      },
-      sink: () => sink,
-    });
-    await a.spawnRun(ctx());
-
-    onExit({ type: 'run_succeeded' });
-    await Bun.sleep(5);
-
-    const failed = sink.calls.find((c) => c[0] === 'runFailed');
-    expect(failed).toBeTruthy();
-    expect(String(failed![2])).toMatch(/without starting a workflow/);
-  });
-
-  test('a clean exit on a run Archon says failed is reported as failed', async () => {
-    const sink = new RecordingSink();
-    let onExit!: (e: { type: string }) => void;
-    const a = new ArchonExecutorAdapter({
-      cfg: makeServiceConfig(),
-      client: fakeClient({ detail: detail('failed') }) as never,
-      launch: async (args) => {
-        onExit = args.callbacks.onExit;
-        args.callbacks.onRunId('run-1');
-        return { cancel: () => {} };
-      },
-      sink: () => sink,
-    });
-    await a.spawnRun(ctx());
-    sink.calls = [];
-
-    onExit({ type: 'run_succeeded' });
-    await Bun.sleep(5);
-    expect(sink.kinds()).toContain('runFailed');
-  });
-
-  test('an unverifiable clean exit decides nothing and leaves it to the reconciler', async () => {
-    // `succeeded` is terminal: guessing it here would close the tracker issue,
-    // leave a possibly-still-paused Archon run holding its worktree, and leave the
-    // operator with no button — the reconciler cannot correct a terminal status.
-    const sink = new RecordingSink();
-    let onExit!: (e: { type: string }) => void;
-    const a = new ArchonExecutorAdapter({
-      cfg: makeServiceConfig(),
-      client: fakeClient({ detailError: 'connection refused' }) as never,
-      launch: async (args) => {
-        onExit = args.callbacks.onExit;
-        args.callbacks.onRunId('run-1');
-        return { cancel: () => {} };
-      },
-      sink: () => sink,
-    });
-    await a.spawnRun(ctx());
-    sink.calls = [];
-
-    onExit({ type: 'run_succeeded' });
-    await Bun.sleep(5);
-
-    expect(sink.kinds()).toEqual([]);
-  });
-
-  test('a clean exit on a run that is still going decides nothing either', async () => {
-    // The process is gone but Archon says the run is not finished. Same reasoning:
-    // stay in the recoverable direction.
-    for (const st of ['running', 'pending'] as const) {
-      const sink = new RecordingSink();
-      let onExit!: (e: { type: string }) => void;
-      const a = new ArchonExecutorAdapter({
-        cfg: makeServiceConfig(),
-        client: fakeClient({ detail: detail(st) }) as never,
-        launch: async (args) => {
-          onExit = args.callbacks.onExit;
-          args.callbacks.onRunId('run-1');
-          return { cancel: () => {} };
-        },
-        sink: () => sink,
-      });
-      await a.spawnRun(ctx());
-      sink.calls = [];
-
-      onExit({ type: 'run_succeeded' });
-      await Bun.sleep(5);
-      expect(sink.kinds()).toEqual([]);
-    }
-  });
-
-  test('a non-zero exit fails the target with the event name as the reason', async () => {
-    const sink = new RecordingSink();
-    let onExit!: (e: { type: string }) => void;
-    const a = new ArchonExecutorAdapter({
-      cfg: makeServiceConfig(),
-      client: fakeClient() as never,
-      launch: async (args) => {
-        onExit = args.callbacks.onExit;
-        return { cancel: () => {} };
-      },
-      sink: () => sink,
-    });
-    await a.spawnRun(ctx());
-
-    onExit({ type: 'run_timed_out' });
-    await Bun.sleep(5);
-    expect(sink.calls.find((c) => c[0] === 'runFailed')?.[2]).toBe('run_timed_out');
-  });
-
-  test('a run id arriving on a log line is recorded immediately', async () => {
-    const sink = new RecordingSink();
-    const a = new ArchonExecutorAdapter({
-      cfg: makeServiceConfig(),
-      client: fakeClient() as never,
-      launch: async (args) => {
-        args.callbacks.onRunId('9136a16135d082cb9f0ac75523b3b56e');
-        return { cancel: () => {} };
-      },
-      sink: () => sink,
-    });
-    const result = await a.spawnRun(ctx());
-
-    // spawnRun resolves before the id is known, so the target is `running`
-    // with a null run_id until the log line lands.
-    expect(result.run_id).toBeNull();
-    await Bun.sleep(5);
-    expect(sink.calls).toContainEqual(['recordRunId', 'tg-1', '9136a16135d082cb9f0ac75523b3b56e']);
-  });
-
-  test('a mid-run gate pause opens a gate and records the run id', async () => {
-    const sink = new RecordingSink();
-    const a = new ArchonExecutorAdapter({
-      cfg: makeServiceConfig(),
-      client: fakeClient() as never,
-      launch: async (args) => {
-        args.callbacks.onGatePaused('run-9', 'Approve?');
-        return { cancel: () => {} };
-      },
-      sink: () => sink,
-    });
+    const { a } = makeAdapter(fakeEngine(), sink, (cb) => cb.onGatePaused('run-9', 'Approve?'));
     await a.spawnRun(ctx());
     await Bun.sleep(5);
 
     expect(sink.calls).toContainEqual(['recordRunId', 'tg-1', 'run-9']);
     expect(sink.calls).toContainEqual(['gateOpened', 'tg-1', 'run-9', 'Approve?']);
+    expect(sink.kinds()).not.toContain('runSucceeded');
+  });
+
+  test('a failure carries the event name as the reason', async () => {
+    const sink = new RecordingSink();
+    const { a, cb } = makeAdapter(fakeEngine(), sink, (c) => c.onRunId('run-1'));
+    await a.spawnRun(ctx());
+    sink.calls = [];
+
+    cb().onExit({ type: 'run_failed', exit_code: 1 });
+    await Bun.sleep(5);
+
+    expect(sink.calls).toContainEqual(['runFailed', 'tg-1', 'run_failed']);
+  });
+
+  test('an outcome the control plane already recorded does not escape', async () => {
+    // The ordinary Cancel path: `cancel_confirmed` commits `cancelled`, then the
+    // run reports `run_cancelled`, and `run_failed` is not accepted from
+    // `cancelled`. An unhandled rejection here terminates the daemon.
+    const sink = new RecordingSink();
+    sink.runFailed = async () => {
+      throw new InvalidControlTransitionError('cancelled', 'run_failed', 'target');
+    };
+    const { a, cb } = makeAdapter(fakeEngine(), sink, (c) => c.onRunId('run-1'));
+    await a.spawnRun(ctx());
+
+    cb().onExit({ type: 'run_cancelled' });
+    await Bun.sleep(5);
+    // Reaching here without an unhandled rejection is the assertion.
   });
 });
 
-describe('ArchonExecutorAdapter — cancellation', () => {
-  test('killRun cancels the subprocess and the run', async () => {
+describe('EngineExecutorAdapter — cancellation and gates', () => {
+  test('killRun cancels the live handle and the run', async () => {
     const sink = new RecordingSink();
-    const client = fakeClient();
-    let cancelled = false;
-    const a = new ArchonExecutorAdapter({
-      cfg: makeServiceConfig(),
-      client: client as never,
-      launch: async () => ({ cancel: () => { cancelled = true; } }),
-      sink: () => sink,
-    });
+    const engine = fakeEngine();
+    const { a, cancels } = makeAdapter(engine, sink);
     const c = ctx();
     await a.spawnRun(c);
 
     await a.killRun('run-1', c);
 
-    expect(cancelled).toBe(true);
-    expect(client.cancelled).toEqual(['run-1']);
+    expect(cancels).toEqual(['cancelled by operator']);
+    expect(engine.cancelled).toEqual(['run-1']);
     expect(a.hasLiveRun('tg-1')).toBe(false);
   });
 
-  test('killRun still cancels in Archon when this process holds no subprocess', async () => {
-    // The common case after a restart, or after a gate pause already exited.
+  test('killRun still cancels by id when this process holds no handle', async () => {
+    // The common case after a restart, or for a run parked at a gate whose
+    // runner has already returned.
     const sink = new RecordingSink();
-    const client = fakeClient();
-    const { a } = adapter(client, sink);
+    const engine = fakeEngine();
+    const { a } = makeAdapter(engine, sink);
     await a.killRun('run-7', ctx());
-    expect(client.cancelled).toEqual(['run-7']);
+    expect(engine.cancelled).toEqual(['run-7']);
   });
 
-  test('an Archon that refuses to cancel does not throw — already gone is not a failure', async () => {
+  test('a run that refuses to cancel does not throw — already gone is not a failure', async () => {
     const sink = new RecordingSink();
-    const client = {
-      ...fakeClient(),
-      async cancelRun(): Promise<void> {
-        throw new Error('404 run not found');
-      },
-    };
-    const { a } = adapter(client as never, sink);
+    const { a } = makeAdapter(fakeEngine({ cancelThrows: true }), sink);
     await a.killRun('run-x', ctx());
   });
 
-  test('rejectGate forwards the reason and tolerates a missing run id', async () => {
+  test('approve and reject both go through decideAndWatch', async () => {
+    // Rejection is watched too: `on_reject` reworks and parks at the same gate
+    // again, so a caller that only followed approvals would never hear the
+    // second question.
     const sink = new RecordingSink();
-    const client = fakeClient();
-    const { a } = adapter(client, sink);
+    const engine = fakeEngine();
+    const { a } = makeAdapter(engine, sink);
 
+    await a.approveGate({ approval_id: 'a', run_id: 'run-1', comment: 'ship it', ctx: ctx() });
     await a.rejectGate({ approval_id: 'a', run_id: 'run-1', reason: 'wrong shape', ctx: ctx() });
-    expect(client.rejected).toEqual([{ id: 'run-1', reason: 'wrong shape' }]);
 
+    expect(engine.decided).toEqual([
+      { id: 'run-1', decision: 'approved', comment: 'ship it' },
+      { id: 'run-1', decision: 'rejected', comment: 'wrong shape' },
+    ]);
+  });
+
+  test('answering a gate with no run id is a no-op, not a throw', async () => {
+    const sink = new RecordingSink();
+    const engine = fakeEngine();
+    const { a } = makeAdapter(engine, sink);
     await a.rejectGate({ approval_id: null, run_id: null, reason: 'x', ctx: ctx() });
-    expect(client.rejected).toHaveLength(1);
+    expect(engine.decided).toEqual([]);
+  });
+
+  test('a gate that was already answered elsewhere is reported, not retried', async () => {
+    const sink = new RecordingSink();
+    const engine = {
+      ...fakeEngine(),
+      async decideAndWatch() {
+        return null;
+      },
+    };
+    const { a } = makeAdapter(engine as never, sink);
+    await a.approveGate({ approval_id: 'a', run_id: 'run-1', comment: null, ctx: ctx() });
+    expect(a.hasLiveRun('tg-1')).toBe(false);
   });
 });
 
 // ─── run observation ────────────────────────────────────────────────────────
 
-describe('ArchonRunStatusAdapter', () => {
-  test('a run Archon has never heard of is unknown, never failed', async () => {
+describe('EngineRunStatusAdapter', () => {
+  test('a run the store has never heard of is unknown, never failed', async () => {
     // The distinction that matters after a restart: `failed` would post a
     // spurious failure comment on the tracker for work that may be fine.
-    const s = new ArchonRunStatusAdapter(fakeClient({ detail: null }) as never);
+    const s = new EngineRunStatusAdapter(fakeEngine({ run: null }) as never);
     expect(await s.observeRun('run-1')).toEqual({ status: 'unknown' });
   });
 
   test('a paused run reports its approval message', async () => {
-    const s = new ArchonRunStatusAdapter(fakeClient({ detail: detail('paused', 'ok?') }) as never);
+    const s = new EngineRunStatusAdapter(fakeEngine({ run: detail('paused', 'ok?') }) as never);
     expect(await s.observeRun('run-1')).toEqual({
       status: 'paused',
       approval: { id: 'run-1', message: 'ok?' },
@@ -463,7 +367,7 @@ describe('ArchonRunStatusAdapter', () => {
   });
 
   test('a paused run with no message still opens a gate, with a placeholder', async () => {
-    const s = new ArchonRunStatusAdapter(fakeClient({ detail: detail('paused') }) as never);
+    const s = new EngineRunStatusAdapter(fakeEngine({ run: detail('paused') }) as never);
     const o = await s.observeRun('run-1');
     expect(o.status).toBe('paused');
     expect(o.approval?.message).toBeTruthy();
@@ -471,13 +375,20 @@ describe('ArchonRunStatusAdapter', () => {
 
   test('terminal statuses map straight through', async () => {
     for (const st of ['completed', 'failed', 'cancelled', 'running', 'pending'] as const) {
-      const s = new ArchonRunStatusAdapter(fakeClient({ detail: detail(st) }) as never);
+      const s = new EngineRunStatusAdapter(fakeEngine({ run: detail(st) }) as never);
       expect((await s.observeRun('run-1')).status).toBe(st);
     }
   });
 
+  test('an interrupted run is unknown, so the startup sweep can still adopt it', async () => {
+    // `interrupted` means an executor died and recovery has not reached it yet.
+    // Reporting it as failed would settle a target that is about to resume.
+    const s = new EngineRunStatusAdapter(fakeEngine({ run: detail('interrupted') }) as never);
+    expect((await s.observeRun('run-1')).status).toBe('unknown');
+  });
+
   test('an unrecognized status is unknown rather than guessed at', async () => {
-    const s = new ArchonRunStatusAdapter(fakeClient({ detail: detail('reticulating') }) as never);
+    const s = new EngineRunStatusAdapter(fakeEngine({ run: detail('reticulating') }) as never);
     expect((await s.observeRun('run-1')).status).toBe('unknown');
   });
 });

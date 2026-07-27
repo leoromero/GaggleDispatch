@@ -14,9 +14,10 @@ import { runRepoList } from './repo-list.ts';
 import { runRepoScaffold, runScaffoldStatus, runScaffoldCancel } from './scaffold.ts';
 import { runSync } from './sync.ts';
 import { runStatus, runPs } from './status.ts';
-import { runDoctor } from './doctor.ts';
 import { runStart } from './start.ts';
 import { runTemplatesUpdate } from './templates-update.ts';
+import { runDbMigrate, runDoctor } from './doctor.ts';
+import { runWorkflowList, runWorkflowValidate } from './workflow.ts';
 import {
   runNestAdd,
   runNestInit,
@@ -27,7 +28,12 @@ import {
 } from './hub.ts';
 import { GaggleError } from '../domain/errors.ts';
 
-const program = new Command();
+/**
+ * Exported so a test can walk the command tree. Registration is module-level,
+ * so a duplicate command throws at import — which is worth catching in a test
+ * rather than on an operator's first invocation.
+ */
+export const program = new Command();
 program
   .name('gaggle')
   .description('GaggleDispatch — federated multi-repo AI coding orchestrator')
@@ -49,6 +55,36 @@ program
   .description('Bootstrap a new GaggleDispatch deployment (creates WORKFLOW.md)')
   .action(async () => {
     await runInit({ cwd: program.opts().cwd });
+  });
+
+// ── workflow subcommands ────────────────────────────────────────────────
+const workflow = program.command('workflow').description('Inspect and validate workflow definitions');
+
+workflow
+  .command('list')
+  .description('List workflows discoverable from this directory')
+  .option('--dir <path>', 'additional directory to search')
+  .option('--json', 'machine-readable output')
+  .action(async (opts: { dir?: string; json?: boolean }) => {
+    await runWorkflowList({ cwd: program.opts().cwd, dir: opts.dir, json: opts.json });
+  });
+
+workflow
+  .command('validate [name]')
+  .description('Validate workflow YAML and DAG structure')
+  .option('--dir <path>', 'additional directory to search')
+  .option('--json', 'machine-readable output')
+  .action(async (name: string | undefined, opts: { dir?: string; json?: boolean }) => {
+    await runWorkflowValidate(name, { cwd: program.opts().cwd, dir: opts.dir, json: opts.json });
+  });
+
+// ── db ────────────────────────────────────────────────────────────────
+const db = program.command('db').description('Manage the executor database');
+
+db.command('migrate')
+  .description('Apply pending schema migrations')
+  .action(async () => {
+    await runDbMigrate({ cwd: program.opts().cwd });
   });
 
 // ── repo subcommands ────────────────────────────────────────────────────────
@@ -85,11 +121,11 @@ repo
 
 repo
   .command('scaffold <url>')
-  .description('Generate a draft gaggle.md PR via Archon (blocking; --async to detach)')
+  .description('Generate a draft gaggle.md PR (blocking; --async to detach)')
   .option('--async', 'detach and return immediately')
   .option('--branch <name>', 'override the working branch')
-  .option('--message <text>', 'override the user message passed to Archon')
-  .option('--from-branch <name>', 'pass through to Archon as --from')
+  .option('--message <text>', 'override the user message passed to the workflow')
+  .option('--from-branch <name>', 'branch to cut the worktree from')
   .action(async (
     url: string,
     opts: { async?: boolean; branch?: string; message?: string; fromBranch?: string },
@@ -116,7 +152,7 @@ scaffold
   });
 scaffold
   .command('cancel <slug>')
-  .description('Abandon a scaffold job and remove it from scaffold_jobs.yaml')
+  .description('Abandon a scaffold job and forget it')
   .action(async (slug: string) => {
     await runScaffoldCancel({ slug, cwd: program.opts().cwd });
   });
@@ -245,11 +281,16 @@ auth
     await runAuthLinear({ cwd: program.opts().cwd });
   });
 
-program.parseAsync(process.argv).catch((err) => {
-  if (err instanceof GaggleError) {
-    console.error(chalk.red(`✗ [${err.code}] ${err.message}`));
-  } else {
-    console.error(chalk.red(`✗ ${(err as Error).message ?? err}`));
-  }
-  process.exit(1);
-});
+// Only when run as the binary. Importing this file — which the entry-point
+// test does — must register the commands without also executing one against
+// the importer's argv.
+if (import.meta.main) {
+  program.parseAsync(process.argv).catch((err) => {
+    if (err instanceof GaggleError) {
+      console.error(chalk.red(`✗ [${err.code}] ${err.message}`));
+    } else {
+      console.error(chalk.red(`✗ ${(err as Error).message ?? err}`));
+    }
+    process.exit(1);
+  });
+}

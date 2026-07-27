@@ -18,7 +18,7 @@ import { describe, expect, test } from 'bun:test';
 import { Orchestrator } from '../orchestrator/orchestrator.ts';
 import { MemoryControlStore } from '../control/store/memory.ts';
 import type { WorkerCallbacks, WorkerStartArgs } from '../orchestrator/worker.ts';
-import type { ArchonRunDetail } from '../executor/archon-client.ts';
+import type { RunRecord } from '../executor/types.ts';
 import type { Issue, IssueAnalysis, RegistryContext } from '../domain/types.ts';
 import { makeServiceConfig } from './helpers/fixtures.ts';
 
@@ -86,8 +86,10 @@ interface Rig {
     subIssues: string[];
     labels: Array<{ id: string; label: string }>;
   };
-  /** Archon's answer for getRunDetail, keyed by run id. */
-  runDetail: Map<string, ArchonRunDetail | null>;
+  /** The engine's answer for getRun, keyed by run id. */
+  runDetail: Map<string, RunRecord | null>;
+  /** How many times the orchestrator asked the engine to suspend its runs. */
+  shutdowns: () => number;
   analysisTargets: () => IssueAnalysis['repo_targets'];
   setAnalysisTargets: (t: IssueAnalysis['repo_targets']) => void;
   tick: () => Promise<void>;
@@ -100,8 +102,6 @@ async function rig(
     agent: {
       max_concurrent_agents: over.maxAgents ?? 5,
       max_turns: 20,
-      max_retry_backoff_ms: 1000,
-      max_concurrent_agents_by_state: {},
     },
   });
   cfg.tracker.mirror_labels = over.mirrorLabels ?? false;
@@ -120,7 +120,8 @@ async function rig(
   };
   const spawns: Rig['spawns'] = [];
   const cancels: string[] = [];
-  const runDetail = new Map<string, ArchonRunDetail | null>();
+  let shutdowns = 0;
+  const runDetail = new Map<string, RunRecord | null>();
   let analysisTargets: IssueAnalysis['repo_targets'] = [
     {
       repo_url: 'https://github.com/acme/api',
@@ -190,19 +191,30 @@ async function rig(
     registry: { getContext: () => REGISTRY, on() {} } as never,
     syncer: null,
     controlStore: store,
-    archonClient: {
-      async getRunDetail(id: string) {
+    executor: {
+      async getRun(id: string) {
         return runDetail.get(id) ?? null;
       },
-      async cancelRun() {},
-      async approveRun() {
-        return true;
+      async cancel() {},
+      async shutdown() {
+        shutdowns += 1;
       },
-      async rejectRun() {},
+      // A gate answer resumes in the background; the tests assert on the
+      // control-plane rows it produces, not on the resumed run.
+      async decideAndWatch() {
+        return null;
+      },
     } as never,
     spawn: async (args: WorkerStartArgs, cb: WorkerCallbacks) => {
       spawns.push({ args, cb });
-      return { cancel: (r?: string) => cancels.push(r ?? 'cancelled'), done: Promise.resolve() };
+      return {
+        cancel: (r?: string) => cancels.push(r ?? 'cancelled'),
+        done: Promise.resolve(),
+        // Synchronous, as the engine's is: `startRun` writes the row before it
+        // resolves. Returning null here modelled a subprocess that no longer
+        // exists, and hid the target being left with no run id.
+        run_id: 'run-1',
+      };
     },
     phaseTimeoutMs: over.phaseTimeoutMs,
   });
@@ -216,6 +228,7 @@ async function rig(
     cancels,
     tracker,
     runDetail,
+    shutdowns: () => shutdowns,
     analysisTargets: () => analysisTargets,
     setAnalysisTargets: (t) => {
       analysisTargets = t;
@@ -225,20 +238,18 @@ async function rig(
   };
 }
 
-function detail(status: string, approvalMessage?: string): ArchonRunDetail {
+function detail(status: string, approvalMessage?: string): RunRecord {
   return {
-    run: {
-      id: 'run-1',
-      workflow_name: 'wf',
-      user_message: 'm',
-      status,
-      started_at: '2026-07-01T00:00:00.000Z',
-      completed_at: null,
-      last_activity_at: null,
-      working_path: null,
-      metadata: approvalMessage ? { approval: { message: approvalMessage } } : {},
-    },
-  } as unknown as ArchonRunDetail;
+    id: 'run-1',
+    workflow_name: 'wf',
+    user_message: 'm',
+    status,
+    started_at: '2026-07-01T00:00:00.000Z',
+    completed_at: null,
+    last_activity_at: null,
+    working_path: null,
+    metadata: approvalMessage ? { approval: { message: approvalMessage } } : {},
+  } as unknown as RunRecord;
 }
 
 const only = async (r: Rig) => (await r.store.listTickets({ workspace: 'acme' }))[0]!;
@@ -322,7 +333,31 @@ describe('Orchestrator — Analyze, Start, run, complete', () => {
     expect(r.spawns).toHaveLength(1);
   });
 
-  test('the run id from a log line lands on the target', async () => {
+  test('dispatch leaves the target with its run id, before any callback fires', async () => {
+    // The bug this pins: `spawnRun` read the id out of the `onRunId` callback,
+    // which the engine emits from inside the run loop — after `startRun` has
+    // already resolved. So it always returned null, and the target was left
+    // with no run id at all.
+    //
+    // A target with no run id is invisible to `reconcileRuns` and is picked up
+    // by `sweepOrphanedTargets` two minutes later, which requeues it and
+    // re-dispatches a run that was perfectly healthy. The second run evicts the
+    // first from the adapter's handle map, so the first becomes uncancellable
+    // and its completion marks the target succeeded while the second carries on
+    // toward a duplicate PR.
+    //
+    // Deliberately asserted *without* firing any callback.
+    const r = await rig();
+    const { ticket } = await upToStart(r);
+    await r.tick();
+
+    expect((await targetsOf(r, ticket.id))[0]!.run_id).toBe('run-1');
+  });
+
+  test('a late run id is recorded, and run_started does not overwrite it', async () => {
+    // The port allows an executor that learns its id asynchronously. When one
+    // does, `patchObject` skips `undefined` but writes an explicit `null`, so a
+    // `run_started` carrying no id would erase the id just recorded.
     const r = await rig();
     const { ticket } = await upToStart(r);
     await r.tick();
@@ -330,7 +365,7 @@ describe('Orchestrator — Analyze, Start, run, complete', () => {
     r.spawns[0]!.cb.onRunId!('9136a16135d082cb9f0ac75523b3b56e');
     await Bun.sleep(10);
 
-    // Stored verbatim: Archon's ids are not UUIDs and must survive unchanged.
+    // Stored verbatim: an executor's ids need not be UUIDs.
     expect((await targetsOf(r, ticket.id))[0]!.run_id).toBe('9136a16135d082cb9f0ac75523b3b56e');
   });
 
@@ -355,11 +390,9 @@ describe('Orchestrator — Analyze, Start, run, complete', () => {
     await upToStart(r);
     await r.tick();
 
-    r.spawns[0]!.cb.onStarted(4242);
     r.spawns[0]!.cb.onOutput('thinking about the widget');
     const running = [...r.orchestrator.getState().running.values()];
     expect(running).toHaveLength(1);
-    expect(running[0]!.run_pid).toBe(4242);
     expect(running[0]!.last_message).toBe('thinking about the widget');
     expect(running[0]!.turn_count).toBe(1);
 
@@ -414,6 +447,11 @@ describe('Orchestrator — failure and gates', () => {
     expect((await targetsOf(r, ticket.id))[0]!.attempt).toBe(1);
   });
 
+  // The Archon-era companion to this — "an exit-0 that is really a gate pause"
+  // — is gone with the executor that needed it: a subprocess exiting 0 on a
+  // pause was the trap, and the engine reports a pause as its own event. The
+  // case that outlives it, a pause whose event went to a process that has since
+  // died, is the reconciler's, and control-reconciler.test.ts owns it.
   test('a gate pause opens a gate rather than completing the target', async () => {
     const r = await rig();
     const { ticket } = await started(r);
@@ -430,21 +468,6 @@ describe('Orchestrator — failure and gates', () => {
     const comment = r.tracker.comments.find((c) => c.body.includes('Approve the plan?'));
     expect(comment).toBeTruthy();
     expect(comment!.body).toMatch(/no effect/i);
-  });
-
-  test('an exit-0 that is really a gate pause does not complete the target', async () => {
-    // Archon exits 0 when a workflow pauses. Believing the exit code would mark a
-    // half-finished workflow as succeeded.
-    const r = await rig();
-    const { ticket } = await started(r);
-    r.spawns[0]!.cb.onRunId!('run-1');
-    r.runDetail.set('run-1', detail('paused', 'Still need approval'));
-
-    r.spawns[0]!.cb.onExit({ type: 'run_succeeded' });
-    await Bun.sleep(10);
-
-    expect((await targetsOf(r, ticket.id))[0]!.status).toBe('gate_waiting');
-    expect((await only(r)).status).toBe('running');
   });
 
   test('approving in the dashboard resumes on the next tick', async () => {
@@ -727,3 +750,49 @@ async function startedTicketVia(r: Rig): Promise<{ id: string }> {
   await control.service.start(ticket.id);
   return ticket;
 }
+
+// ─── shutdown ───────────────────────────────────────────────────────────────
+
+describe('Orchestrator.stop', () => {
+  test('suspends the in-flight runs rather than cancelling them', async () => {
+    // The regression this pins: a merge replaced the engine branch's
+    // `await executor.shutdown()` with main's `session.cancel()` loop, and
+    // nothing noticed because no test called stop() at all.
+    //
+    // The difference is not cosmetic. `cancel` marks a run `cancelled` and
+    // discards work a restart could finish; and because `cli/start.ts` calls
+    // `process.exit(0)` the moment stop() returns, the runner never unwinds, so
+    // the row is left `running` under a *live* lease. Startup recovery only
+    // adopts runs whose lease has lapsed, and only at startup — so any restart
+    // inside the 60s TTL loses them permanently.
+    const r = await rig();
+    r.tracker.candidates = [issue()];
+    await r.tick();
+    const api = r.orchestrator.controlApi()!;
+    const ticket = (await r.store.listTickets({ workspace: 'acme' }))[0]!;
+    await api.handle({ method: 'POST', path: `/tickets/${ticket.id}/analyze` });
+    await r.tick();
+    await api.handle({ method: 'POST', path: `/tickets/${ticket.id}/start` });
+    await r.tick();
+    expect(r.spawns).toHaveLength(1);
+
+    await r.orchestrator.stop();
+
+    expect(r.shutdowns()).toBe(1);
+    expect(r.cancels).toEqual([]);
+  });
+
+  test('stops cleanly with nothing running', async () => {
+    const r = await rig();
+    await r.orchestrator.stop();
+    expect(r.shutdowns()).toBe(1);
+  });
+
+  test('a stopped orchestrator does not schedule another tick', async () => {
+    const r = await rig();
+    await r.orchestrator.stop();
+    // `scheduleTick` returns early once stopped; a tick that slipped through
+    // would touch a closed control plane.
+    await r.tick();
+  });
+});

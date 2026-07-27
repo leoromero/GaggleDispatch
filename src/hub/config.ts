@@ -21,46 +21,14 @@ export interface HubUiConfig {
   host?: string;
 }
 
-export interface HubArchonConfig {
-  /** Auto-launch `archon serve` if it isn't already running on `ui_url`. */
-  autostart: boolean;
-  /** Base URL where Archon's web UI serves. Default: http://localhost:3090. */
-  ui_url: string;
-  /**
-   * Path template for a single workflow run page. `{run_id}` is replaced
-   * with the LiveSession's `run_id`.
-   */
-  run_path: string;
-  /** Command used to launch Archon's web UI (only when autostart applies). */
-  serve_command: string;
-  /** Optional override for ARCHON_HOME env var passed to the Archon process. */
-  archon_home?: string;
-}
-
 export interface HubConfig {
   workspaces: HubWorkspaceEntry[];
   ui: HubUiConfig;
-  archon: HubArchonConfig;
-  /** Optional override for the history DB location. */
-  /**
-   * @deprecated Ignored. History moved into the shared Postgres database
-   * (migrations 200–299), so there is no separate file to point at. Kept only so
-   * an existing hub.yaml still parses.
-   */
-  history_db?: string;
 }
-
-const DEFAULT_ARCHON: HubArchonConfig = {
-  autostart: true,
-  ui_url: 'http://localhost:3090',
-  run_path: '/workflows/runs/{run_id}',
-  serve_command: 'archon serve',
-};
 
 const DEFAULT_CONFIG: HubConfig = {
   workspaces: [],
   ui: { port: 4242, host: '127.0.0.1' },
-  archon: { ...DEFAULT_ARCHON },
 };
 
 const DEFAULT_PALETTE = [
@@ -87,7 +55,6 @@ export function loadHubConfig(path = defaultHubConfigPath()): HubConfig {
   const parsed = YAML.parse(raw) as Partial<HubConfig> | null;
   if (!parsed || typeof parsed !== 'object') return structuredClone(DEFAULT_CONFIG);
   const workspaces = Array.isArray(parsed.workspaces) ? parsed.workspaces : [];
-  const archonRaw = (parsed.archon ?? {}) as Partial<HubArchonConfig>;
   return {
     workspaces: workspaces.map((w) => ({
       name: String(w.name),
@@ -98,14 +65,6 @@ export function loadHubConfig(path = defaultHubConfigPath()): HubConfig {
       port: parsed.ui?.port ?? DEFAULT_CONFIG.ui.port,
       host: parsed.ui?.host ?? DEFAULT_CONFIG.ui.host,
     },
-    archon: {
-      autostart: archonRaw.autostart ?? DEFAULT_ARCHON.autostart,
-      ui_url: archonRaw.ui_url ?? DEFAULT_ARCHON.ui_url,
-      run_path: archonRaw.run_path ?? DEFAULT_ARCHON.run_path,
-      serve_command: archonRaw.serve_command ?? DEFAULT_ARCHON.serve_command,
-      archon_home: (archonRaw as { archon_home?: string }).archon_home,
-    },
-    history_db: parsed.history_db ? String(parsed.history_db) : undefined,
   };
 }
 

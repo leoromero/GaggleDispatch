@@ -365,7 +365,7 @@ describe('buildGaggleEnv', () => {
     expect(env.GAGGLE_ISSUE_IDENTIFIER).toBe('SYM-1');
     expect(env.GAGGLE_ISSUE_TITLE).toBe('A bug');
     expect(env.GAGGLE_REPO_ALIAS).toBe('repo-r');
-    expect(env.GAGGLE_ARCHON_WORKFLOW).toBe('gaggle/fix');
+    expect(env.GAGGLE_WORKFLOW).toBe('gaggle/fix');
     expect(env.GAGGLE_ATTEMPT).toBe('first');
     expect(env.GAGGLE_ANALYSIS_SUMMARY).toBe('summary');
   });

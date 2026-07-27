@@ -8,7 +8,7 @@ import * as YAML from 'yaml';
 import { resolveWorkflowPath, splitFrontMatter } from '../config/loader.ts';
 import { withLock } from '../util/lock.ts';
 import { deriveRepoSlug } from '../util/paths.ts';
-import { fatal, success } from './common.ts';
+import { fatal, success , withStore , loadConfig } from './common.ts';
 import { existsSync as fsExists } from 'node:fs';
 import { loadScaffoldJobs } from '../registry/scaffold-jobs.ts';
 import chalk from 'chalk';
@@ -41,13 +41,17 @@ export async function runRepoRemove(args: { target: string; cwd?: string }): Pro
     writeFileSync(wfPath, `${banner}\n---\n${fmStr}---\n\n${prompt_template}\n`);
     success(`Removed ${removed.url} from Source Registry. Local checkout (if any) is preserved.`);
 
-    if (fsExists(join(baseFolder, 'scaffold_jobs.yaml'))) {
-      const jobs = loadScaffoldJobs(baseFolder);
+    // Warn if a scaffold job for the removed repo is still tracked. Best
+    // effort: an unreachable database should not fail a registry edit.
+    try {
       const slug = deriveRepoSlug(removed.url);
-      if (jobs.jobs.find((j) => j.slug === slug)) {
-        console.log(chalk.yellow(`  ⚠ A scaffold job for slug '${slug}' is still tracked in scaffold_jobs.yaml.`));
+      const jobs = await withStore(loadConfig({ cwd }), (store) => loadScaffoldJobs(store));
+      if (jobs.jobs.some((j) => j.slug === slug)) {
+        console.log(chalk.yellow(`  ⚠ A scaffold job for slug '${slug}' is still tracked.`));
         console.log(chalk.gray(`    Use 'gaggle scaffold cancel ${slug}' to clear it.`));
       }
+    } catch {
+      /* the repo was still removed from the registry, which is what matters */
     }
 
     console.log(chalk.gray(`  Run 'gaggle sync' to refresh registry.synced.yaml.`));

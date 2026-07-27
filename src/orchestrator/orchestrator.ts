@@ -25,14 +25,14 @@ import { logger } from '../util/logger.ts';
 import { LinearClient } from '../tracker/linear.ts';
 import { IssueAnalyzer } from '../analyzer/issue-analyzer.ts';
 import { WorkspaceManager } from '../workspace/workspace-manager.ts';
-import { ArchonClient } from '../executor/archon-client.ts';
 import { spawnWorker, buildLiveSession, type WorkerStartArgs } from './worker.ts';
 import { buildSessionId, createInitialState } from './state.ts';
 import { PrMergeWatcher } from './pr-merge-watcher.ts';
 import type { RegistryLoaderHandle } from '../registry/loader.ts';
 import type { SyncerHandle } from '../registry/repo-syncer.ts';
 import { openControlPlane, type ControlPlane } from '../control/index.ts';
-import { ArchonExecutorAdapter, ArchonRunStatusAdapter } from '../control/adapters/archon.ts';
+import { EngineExecutorAdapter, EngineRunStatusAdapter } from '../control/adapters/executor.ts';
+import type { GaggleExecutor } from '../executor/engine/index.ts';
 import { ControlAnalyzerAdapter, MaxConcurrentSlots } from '../control/adapters/analyzer.ts';
 import type { ControlApi } from '../control/api.ts';
 import type { ControlStore } from '../control/store/types.ts';
@@ -48,15 +48,15 @@ export interface OrchestratorDeps {
   syncer: SyncerHandle | null;
   /** Names this gaggle's tickets. Several gaggles may share one database. */
   workspaceName: string;
-  /** Injected for testing; defaults to a real client built from cfg. */
-  archonClient?: ArchonClient;
+  /** The workflow engine. Runs in this process; there is no executor daemon. */
+  executor: GaggleExecutor;
   /** Injected for testing; defaults to Postgres. */
   controlStore?: ControlStore;
   /**
    * Injected for testing; defaults to the real subprocess spawner.
    *
-   * Without this seam an end-to-end test of the tick loop would launch actual
-   * Archon processes, so the wiring — the part most likely to be wrong — could
+   * Without this seam an end-to-end test of the tick loop would start real
+   * workflow runs, so the wiring — the part most likely to be wrong — could
    * only be verified by hand.
    */
   spawn?: typeof spawnWorker;
@@ -86,9 +86,8 @@ export class Orchestrator {
   private readonly cfg: ServiceConfig;
   private readonly deps: OrchestratorDeps;
   private readonly state: OrchestratorState;
-  private readonly archon: ArchonClient;
   private readonly prWatcher: PrMergeWatcher;
-  private readonly executor: ArchonExecutorAdapter;
+  private readonly executorPort: EngineExecutorAdapter;
   private control: ControlPlane | null = null;
   private tickTimer: ReturnType<typeof setTimeout> | null = null;
   private stopped = false;
@@ -97,13 +96,10 @@ export class Orchestrator {
     this.deps = deps;
     this.cfg = deps.cfg;
     this.state = createInitialState(deps.cfg);
-    this.archon = deps.archonClient ?? new ArchonClient(deps.cfg.executor.api_url);
-
     // The adapter needs to report outcomes to a service that does not exist yet,
-    // so the sink is resolved lazily. See the note in adapters/archon.ts.
-    this.executor = new ArchonExecutorAdapter({
-      cfg: this.cfg,
-      client: this.archon,
+    // so the sink is resolved lazily. See the note in adapters/executor.ts.
+    this.executorPort = new EngineExecutorAdapter({
+      executor: deps.executor,
       launch: (args) => this.launchWorker(args),
       sink: () => {
         if (!this.control) throw new Error('control plane not open');
@@ -144,8 +140,8 @@ export class Orchestrator {
       cfg: this.cfg,
       workspace: this.deps.workspaceName,
       tracker: this.deps.tracker,
-      executor: this.executor,
-      runs: new ArchonRunStatusAdapter(this.archon),
+      executor: this.executorPort,
+      runs: new EngineRunStatusAdapter(this.deps.executor),
       analyzer: new ControlAnalyzerAdapter({
         cfg: this.cfg,
         analyzer: this.deps.analyzer,
@@ -162,16 +158,26 @@ export class Orchestrator {
     this.scheduleTick(0);
   }
 
+  /**
+   * Stop ticking and put the in-flight runs somewhere recoverable.
+   *
+   * Deliberately **not** `session.cancel()`. Cancelling marks a run `cancelled`
+   * and throws away work a restart could finish — and it only sets a flag, so
+   * with `process.exit(0)` following immediately the runner never unwinds and
+   * the row is left `running` under a live lease. Startup recovery looks only
+   * for runs whose lease has *lapsed*, and only at startup, so a restart inside
+   * the 60s TTL — which is every ordinary restart — walks straight past them
+   * and nothing adopts them afterwards.
+   *
+   * `executor.shutdown()` suspends instead: the row and its in-flight nodes stay
+   * `running`, the lease is dropped, and the next start picks them up with the
+   * `at_most_once` gate intact. Awaited, because the process exits the moment
+   * this returns.
+   */
   async stop(): Promise<void> {
     this.stopped = true;
     if (this.tickTimer) clearTimeout(this.tickTimer);
-    for (const [, session] of this.state.running) {
-      try {
-        session.cancel?.();
-      } catch {
-        /* best effort */
-      }
-    }
+    await this.deps.executor.shutdown();
     await this.control?.close();
   }
 
@@ -253,13 +259,12 @@ export class Orchestrator {
     repo_target: RepoTarget;
     analysis: IssueAnalysis;
     callbacks: {
-      onStarted: (pid: number) => void;
       onOutput: (line: string) => void;
       onRunId: (runId: string) => void;
       onGatePaused: (runId: string, message: string) => void;
       onExit: (event: { type: string; exit_code?: number }) => void;
     };
-  }): Promise<{ cancel: (reason?: string) => void }> {
+  }): Promise<{ cancel: (reason?: string) => void; run_id: string | null }> {
     const { ticket, target, callbacks } = args;
     const key = target.id;
     const log = logger.child({
@@ -286,6 +291,8 @@ export class Orchestrator {
       const handle = await spawn(
         {
           cfg: this.cfg,
+          executor: this.deps.executor,
+          worker_key: target.id,
           workspace: this.deps.workspace,
           issue: args.issue,
           repo_target: args.repo_target,
@@ -295,14 +302,6 @@ export class Orchestrator {
           sub_issue_url: target.external_target_url,
         },
         {
-          onStarted: (pid) => {
-            const s = this.state.running.get(key);
-            if (s) {
-              s.run_pid = pid;
-              s.last_event_at = new Date().toISOString();
-            }
-            callbacks.onStarted(pid);
-          },
           onOutput: (line) => {
             const s = this.state.running.get(key);
             if (s) {
@@ -330,7 +329,7 @@ export class Orchestrator {
             this.state.running.delete(key);
             if (event.type !== 'run_succeeded') {
               // The tail is the difference between a diagnosable failure and a
-              // trip into Archon's own logs.
+              // trip through the run's event rows.
               log.warn('Worker exited abnormally', { event: event.type, recent_output: tail });
             }
             callbacks.onExit(event);
@@ -339,9 +338,12 @@ export class Orchestrator {
       );
 
       const s = this.state.running.get(key);
-      if (s) s.cancel = handle.cancel;
-      log.info('Worker spawned', { workflow: args.repo_target.workflow });
-      return { cancel: handle.cancel };
+      if (s) {
+        s.cancel = handle.cancel;
+        s.run_id = handle.run_id;
+      }
+      log.info("Worker spawned", { workflow: args.repo_target.workflow, run_id: handle.run_id ?? undefined });
+      return { cancel: handle.cancel, run_id: handle.run_id };
     } catch (err) {
       this.state.running.delete(key);
       throw err;

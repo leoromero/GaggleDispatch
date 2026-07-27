@@ -12,7 +12,8 @@ import chalk from 'chalk';
 import { loadHubConfig } from '../hub/config.ts';
 import { openSql } from '../store/sql.ts';
 import { currentVersion, pendingVersions } from '../store/migrate.ts';
-import { CONTROL_MIGRATIONS } from '../control/store/migrations.ts';
+import { ALL_MIGRATIONS, migrateAll } from '../store/schema.ts';
+import { resolveBashPath } from '../executor/engine/shell.ts';
 import { loadConfig, type GlobalOptions } from './common.ts';
 import { commandExists } from '../util/subprocess.ts';
 
@@ -58,6 +59,25 @@ export async function runDoctor(opts: GlobalOptions & { json?: boolean } = {}): 
     );
   }
 
+  // Checked separately from git and gh because it is resolved, not just found:
+  // on Windows the engine looks for Git Bash in the places Git for Windows
+  // installs it, not only on PATH. Without it every `bash:` node fails — and it
+  // fails at node twelve of eighteen, long after the run looked healthy.
+  const bash = resolveBashPath();
+  checks.push(
+    bash
+      ? { name: 'bash', level: 'ok', detail: `${bash} (workflow bash: nodes)` }
+      : {
+          name: 'bash',
+          level: 'fail',
+          detail: 'no bash found — every `bash:` workflow node will fail',
+          fix:
+            process.platform === 'win32'
+              ? 'Install Git for Windows (it ships Git Bash), or point GAGGLE_BASH at a bash.exe'
+              : 'Install bash, or point GAGGLE_BASH at it',
+        },
+  );
+
   // ── database ────────────────────────────────────────────────────────────
   if (!cfg.database.url) {
     checks.push({
@@ -80,16 +100,23 @@ export async function runDoctor(opts: GlobalOptions & { json?: boolean } = {}): 
         detail: `connected to ${rows[0]?.db} (${server})`,
       });
 
-      const pending = await pendingVersions(sql, CONTROL_MIGRATIONS);
+      // Every owner: they share one database and one schema_migrations table,
+      // so checking a single set would report "current" while another owner's
+      // tables are missing entirely.
+      const pending = await pendingVersions(sql, ALL_MIGRATIONS);
       const applied = await currentVersion(sql);
       checks.push(
         pending.length === 0
-          ? { name: 'migrations', level: 'ok', detail: `control-plane schema current (at ${applied})` }
+          ? { name: 'migrations', level: 'ok', detail: `schema current (at ${applied})` }
           : {
               name: 'migrations',
               level: 'warn',
-              detail: `${pending.length} control-plane migration(s) pending: ${pending.join(', ')}`,
-              fix: 'They apply automatically on `gaggle start`',
+              detail: `${pending.length} migration(s) pending: ${pending.join(', ')}`,
+              // Every command that opens the database migrates it, so this is
+              // rarely actionable — but naming the explicit command beats
+              // pointing at `gaggle start`, which a `gaggle sync` user is not
+              // about to run.
+              fix: 'Run `gaggle db migrate`, or just run any command — they all apply it',
             },
       );
     } catch (err) {
@@ -162,4 +189,28 @@ function report(checks: Check[], json?: boolean): void {
     );
   }
   if (checks.some((c) => c.level === 'fail')) process.exitCode = 1;
+}
+
+/**
+ * `gaggle db migrate` — apply every pending migration, from every owner.
+ *
+ * Explicit because `gaggle start` migrating on boot is convenient but opaque:
+ * when a deploy needs the schema moved first, an operator wants a command that
+ * does only that and says what it did. All three sets go through one
+ * advisory-locked run, so this is safe to invoke while other processes start.
+ */
+export async function runDbMigrate(opts: GlobalOptions = {}): Promise<void> {
+  const cfg = loadConfig(opts);
+  const sql = openSql(cfg.database.url);
+  try {
+    const before = await currentVersion(sql);
+    const applied = await migrateAll(sql);
+    console.log(
+      applied.length === 0
+        ? chalk.green(`✓ schema already current (at ${before})`)
+        : chalk.green(`✓ applied ${applied.length} migration(s): ${applied.join(', ')}`),
+    );
+  } finally {
+    await sql.close().catch(() => {});
+  }
 }

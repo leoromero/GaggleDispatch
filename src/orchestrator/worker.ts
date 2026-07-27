@@ -11,26 +11,29 @@ import type {
   ServiceConfig,
 } from '../domain/types.ts';
 import { logger } from '../util/logger.ts';
-import { startArchon, type ArchonEvent } from '../executor/archon.ts';
+import type { GaggleExecutor } from '../executor/engine/index.ts';
+import type { RunEvent } from '../executor/types.ts';
 import { WorkspaceManager } from '../workspace/workspace-manager.ts';
 import { buildIssueMessage, buildGaggleEnv } from '../workspace/message.ts';
 
 export interface WorkerExitEvent {
-  type: 'run_succeeded' | 'run_failed' | 'run_timed_out' | 'run_stalled' | 'run_cancelled';
+  type: 'run_succeeded' | 'run_failed' | 'run_timed_out' | 'run_cancelled';
   exit_code?: number;
+  /** The engine's own message, when it gave one. Becomes the failure reason. */
+  error?: string;
 }
 
 export interface WorkerCallbacks {
-  onStarted: (pid: number) => void;
   onOutput: (line: string) => void;
   onGatePaused: (run_id: string, gate_message: string) => void;
   onExit: (event: WorkerExitEvent) => void;
-  /** Called once when Archon logs the workflowRunId (DB run id). */
-  onRunId?: (db_run_id: string) => void;
+  /** Called once the run row exists and its id is known. */
+  onRunId?: (run_id: string) => void;
 }
 
 export interface WorkerStartArgs {
   cfg: ServiceConfig;
+  executor: GaggleExecutor;
   workspace: WorkspaceManager;
   issue: Issue;
   repo_target: RepoTarget;
@@ -38,17 +41,80 @@ export interface WorkerStartArgs {
   attempt: number | null;
   source_branch: string;
   sub_issue_url?: string | null;
-  /** When set, used as the Archon message instead of building one from issue+target. */
+  /** Sub-issue this run is tracked by, if the target has one. */
+  sub_issue_id?: string | null;
+  /**
+   * Orchestrator's key for this (issue, repo) pair. Stamped on the run so
+   * startup recovery can find it again without a separate sidecar.
+   */
+  worker_key: string;
+  /** When set, used as the run message instead of building one from issue+target. */
   message_override?: string;
 }
 
 export interface RunningWorker {
   cancel: (reason?: string) => void;
   done: Promise<void>;
+  /**
+   * The run id, or null when the run never started.
+   *
+   * Known synchronously: the engine writes the run row inside `startRun`. The
+   * `run_started` event carries it too, but that fires from inside the run
+   * loop, which `startRun` does not await — so a caller that waited for the
+   * event would be handed null and act on it.
+   */
+  run_id: string | null;
+}
+
+/**
+ * Translate engine events into the callbacks the orchestrator expects.
+ *
+ * The gate case is the notable one: the engine reports a pause exactly, with
+ * the node id and the resolved message. The previous integration inferred it
+ * by regex-matching a keyword and a UUID out of a log line.
+ */
+export function toWorkerCallbacks(cb: WorkerCallbacks): (e: RunEvent) => void {
+  return (e) => {
+    switch (e.type) {
+      case 'run_started':
+        cb.onRunId?.(e.run_id);
+        break;
+      case 'node_started':
+        cb.onOutput(`▸ ${e.node_id} (${e.node_type})`);
+        break;
+      case 'node_output':
+        cb.onOutput(e.line);
+        break;
+      case 'node_completed':
+        cb.onOutput(`✓ ${e.node_id}`);
+        break;
+      case 'node_skipped':
+        cb.onOutput(`· ${e.node_id} skipped — ${e.reason}`);
+        break;
+      case 'node_failed':
+        cb.onOutput(`✗ ${e.node_id}: ${e.error}`);
+        break;
+      case 'run_gate_paused':
+        cb.onGatePaused(e.run_id, e.gate_message);
+        break;
+      case 'run_succeeded':
+        cb.onExit({ type: 'run_succeeded' });
+        break;
+      case 'run_failed':
+        cb.onExit({ type: 'run_failed', exit_code: 1, error: e.error });
+        break;
+      case 'run_cancelled':
+        cb.onExit({ type: 'run_cancelled' });
+        break;
+      case 'run_timed_out':
+        cb.onExit({ type: 'run_timed_out' });
+        break;
+    }
+  };
 }
 
 export async function spawnWorker(args: WorkerStartArgs, cb: WorkerCallbacks): Promise<RunningWorker> {
-  const { cfg, workspace, issue, repo_target, analysis, attempt } = args;
+  const { executor, workspace, issue, repo_target, analysis, attempt } = args;
   const log = logger.child({
     issue_id: issue.id,
     issue_identifier: issue.identifier,
@@ -64,65 +130,61 @@ export async function spawnWorker(args: WorkerStartArgs, cb: WorkerCallbacks): P
   } catch (err) {
     log.error('before_run hook failed', { error: (err as Error).message });
     cb.onExit({ type: 'run_failed', exit_code: 99 });
-    return { cancel: () => {}, done: Promise.resolve() };
+    return { cancel: () => {}, done: Promise.resolve(), run_id: null };
   }
 
-  const message = args.message_override ?? buildIssueMessage({ issue, repo_target, analysis, attempt, sub_issue_url: args.sub_issue_url ?? null });
-  const env = buildGaggleEnv({ issue, repo_target, analysis, attempt, sub_issue_url: args.sub_issue_url ?? null });
+  const message =
+    args.message_override ??
+    buildIssueMessage({ issue, repo_target, analysis, attempt, sub_issue_url: args.sub_issue_url ?? null });
+  const env = buildGaggleEnv({
+    issue, repo_target, analysis, attempt, sub_issue_url: args.sub_issue_url ?? null,
+  });
 
-  log.info('Launching Archon workflow', {
+  log.info('Launching workflow', {
     workflow: repo_target.workflow,
     cwd: repo_target.local_path,
   });
 
-  const handle = startArchon(
-    {
-      archonCommand: cfg.executor.command,
-      workflowName: repo_target.workflow,
-      cwd: repo_target.local_path,
-      message,
-      env,
-      turnTimeoutMs: cfg.executor.turn_timeout_ms,
-      stallTimeoutMs: cfg.executor.stall_timeout_ms,
-    },
-    (e: ArchonEvent) => {
-      switch (e.type) {
-        case 'archon_started':
-          cb.onStarted(e.pid);
-          break;
-        case 'archon_output':
-          cb.onOutput(e.line);
-          break;
-        case 'run_id':
-          cb.onRunId?.(e.db_run_id);
-          break;
-        case 'run_gate_paused':
-          cb.onGatePaused(e.run_id, e.gate_message);
-          break;
-        case 'run_succeeded':
-        case 'run_failed':
-        case 'run_timed_out':
-        case 'run_stalled':
-        case 'run_cancelled':
-          cb.onExit({ type: e.type, exit_code: 'exit_code' in e ? e.exit_code : undefined });
-          break;
-      }
-    },
-  );
+  let handle;
+  try {
+    handle = await executor.startRun(
+      {
+        workflow: repo_target.workflow,
+        cwd: repo_target.local_path,
+        message,
+        repo_slug: repo_target.repo_alias,
+        env,
+        base_branch: args.source_branch,
+        external_key: args.worker_key,
+        metadata: {
+          worker: {
+            parent_issue_id: issue.id,
+            sub_issue_id: args.sub_issue_id ?? null,
+            repo_alias: repo_target.repo_alias,
+          },
+        },
+      },
+      toWorkerCallbacks(cb),
+    );
+  } catch (err) {
+    // An unknown workflow or an unloadable one fails here, before any node
+    // runs — report it as a worker failure rather than letting it escape.
+    log.error('Could not start the workflow', { error: (err as Error).message });
+    cb.onOutput(`✗ ${(err as Error).message}`);
+    cb.onExit({ type: 'run_failed', exit_code: 98 });
+    return { cancel: () => {}, done: Promise.resolve(), run_id: null };
+  }
 
-  // Run the after_run hook upon completion (best-effort).
-  void handle.done.then(async () => {
-    try {
-      await workspace.runHook('after_run', repo_target, issue, attempt);
-    } catch {
-      /* logged inside */
-    }
-  });
+  // The run id reaches the caller through the `run_started` event, which
+  // `toWorkerCallbacks` turns into onRunId. Announcing it here as well fired
+  // the callback twice for one run.
 
-  return {
-    cancel: handle.cancel,
-    done: handle.done,
-  };
+  // `after_run` deliberately does not hang off `handle.done`: that settles at
+  // an approval gate too, so the hook fired mid-workflow and never again when
+  // the resumed run actually finished. The orchestrator runs it from
+  // handleWorkerExit, which is the one place that knows an outcome is final.
+
+  return { cancel: handle.cancel, done: handle.done, run_id: handle.run_id };
 }
 
 export function buildLiveSession(args: {
@@ -140,7 +202,6 @@ export function buildLiveSession(args: {
     repo_alias: repo_target.repo_alias,
     repo_target,
     sub_issue_id,
-    run_pid: null,
     run_id: null,
     workflow: repo_target.workflow,
     last_event: null,

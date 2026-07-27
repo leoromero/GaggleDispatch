@@ -469,7 +469,7 @@ describe('ControlService — gates', () => {
     expect(after!.gate_message).toBeNull();
   });
 
-  test('a gate timeout fails the target and rejects the run', async () => {
+  test('a gate timeout fails the target and stops the run', async () => {
     const h = await harness();
     const ticket = await startedTicket(h);
     await h.service.claimAndDispatch(10);
@@ -479,7 +479,11 @@ describe('ControlService — gates', () => {
     await h.service.gateTimedOut(target.id);
 
     expect((await h.store.getTarget(target.id))!.status).toBe('failed');
-    expect(h.executor.rejected[0]!.reason).toMatch(/timeout/i);
+    // Stopped, not rejected. Rejecting resumes the run so `on_reject` can
+    // rework — pointless for a target that has just been failed, and it left
+    // the run parked at the gate forever holding its worktree.
+    expect(h.executor.killed).toHaveLength(1);
+    expect(h.executor.rejected).toEqual([]);
   });
 
   test('creating a blocker from a gate parks the target and files the issue', async () => {

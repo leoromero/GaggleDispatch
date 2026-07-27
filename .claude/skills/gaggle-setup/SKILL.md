@@ -22,10 +22,10 @@ bun --version
 git --version
 gh --version
 claude --version
-archon version
+gaggle version
 ```
 
-**Claude Code is a direct prerequisite** — GaggleDispatch's Issue Analyzer uses the Claude Agent SDK, which invokes the `claude` binary for authentication (same mechanism as Archon). No separate `ANTHROPIC_API_KEY` is needed; run `claude /login` to authenticate.
+**Claude Code is a direct prerequisite** — GaggleDispatch's Issue Analyzer uses the Claude Agent SDK, which invokes the `claude` binary for authentication (same mechanism as the workflow engine). No separate `ANTHROPIC_API_KEY` is needed; run `claude /login` to authenticate.
 
 **If `bun` is missing:**
 ```powershell
@@ -51,36 +51,38 @@ irm https://claude.ai/install.ps1 | iex   # install
 claude /login                              # authenticate
 ```
 
-**If `archon` is missing:** Install it, then verify:
-
-```powershell
-# Windows (quick install)
-irm https://archon.diy/install.ps1 | iex
-archon version
-```
+**If Postgres is not reachable:** the engine records run state there, which is
+what makes a run resumable across a crash or an overnight gate.
 
 ```bash
-# macOS / Linux (quick install)
-curl -fsSL https://archon.diy/install | bash
-archon version
+docker compose up -d          # from the GaggleDispatch repo
+export DATABASE_URL=postgres://gaggle:gaggle@localhost:55432/gaggle
 ```
+
+Any reachable Postgres 16+ works; point `DATABASE_URL` at it instead.
+
+**On Windows, `bash` must be on PATH** — workflow `bash:` nodes are POSIX
+scripts. Install Git for Windows, or set `GAGGLE_BASH` to a bash executable.
+
+Verify the whole host with `gaggle doctor`, which checks bash, git, gh, the
+database connection, and the schema version.
 
 Or from source (any platform):
 ```bash
-git clone https://github.com/coleam00/Archon
-cd Archon
+git clone https://github.com/coleam00/the workflow engine
+cd the workflow engine
 bun install
 cd packages/cli && bun link
-archon version
+gaggle version
 ```
 
-After installing, verify Claude Code is configured for Archon:
+After installing, verify Claude Code is configured for the workflow engine:
 ```bash
 which claude   # must be in PATH
 claude --version
 ```
 
-If `archon version` shows a missing `CLAUDE_BIN_PATH` warning, set it:
+If `gaggle version` shows a missing `CLAUDE_BIN_PATH` warning, set it:
 ```powershell
 # Windows
 $env:CLAUDE_BIN_PATH = (Get-Command claude).Source
@@ -147,7 +149,7 @@ If `gaggle: command not found` after `bun link`, open a new terminal — the PAT
 > It will prompt you for:
 > 1. **LINEAR_API_KEY** — Linear → Settings → API → Personal API keys
 >
-> The Anthropic API key is **not** required here — GaggleDispatch inherits it from Claude Code's credential store, the same way Archon does.
+> The Anthropic API key is **not** required here — GaggleDispatch inherits it from Claude Code's credential store, the same way the workflow engine does.
 >
 > Keys are saved to `<base_folder>/.env` (the path shown when `gaggle init` ran). This file is scoped to this deployment and loaded automatically every time a `gaggle` command starts — no terminal restart needed.
 >
@@ -182,7 +184,7 @@ gaggle init
 
 This creates:
 - **`WORKFLOW.md`** — deployment configuration (YAML front matter + docs)
-- **`workflow_templates/`** — default Archon DAG workflow files (`gaggle-fix-issue.yaml`, `gaggle-supervised.yaml`, `gaggle-scaffold.yaml`)
+- **`workflow_templates/`** — default the workflow engine DAG workflow files (`gaggle-fix-issue.yaml`, `gaggle-supervised.yaml`, `gaggle-scaffold.yaml`)
 
 Store this directory as `<project-dir>`.
 
@@ -198,7 +200,8 @@ Open `<project-dir>/WORKFLOW.md` and set at minimum:
 | `tracker.active_states` | Linear board column names | `[Todo, In Progress]` |
 | `tracker.terminal_states` | Linear board column names | `[Done, Cancelled]` |
 | `registry.base_folder` | Any directory **outside** `<project-dir>` | `C:\Users\you\.gaggle` |
-| `archon.default_workflow` | Leave as `gaggle/gaggle-fix-issue` | — |
+| `executor.database_url` | Postgres connection string | `$DATABASE_URL` |
+| `executor.default_workflow` | Leave as `gaggle/gaggle-fix-issue` | — |
 
 Ask the user for their **Linear team key** in plain text: "What is your Linear team key? (e.g., `SYM`, `ENG` — visible in Linear → Settings)"
 
@@ -220,11 +223,12 @@ polling:
 agent:
   max_concurrent_agents: 4
 
-archon:
-  command: archon workflow run
-  turn_timeout_ms: 7200000
-  stall_timeout_ms: 600000
+executor:
+  database_url: $DATABASE_URL
   default_workflow: gaggle/gaggle-fix-issue
+  max_run_duration_ms: 7200000
+  node_idle_timeout_ms: 600000
+  gate_timeout_ms: 86400000
 
 claude:
   api_key: $ANTHROPIC_API_KEY
@@ -293,7 +297,7 @@ Look for repos with `gaggle_md: missing` in the output. For each:
 gaggle repo scaffold <url>
 ```
 
-This launches an Archon workflow that reads the repo source code and opens a draft PR with a generated `gaggle.md`. It runs asynchronously — use `--async` if you want to return control immediately:
+This launches an the workflow engine workflow that reads the repo source code and opens a draft PR with a generated `gaggle.md`. It runs asynchronously — use `--async` if you want to return control immediately:
 
 ```powershell
 gaggle repo scaffold <url> --async
@@ -333,7 +337,7 @@ gaggle start
 GaggleDispatch will:
 1. Restore any in-flight issues from Linear labels (crash recovery)
 2. Begin the poll loop (default every 30s)
-3. Analyze new issues via Claude and dispatch Archon workflows to registered repos
+3. Analyze new issues via Claude and dispatch the workflow engine workflows to registered repos
 
 To run in the background on Windows, wrap in a PowerShell job or use Windows Task Scheduler. For long-running deployments, use `gaggle hub start` (multi-repo hub mode).
 
@@ -349,7 +353,8 @@ To run in the background on Windows, wrap in a PowerShell job or use Windows Tas
 | `registry.synced.yaml not found` | `gaggle sync` not run | Run `gaggle sync` |
 | Issue routed to no repos | Repos missing `gaggle.md` | Run `gaggle repo scaffold <url>` for each repo, merge the PR |
 | `.gaggle.lock` timeout | Another gaggle command running | Wait 10s and retry; kill stale processes if needed |
-| `archon: command not found` | Archon not installed or not in PATH | Install Archon (use the `archon` skill), then retry |
+| `executor.database_url is empty` | Postgres not configured | Set `DATABASE_URL`, or run `docker compose up -d`, then `gaggle doctor` |
+| `bash was not found` | No POSIX shell on PATH (Windows) | Install Git for Windows, or set `GAGGLE_BASH` |
 | Linear 401 errors | Invalid or expired API key | Re-run `gaggle setup` with a fresh key |
 
 ---
@@ -358,7 +363,7 @@ To run in the background on Windows, wrap in a PowerShell job or use Windows Tas
 
 Tell the user what was configured:
 - `<project-dir>/WORKFLOW.md` — orchestration config
-- `<project-dir>/workflow_templates/` — default Archon DAG workflows (synced to each repo on dispatch)
+- `<project-dir>/workflow_templates/` — default the workflow engine DAG workflows (synced to each repo on dispatch)
 - `<project-dir>/.claude/skills/gaggle/` — Claude Code skill (copied automatically by `gaggle init`)
 - `$GAGGLE_BASE_FOLDER/repos/` — local checkouts of registered repos
 - `$GAGGLE_BASE_FOLDER/registry.synced.yaml` — merged routing registry

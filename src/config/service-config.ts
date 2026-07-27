@@ -249,57 +249,47 @@ export function buildServiceConfig(def: WorkflowDefinition): ServiceConfig {
 
   // ── agent ────────────────────────────────────────────────────────────────
   const agentRaw = asObject(root.agent, 'agent');
-  const byStateRaw = asObject(agentRaw.max_concurrent_agents_by_state, 'agent.max_concurrent_agents_by_state');
-  const max_concurrent_agents_by_state: Record<string, number> = Object.fromEntries(
-    Object.entries(byStateRaw).map(([k, v]) => [
-      k.toLowerCase(),
-      asPositiveInt(v, `agent.max_concurrent_agents_by_state.${k}`, 1),
-    ]),
-  );
   const agent: AgentConfig = {
     max_concurrent_agents: asPositiveInt(agentRaw.max_concurrent_agents, 'agent.max_concurrent_agents', 10),
     max_turns: asPositiveInt(agentRaw.max_turns, 'agent.max_turns', 20),
-    max_retry_backoff_ms: asPositiveInt(agentRaw.max_retry_backoff_ms, 'agent.max_retry_backoff_ms', 300_000),
-    max_concurrent_agents_by_state,
   };
 
   // ── executor ─────────────────────────────────────────────────────────────
-  // `executor:` is the name; `archon:` is accepted as a deprecated alias.
+  // `executor:` is the name; `archon:` is still accepted as a deprecated alias.
   //
-  // The block describes *the executor*, which happens to be Archon today and
-  // will be the in-house engine shortly. Naming it after the current
-  // implementation is what made `cfg.executor.gate_timeout_ms` read like an
-  // Archon-specific setting when it is a policy of ours. The engine branch
-  // removes `archon:` outright; warning here rather than failing gives operators
-  // a release to rename in, and means neither branch has to break a working
-  // WORKFLOW.md on merge day.
+  // The block describes *the executor*, which is now the in-house engine. The
+  // four Archon transport settings (command, api_url, poll_interval_ms,
+  // turn_timeout_ms) are gone with it — nothing reads them. Everything that
+  // remains is policy, and kept its name across the swap, so a WORKFLOW.md
+  // written against Archon still parses; it just warns.
   const executorRaw = asObject(root.executor, 'executor');
   const archonRaw = asObject(root.archon, 'archon');
   if (root.archon !== undefined) {
     logger.warn(
-      'The `archon:` config block is deprecated — rename it to `executor:`. It will stop being read once the workflow engine lands.',
+      'The `archon:` config block is deprecated — rename it to `executor:`. Its transport settings ' +
+        '(command, api_url, poll_interval_ms, turn_timeout_ms) are no longer read: GaggleDispatch runs workflows itself.',
     );
   }
   /** Prefer `executor:`, fall back to the deprecated `archon:`. */
   const exec = (key: string): unknown => executorRaw[key] ?? archonRaw[key];
   const executor: ExecutorConfig = {
-    // Archon transport. These four go away with Archon; nothing in the control
-    // plane reads them.
-    command: asString(exec('command'), 'executor.command', 'archon workflow run'),
-    api_url: asString(exec('api_url'), 'executor.api_url', 'http://localhost:3090'),
-    poll_interval_ms: asPositiveInt(exec('poll_interval_ms'), 'executor.poll_interval_ms', 5_000),
-    turn_timeout_ms: asPositiveInt(exec('turn_timeout_ms'), 'executor.turn_timeout_ms', 3_600_000),
-    // Policy, not transport. These four keep their names across the engine swap.
-    stall_timeout_ms: asInt(exec('stall_timeout_ms'), 'executor.stall_timeout_ms', 300_000),
     default_workflow: asString(exec('default_workflow'), 'executor.default_workflow', 'gaggle/gaggle-fix-issue'),
     gate_timeout_ms: asInt(exec('gate_timeout_ms'), 'executor.gate_timeout_ms', 0),
     startup_cleanup_age_days: asInt(exec('startup_cleanup_age_days'), 'executor.startup_cleanup_age_days', 7),
+    // Engine timings. Idle and bash timeouts bound a single node; the run
+    // duration bounds the whole graph; the lease pair is what lets another
+    // process tell a live run from an abandoned one.
+    max_run_duration_ms: asPositiveInt(exec('max_run_duration_ms'), 'executor.max_run_duration_ms', 3_600_000),
+    node_idle_timeout_ms: asPositiveInt(exec('node_idle_timeout_ms'), 'executor.node_idle_timeout_ms', 300_000),
+    bash_timeout_ms: asPositiveInt(exec('bash_timeout_ms'), 'executor.bash_timeout_ms', 120_000),
+    lease_heartbeat_ms: asPositiveInt(exec('lease_heartbeat_ms'), 'executor.lease_heartbeat_ms', 15_000),
+    lease_ttl_ms: asPositiveInt(exec('lease_ttl_ms'), 'executor.lease_ttl_ms', 60_000),
   };
 
   // ── database ─────────────────────────────────────────────────────────────
   // One key names the shared database. `executor.database_url` is accepted as an
   // alias because the workflow-engine branch introduced that name; whichever the
-  // operator has written, both halves resolve to the same connection.
+  // operator has written, every half resolves to the same connection.
   const databaseRaw = asObject(root.database, 'database');
   const databaseUrlRaw =
     asOptionalString(databaseRaw.url, 'database.url') ??
@@ -419,7 +409,7 @@ export function defaultGateResumeState(cfg: ServiceConfig): string {
   return cfg.tracker.active_states[0] ?? 'In Progress';
 }
 
-/** State to move an issue/sub-issue to when Archon finishes successfully (PR created). */
+/** State to move an issue/sub-issue to when a run finishes successfully (PR created). */
 export function completedState(cfg: ServiceConfig): string {
   if (cfg.tracker.pr_ready_state) return cfg.tracker.pr_ready_state;
   return cfg.tracker.terminal_states[0] ?? 'Done';

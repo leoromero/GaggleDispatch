@@ -13,7 +13,7 @@ description: |
   Triggers (config): "update gaggle.md", "regenerate gaggle.md", "scaffold gaggle.md",
             "what does this repo do in gaggle", "gaggle routing".
   Capability: Orchestrates multi-repo AI coding workflows via Linear issues. GaggleDispatch
-  reads this repo's gaggle.md, routes issues to it, and dispatches Archon workflows.
+  reads this repo's gaggle.md, routes issues to it, and dispatches workflow runs.
 argument-hint: "[workflow] [issue number or description]"
 ---
 
@@ -21,11 +21,11 @@ argument-hint: "[workflow] [issue number or description]"
 
 GaggleDispatch is the multi-repo orchestrator that dispatched work to this repository. It reads
 issues from Linear, analyzes which repos are affected using each repo's `gaggle.md`, and runs
-Archon DAG workflows in isolated git worktrees. It never writes code itself.
+DAG workflows in isolated git worktrees. It never writes code itself.
 
 ## Available Gaggle Workflows (live)
 
-!`archon workflow list 2>&1 | grep -i gaggle || echo "No gaggle workflows found — run 'gaggle sync' from the GaggleDispatch repo to sync templates into .archon/workflows/gaggle/."`
+!`gaggle workflow list 2>&1 | grep -i gaggle || echo "No gaggle workflows found — run 'gaggle sync' from the GaggleDispatch repo to sync templates into .gaggle/workflows/gaggle/."`
 
 ## Routing
 
@@ -36,18 +36,18 @@ Archon DAG workflows in isolated git worktrees. It never writes code itself.
 | **Start / restart the orchestrator** | Read "Orchestrator Commands" below |
 | **Check what GaggleDispatch is doing** | Run `gaggle status` from the GaggleDispatch project dir |
 | **Update this repo's routing description** | Read "The gaggle.md File" section below |
-| **Regenerate gaggle.md from scratch** | Run `archon workflow run gaggle/gaggle-scaffold --branch scaffold/gaggle-md "Generate gaggle.md"` |
+| **Regenerate gaggle.md from scratch** | Run `gaggle workflow run gaggle/gaggle-scaffold --branch scaffold/gaggle-md "Generate gaggle.md"` |
 | **Set up GaggleDispatch for the first time** | Use the `gaggle-setup` skill from the GaggleDispatch repo |
 
 ---
 
 ## Running Workflows
 
-Gaggle workflows are Archon DAG workflows synced by GaggleDispatch into `.archon/workflows/gaggle/`.
-Run them like any other Archon workflow — always in a worktree, always in the background:
+Gaggle workflows are DAG workflows synced by GaggleDispatch into `.gaggle/workflows/gaggle/`.
+Run them with the gaggle CLI — always in a worktree, always in the background:
 
 ```bash
-archon workflow run gaggle/gaggle-fix-issue --branch fix/issue-42 "Fix issue #42"
+gaggle workflow run gaggle/gaggle-fix-issue --branch fix/issue-42 "Fix issue #42"
 ```
 
 ### Workflow Selection
@@ -58,7 +58,7 @@ archon workflow run gaggle/gaggle-fix-issue --branch fix/issue-42 "Fix issue #42
 | Risky change needing human plan approval | `gaggle/gaggle-supervised` | `feat/{name}` |
 | Generate or regenerate `gaggle.md` | `gaggle/gaggle-scaffold` | `scaffold/gaggle-md` |
 
-**CRITICAL RULES** (same as Archon):
+**CRITICAL RULES**:
 1. **Always run in background** — use `run_in_background: true` in the Bash tool.
 2. **Always use `--branch`** — worktree isolation prevents conflicts.
 3. **One workflow per shell** — each workflow blocks its shell.
@@ -67,10 +67,10 @@ archon workflow run gaggle/gaggle-fix-issue --branch fix/issue-42 "Fix issue #42
 
 ## Signaling a Cross-repo Blocker
 
-If you (or an Archon workflow agent) discover mid-implementation that work in **another repository**
+If you (or an the workflow engine workflow agent) discover mid-implementation that work in **another repository**
 is needed before this repo can proceed, signal a blocker:
 
-1. Write `$ARTIFACTS_DIR/blocker-request.md` (inside the running Archon workflow's artifacts dir):
+1. Write `$ARTIFACTS_DIR/blocker-request.md` (inside the running the workflow engine workflow's artifacts dir):
 
 ```markdown
 ---
@@ -94,11 +94,11 @@ is resolved. **No further action needed from the agent.**
 
 When a gaggle workflow pauses at an `approval` node:
 
-1. GaggleDispatch detects the pause from Archon, frees the concurrency slot.
+1. GaggleDispatch detects the pause from the workflow engine, frees the concurrency slot.
 2. It posts the gate message as a comment on the Linear issue.
 3. A `gaggle:waiting-human` label is applied.
 4. A human replies in Linear with `approve` / `lgtm` / `yes` or `reject` / `no` / `cancel`.
-5. GaggleDispatch resumes the workflow via Archon, injecting the human's reply.
+5. GaggleDispatch resumes the workflow via the workflow engine, injecting the human's reply.
 
 **No agent action required** — the orchestrator handles all gate communication.
 
@@ -177,7 +177,7 @@ GaggleDispatch writes these labels to Linear issues — do not create or remove 
 | `gaggle:claimed` | Issue locked for analysis |
 | `gaggle:analyzing` | Issue Analyzer (Claude) running |
 | `gaggle:queued` | Analysis done, waiting for dispatch |
-| `gaggle:running` | Archon workflow in progress |
+| `gaggle:running` | the workflow engine workflow in progress |
 | `gaggle:waiting-human` | Approval gate active |
 | `gaggle:retrying` | Retry in progress after failure |
 | `gaggle:failed` | Workflow failed, needs manual review |
@@ -188,12 +188,12 @@ GaggleDispatch writes these labels to Linear issues — do not create or remove 
 
 **User**: "Use gaggle to fix issue #42"
 ```bash
-archon workflow run gaggle/gaggle-fix-issue --branch fix/issue-42 "Fix issue #42"
+gaggle workflow run gaggle/gaggle-fix-issue --branch fix/issue-42 "Fix issue #42"
 ```
 
 **User**: "Run the supervised workflow for this risky migration"
 ```bash
-archon workflow run gaggle/gaggle-supervised --branch feat/migration "Perform the database migration"
+gaggle workflow run gaggle/gaggle-supervised --branch feat/migration "Perform the database migration"
 ```
 
 **User**: "Start the orchestrator"

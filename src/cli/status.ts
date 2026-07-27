@@ -3,14 +3,14 @@
  */
 
 import chalk from 'chalk';
-import { loadConfig } from './common.ts';
+import { loadConfig, withStore } from './common.ts';
 import { loadSyncedRegistry } from '../registry/synced-registry.ts';
 import { loadScaffoldJobs } from '../registry/scaffold-jobs.ts';
 
 export async function runStatus(opts: { cwd?: string; json?: boolean }): Promise<void> {
   const cfg = loadConfig({ cwd: opts.cwd });
-  const synced = loadSyncedRegistry(cfg.registry.base_folder);
-  const jobs = loadScaffoldJobs(cfg.registry.base_folder);
+  const synced = await withStore(cfg, (store) => loadSyncedRegistry(store));
+  const jobs = await withStore(cfg, (store) => loadScaffoldJobs(store));
 
   if (opts.json) {
     console.log(
@@ -34,7 +34,7 @@ export async function runStatus(opts: { cwd?: string; json?: boolean }): Promise
   console.log(chalk.bold('Source Registry (WORKFLOW.md):'));
   console.log(`  ${cfg.repositories.length} repositories registered.\n`);
 
-  console.log(chalk.bold('Synced Registry (registry.synced.yaml):'));
+  console.log(chalk.bold('Synced Registry:'));
   if (!synced) {
     console.log(chalk.gray('  (not synced — run `gaggle sync`)'));
   } else {
@@ -53,7 +53,7 @@ export async function runStatus(opts: { cwd?: string; json?: boolean }): Promise
   }
   console.log('');
 
-  console.log(chalk.bold('Scaffold Jobs (scaffold_jobs.yaml):'));
+  console.log(chalk.bold('Scaffold Jobs:'));
   if (jobs.jobs.length === 0) {
     console.log(chalk.gray('  (none)'));
   } else {

@@ -24,8 +24,10 @@ import {
   type MigrationOwner,
 } from '../store/migrate.ts';
 import { CONTROL_MIGRATIONS } from '../control/store/migrations.ts';
+import { MIGRATIONS as ENGINE_MIGRATIONS } from '../executor/store/migrations.ts';
 import { HUB_MIGRATIONS } from '../hub/history-migrations.ts';
 import { openSql, type Sql } from '../store/sql.ts';
+import { ALL_MIGRATIONS, migrateAll } from '../store/schema.ts';
 
 const PG_URL = process.env.TEST_DATABASE_URL ?? '';
 
@@ -192,17 +194,19 @@ describe('migration range ownership', () => {
 // never the problem, and a comment saying "a range is a claim on tables" is not a
 // check.
 //
-// Applying every set the repo knows about to a virgin database is. It is also the
-// one test that will still be true after the engine branch merges — adding
-// `ENGINE_MIGRATIONS` to the list below is the whole change, and if its tables
-// overlap these, this fails on the spot instead of on someone's first boot.
+// Applying every set the repo knows about to a virgin database is. This is the
+// check that was missing when both branches independently created
+// `scaffold_jobs`, `hub_workspaces` and `hub_token_daily`: the ranges were
+// documented and respected, and the merged schema still could not migrate a
+// fresh database, because a range is a claim on *tables* and nothing enforced
+// that half. An overlap now fails here rather than on someone's first boot.
 
 if (PG_URL) {
   describe('all migration sets on one database', () => {
     const OWNED: Array<{ owner: MigrationOwner; set: readonly Migration[] }> = [
+      { owner: 'engine', set: ENGINE_MIGRATIONS },
       { owner: 'control', set: CONTROL_MIGRATIONS },
       { owner: 'hub', set: HUB_MIGRATIONS },
-      // When the workflow engine lands: { owner: 'engine', set: ENGINE_MIGRATIONS }
     ];
 
     test('no two owners create the same table', async () => {
@@ -221,6 +225,36 @@ if (PG_URL) {
       // A sanity floor: if the regex ever stops matching, the test above passes
       // vacuously and this is what notices.
       expect(created.size).toBeGreaterThan(5);
+    });
+
+    test('a store opened the way the CLI opens it can use every table', async () => {
+      // The regression: `withStore` applied only the engine set, but the engine
+      // store reads `scaffold_jobs`, which the control plane creates. A fresh
+      // database therefore migrated "successfully" and then died on step 4 of
+      // the documented setup with a raw `relation does not exist`.
+      //
+      // Asserted through a real store against real DDL, because the shape of
+      // the bug was exactly that every string-level check passed.
+      const sql = openSql(PG_URL, { maxConnections: 1 });
+      const schema = `cliopen_${process.pid}`;
+      try {
+        await sql.unsafe(`DROP SCHEMA IF EXISTS ${schema} CASCADE`);
+        await sql.unsafe(`CREATE SCHEMA ${schema}`);
+        await sql.unsafe(`SET search_path TO ${schema}`);
+
+        await migrateAll(sql);
+
+        // One table from each owner, so a future split fails here.
+        for (const table of ['workflow_runs', 'scaffold_jobs', 'tickets', 'hub_workspaces']) {
+          const rows = (await sql.unsafe(
+            `SELECT to_regclass('${schema}.${table}') AS t`,
+          )) as Array<{ t: string | null }>;
+          expect(rows[0]?.t, `${table} was not created`).not.toBeNull();
+        }
+      } finally {
+        await sql.unsafe(`DROP SCHEMA IF EXISTS ${schema} CASCADE`).catch(() => {});
+        await sql.close();
+      }
     });
 
     test('applying every set to a virgin schema succeeds', async () => {

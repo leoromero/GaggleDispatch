@@ -2,13 +2,13 @@
  * `gaggle repo list` (Section 21.5).
  */
 
-import { loadConfig } from './common.ts';
+import { loadConfig , withStore } from './common.ts';
 import { loadSyncedRegistry } from '../registry/synced-registry.ts';
 import chalk from 'chalk';
 
 export async function runRepoList(opts: { cwd?: string; json?: boolean }): Promise<void> {
   const cfg = loadConfig({ cwd: opts.cwd });
-  const synced = loadSyncedRegistry(cfg.registry.base_folder);
+  const synced = await withStore(cfg, (store) => loadSyncedRegistry(store));
   const bySlug = new Map<string, ReturnType<typeof loadSyncedRegistry> extends infer R ? (R extends null ? never : R) : never>();
   if (synced) for (const e of synced.repositories) bySlug.set(e.slug, e as never);
 

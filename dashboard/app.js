@@ -9,20 +9,9 @@ const state = {
   logFilters: { level: '', search: '' },
   autoscroll: true,
   connected: false,
-  archon: null, // { status, ui_url, run_path, spawned_by_hub, ... }
 };
 
-function archonRunUrl(runId) {
-  if (!runId || !state.archon || !state.archon.ui_url || !state.archon.run_path) return null;
-  const base = state.archon.ui_url.replace(/\/$/, '');
-  const path = state.archon.run_path.replace('{run_id}', encodeURIComponent(runId));
-  return `${base}${path}`;
-}
 
-function archonRunsIndexUrl() {
-  if (!state.archon || !state.archon.ui_url) return null;
-  return `${state.archon.ui_url.replace(/\/$/, '')}/workflows/runs`;
-}
 
 const MAX_LOGS = 1000;
 const COLORS_FALLBACK = ['#4f9cf9', '#f97316', '#10b981', '#a855f7', '#ef4444', '#eab308', '#06b6d4', '#ec4899'];
@@ -130,12 +119,6 @@ async function bootstrap() {
     /* ignore */
   }
   try {
-    const aRes = await fetch('/api/archon');
-    state.archon = await aRes.json();
-  } catch {
-    /* ignore */
-  }
-  try {
     const logsRes = await fetch('/api/history/logs?limit=200');
     const logsJson = await logsRes.json();
     // queryLogs returns DESC; reverse so newest is at end.
@@ -165,7 +148,6 @@ function renderAll() {
   renderTabs();
   renderStats();
   renderConnStat();
-  renderArchonChip();
   renderWorkers();
   renderGaggles();
   renderLogs();
@@ -174,24 +156,6 @@ function renderAll() {
   void refreshBoard();
 }
 
-function renderArchonChip() {
-  const chip = $('#archon-chip');
-  if (!chip) return;
-  const a = state.archon;
-  chip.className = 'stat archon-chip';
-  if (!a) {
-    chip.textContent = 'archon: ?';
-    chip.removeAttribute('href');
-    return;
-  }
-  chip.classList.add(a.status);
-  chip.textContent = `archon: ${a.status}`;
-  if (a.status === 'running' && a.ui_url) {
-    chip.setAttribute('href', a.ui_url);
-  } else {
-    chip.removeAttribute('href');
-  }
-}
 
 function renderTabs() {
   const root = $('#ws-tabs');
@@ -267,13 +231,13 @@ function renderWorkers() {
   for (const { name, w } of cards) {
     const tokens = w.claude_total_tokens ?? 0;
     const pct = Math.min(100, Math.round((tokens / 200000) * 100));
-    const runUrl = archonRunUrl(w.run_id);
-    const indexUrl = archonRunsIndexUrl();
-    const linkAttrs = runUrl
-      ? { href: runUrl, target: '_blank', rel: 'noopener' }
-      : indexUrl
-        ? { href: indexUrl, target: '_blank', rel: 'noopener', class: 'fallback', title: 'Run id not captured yet' }
-        : { class: 'disabled', title: 'Executor UI unavailable' };
+    // The engine runs in this process, so there is no external run page to
+    // link to. The run id is still worth showing: it is what `workflow_runs`
+    // is keyed by, and what an operator needs to grep a log with.
+    const runLabel = w.run_id ? `run ${w.run_id.slice(0, 8)}` : 'starting…';
+    const runAttrs = w.run_id
+      ? { class: 'run-id', title: w.run_id }
+      : { class: 'run-id disabled', title: 'Run not started yet' };
 
     root.appendChild(
       el('div', { class: 'worker-card' }, [
@@ -290,7 +254,7 @@ function renderWorkers() {
         w.last_message
           ? el('div', { class: 'meta', style: { fontStyle: 'italic', marginTop: '4px' } }, w.last_message.slice(0, 120))
           : null,
-        el('div', { class: 'actions' }, [el('a', linkAttrs, runUrl ? 'View run ↗' : 'Open runs ↗')]),
+        el('div', { class: 'actions' }, [el('span', runAttrs, runLabel)]),
       ]),
     );
   }
@@ -304,21 +268,21 @@ async function apiPost(path) {
   }
 }
 
-function activeArchonCount(workspaceName) {
+function activeWorkerCount(workspaceName) {
   const s = state.states[workspaceName];
   return (s?.running?.length ?? 0);
 }
 
 function showStopModal(workspace, onConfirm) {
-  const count = activeArchonCount(workspace.name);
+  const count = activeWorkerCount(workspace.name);
   const modal = $('#stop-modal');
   $('#modal-title').textContent = `Stop "${workspace.name}"?`;
   if (count > 0) {
     $('#modal-body').textContent =
-      `This gaggle has ${count} active Archon ${count === 1 ? 'worker' : 'workers'} running. ` +
-      `The orchestrator will stop; Archon workers will continue processing independently and can be cancelled in the Archon UI.`;
+      `This gaggle has ${count} active ${count === 1 ? 'worker' : 'workers'} running. ` +
+      `They will be suspended, not cancelled — starting this gaggle again resumes them where they stopped.`;
   } else {
-    $('#modal-body').textContent = `No active Archon workers. The orchestrator will stop cleanly.`;
+    $('#modal-body').textContent = `No active workers. The orchestrator will stop cleanly.`;
   }
   modal.classList.remove('hidden');
 
@@ -446,13 +410,13 @@ function formatContext(ctx) {
 $('#btn-stop-all').addEventListener('click', () => {
   const running = state.gaggles.filter((w) => w.status !== 'stopped' && w.status !== 'crashed');
   if (running.length === 0) return;
-  const workerCount = running.reduce((sum, w) => sum + activeArchonCount(w.name), 0);
+  const workerCount = running.reduce((sum, w) => sum + activeWorkerCount(w.name), 0);
 
   $('#modal-title').textContent = 'Stop all gaggles?';
   $('#modal-body').textContent = workerCount > 0
     ? `${running.length} ${running.length === 1 ? 'gaggle' : 'gaggles'} will stop. ` +
-      `There ${workerCount === 1 ? 'is' : 'are'} ${workerCount} active Archon ${workerCount === 1 ? 'worker' : 'workers'} — ` +
-      `they will continue running independently and can be cancelled in the Archon UI.`
+      `There ${workerCount === 1 ? 'is' : 'are'} ${workerCount} active ${workerCount === 1 ? 'worker' : 'workers'} — ` +
+      `they will be suspended and resume when the gaggle starts again.`
     : `${running.length} ${running.length === 1 ? 'gaggle' : 'gaggles'} will stop cleanly.`;
   $('#stop-modal').classList.remove('hidden');
 

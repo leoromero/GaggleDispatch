@@ -1,5 +1,5 @@
 ﻿/**
- * Writes a starter set of Symphony-managed Archon workflow YAML files into
+ * Writes a starter set of Symphony-managed workflow YAML files into
  * `workflow_templates/` next to WORKFLOW.md. Used by `gaggle init`.
  */
 
@@ -177,7 +177,7 @@ nodes:
   # ═══════════════════════════════════════════════════════════════
 
   - id: validate-script
-    # 30 min — Archon's default 120s isn't enough for real test suites
+    # 30 min — the 120s default isn't enough for real test suites
     # (TS build + unit tests + E2E commonly exceed it). Tune per repo.
     timeout: 1800000
     bash: |
@@ -240,6 +240,7 @@ nodes:
   # ═══════════════════════════════════════════════════════════════
 
   - id: create-pr
+    side_effects: at_most_once
     depends_on: [validate]
     context: fresh
     prompt: |
@@ -291,7 +292,7 @@ nodes:
     depends_on: [create-pr]
 
   - id: review-scope
-    command: archon-pr-review-scope
+    command: pr-review-scope
     depends_on: [verify-pr-base]
     context: fresh
 
@@ -342,30 +343,30 @@ nodes:
         - reasoning
 
   - id: code-review
-    command: archon-code-review-agent
+    command: code-review-agent
     depends_on: [review-classify]
     context: fresh
 
   - id: error-handling
-    command: archon-error-handling-agent
+    command: error-handling-agent
     depends_on: [review-classify]
     when: "$review-classify.output.run_error_handling == 'true'"
     context: fresh
 
   - id: test-coverage
-    command: archon-test-coverage-agent
+    command: test-coverage-agent
     depends_on: [review-classify]
     when: "$review-classify.output.run_test_coverage == 'true'"
     context: fresh
 
   - id: comment-quality
-    command: archon-comment-quality-agent
+    command: comment-quality-agent
     depends_on: [review-classify]
     when: "$review-classify.output.run_comment_quality == 'true'"
     context: fresh
 
   - id: docs-impact
-    command: archon-docs-impact-agent
+    command: docs-impact-agent
     depends_on: [review-classify]
     when: "$review-classify.output.run_docs_impact == 'true'"
     context: fresh
@@ -375,18 +376,18 @@ nodes:
   # ═══════════════════════════════════════════════════════════════
 
   - id: synthesize
-    command: archon-synthesize-review
+    command: synthesize-review
     depends_on: [code-review, error-handling, test-coverage, comment-quality, docs-impact]
     trigger_rule: one_success
     context: fresh
 
   - id: self-fix
-    command: archon-self-fix-all
+    command: self-fix-all
     depends_on: [synthesize]
     context: fresh
 
   - id: simplify
-    command: archon-simplify-changes
+    command: simplify-changes
     depends_on: [self-fix]
     context: fresh
 
@@ -395,7 +396,8 @@ nodes:
   # ═══════════════════════════════════════════════════════════════
 
   - id: report
-    command: archon-issue-completion-report
+    side_effects: at_most_once
+    command: issue-completion-report
     depends_on: [simplify]
     context: fresh
 `;
@@ -711,6 +713,7 @@ nodes:
       - No "we will call function X" or "modify class Y"
 
   - id: post-summary
+    side_effects: at_most_once
     bash: |
       set -euo pipefail
       if [ ! -f "\$ARTIFACTS_DIR/plan-summary.md" ]; then
@@ -731,7 +734,7 @@ nodes:
 
   # ═══════════════════════════════════════════════════════════════
   # PHASE 3: PLAN APPROVAL GATE
-  # Human sees the plan summary in the gate comment and in Archon output.
+  # Human sees the plan summary in the gate comment and in the run output.
   # Reply "approve" (or any positive response) to start implementation.
   # Reply "reject" with your feedback to receive a revised plan — up to 3 cycles.
   # ═══════════════════════════════════════════════════════════════
@@ -746,7 +749,7 @@ nodes:
 
         ---
 
-        The full implementation plan is in the Archon run output above.
+        The full implementation plan is in the run output above.
 
         - **approve** (optionally with answers to any questions above) — starts implementation immediately
         - **reject: <your feedback>** — triggers a revised plan addressing your concerns
@@ -813,7 +816,7 @@ nodes:
   # ═══════════════════════════════════════════════════════════════
 
   - id: validate-script
-    # 30 min — Archon's default 120s isn't enough for real test suites
+    # 30 min — the 120s default isn't enough for real test suites
     # (TS build + unit tests + E2E commonly exceed it). Tune per repo.
     timeout: 1800000
     bash: |
@@ -875,6 +878,7 @@ nodes:
   # ═══════════════════════════════════════════════════════════════
 
   - id: create-pr
+    side_effects: at_most_once
     depends_on: [validate]
     context: fresh
     prompt: |
@@ -926,7 +930,7 @@ nodes:
     depends_on: [create-pr]
 
   - id: review-scope
-    command: archon-pr-review-scope
+    command: pr-review-scope
     depends_on: [verify-pr-base]
     context: fresh
 
@@ -977,30 +981,30 @@ nodes:
         - reasoning
 
   - id: code-review
-    command: archon-code-review-agent
+    command: code-review-agent
     depends_on: [review-classify]
     context: fresh
 
   - id: error-handling
-    command: archon-error-handling-agent
+    command: error-handling-agent
     depends_on: [review-classify]
     when: "$review-classify.output.run_error_handling == 'true'"
     context: fresh
 
   - id: test-coverage
-    command: archon-test-coverage-agent
+    command: test-coverage-agent
     depends_on: [review-classify]
     when: "$review-classify.output.run_test_coverage == 'true'"
     context: fresh
 
   - id: comment-quality
-    command: archon-comment-quality-agent
+    command: comment-quality-agent
     depends_on: [review-classify]
     when: "$review-classify.output.run_comment_quality == 'true'"
     context: fresh
 
   - id: docs-impact
-    command: archon-docs-impact-agent
+    command: docs-impact-agent
     depends_on: [review-classify]
     when: "$review-classify.output.run_docs_impact == 'true'"
     context: fresh
@@ -1010,18 +1014,18 @@ nodes:
   # ═══════════════════════════════════════════════════════════════
 
   - id: synthesize
-    command: archon-synthesize-review
+    command: synthesize-review
     depends_on: [code-review, error-handling, test-coverage, comment-quality, docs-impact]
     trigger_rule: one_success
     context: fresh
 
   - id: self-fix
-    command: archon-self-fix-all
+    command: self-fix-all
     depends_on: [synthesize]
     context: fresh
 
   - id: simplify
-    command: archon-simplify-changes
+    command: simplify-changes
     depends_on: [self-fix]
     context: fresh
 
@@ -1030,7 +1034,8 @@ nodes:
   # ═══════════════════════════════════════════════════════════════
 
   - id: report
-    command: archon-issue-completion-report
+    side_effects: at_most_once
+    command: issue-completion-report
     depends_on: [simplify]
     context: fresh
 `;
@@ -1087,7 +1092,7 @@ nodes:
       "Add gaggle.md (GaggleDispatch self-description)"
 `;
 
-const TEMPLATES: Record<string, string> = {
+export const TEMPLATES: Record<string, string> = {
   'gaggle-fix-issue.yaml': FIX_ISSUE,
   'gaggle-supervised.yaml': SUPERVISED,
   'gaggle-scaffold.yaml': SCAFFOLD,

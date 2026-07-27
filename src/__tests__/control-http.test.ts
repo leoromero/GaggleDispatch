@@ -27,7 +27,6 @@ const hubCfg = (): HubConfig => ({
   workspaces: [],
   // Port 0 lets the OS pick, so these never collide with a running nest.
   ui: { port: 0, host: '127.0.0.1' },
-  archon: { autostart: false, ui_url: 'http://localhost:3090', run_path: '/r/{run_id}', serve_command: 'x' },
 });
 
 /** Just enough HubProcessManager for the routes under test. */
@@ -45,8 +44,6 @@ const fakeManager = () =>
     async stopAll() {},
   }) as never;
 
-const fakeArchon = () => ({ getState: () => ({ status: 'disabled' }) }) as never;
-
 const servers: Array<{ stop: () => Promise<void> }> = [];
 afterEach(async () => {
   while (servers.length) await servers.pop()!.stop().catch(() => {});
@@ -56,7 +53,6 @@ function hub(control: ControlApi | null): HubServerHandle {
   const h = startHubServer({
     cfg: hubCfg(),
     manager: fakeManager(),
-    archon: fakeArchon(),
     dashboardDir: '/nonexistent-dashboard-dir',
     control,
     history: null,

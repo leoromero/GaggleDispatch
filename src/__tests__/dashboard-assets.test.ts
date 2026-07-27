@@ -61,7 +61,7 @@ describe('dashboard/app.js', () => {
       'supervised_gates',
       'pending_targets',
       'retry_attempts',
-      'detached_archon_runs',
+      'detached_runs',
       'target_machine_states',
       'renderPipeline',
     ]) {
@@ -95,5 +95,169 @@ describe('dashboard/app.js', () => {
     ]) {
       expect(css).toContain(`.${cls}`);
     }
+  });
+});
+
+// ─── actually run the renderers ─────────────────────────────────────────────
+
+/**
+ * Parsing is not enough.
+ *
+ * A merge deleted `const runUrl = ...` and left one use of `runUrl` behind. The
+ * file still parses — an undefined identifier is a *runtime* ReferenceError —
+ * so every check above stayed green while `renderWorkers` threw on its first
+ * card. It clears the panel before it throws, and it runs before
+ * `renderGaggles`, `renderLogs` and `refreshBoard`, so the whole dashboard went
+ * blank whenever any worker was running.
+ *
+ * So: load the real file into a stub DOM and call the renderers. This does not
+ * check that anything *looks* right — only that the code executes, which is the
+ * class of failure that has now bitten twice.
+ */
+function loadDashboard(): Record<string, unknown> {
+  const source = readFileSync(join(DASHBOARD, 'app.js'), 'utf8');
+
+  const node = (): Record<string, unknown> => {
+    const self: Record<string, unknown> = {
+      children: [] as unknown[],
+      style: {},
+      classList: { add() {}, remove() {}, toggle() {}, contains: () => false },
+      dataset: {},
+      appendChild(c: unknown) {
+        (self.children as unknown[]).push(c);
+        return c;
+      },
+      append(...c: unknown[]) {
+        (self.children as unknown[]).push(...c);
+      },
+      remove() {},
+      setAttribute() {},
+      removeAttribute() {},
+      addEventListener() {},
+      replaceWith() {},
+      cloneNode: () => node(),
+      querySelector: () => node(),
+      querySelectorAll: () => [],
+      closest: () => node(),
+      insertAdjacentHTML() {},
+      focus() {},
+      scrollTo() {},
+      textContent: '',
+      innerHTML: '',
+      value: '',
+      checked: false,
+      scrollHeight: 0,
+      scrollTop: 0,
+    };
+    return self;
+  };
+
+  const doc = {
+    createElement: () => node(),
+    createTextNode: () => node(),
+    getElementById: () => node(),
+    querySelector: () => node(),
+    querySelectorAll: () => [],
+    addEventListener() {},
+    body: node(),
+    documentElement: node(),
+  };
+
+  const exported: Record<string, unknown> = {};
+  const globals = {
+    document: doc,
+    window: {
+      addEventListener() {},
+      location: { host: 'localhost:8787', protocol: 'http:', href: 'http://localhost:8787/' },
+      matchMedia: () => ({ matches: false, addEventListener() {} }),
+    },
+    WebSocket: class {
+      addEventListener() {}
+      send() {}
+      close() {}
+    },
+    // The file uses bare globals (`location`, not `window.location`) and calls
+    // bootstrap() at load, so these have to exist before the source runs.
+    location: { host: 'localhost:8787', protocol: 'http:', href: 'http://localhost:8787/' },
+    navigator: { clipboard: { writeText: async () => {} } },
+    localStorage: { getItem: () => null, setItem() {}, removeItem() {} },
+    alert() {},
+    confirm: () => true,
+    fetch: async () => ({ ok: true, json: async () => ({}), text: async () => '' }),
+    setInterval: () => 0,
+    setTimeout: () => 0,
+    clearInterval() {},
+    clearTimeout() {},
+    requestAnimationFrame: () => 0,
+    console,
+    // The renderers are top-level `function` declarations, so hand them back
+    // through an explicit capture rather than guessing at module semantics.
+    __capture: (name: string, fn: unknown) => {
+      exported[name] = fn;
+    },
+  };
+
+  const RENDERERS = ['renderWorkers', 'renderGaggles', 'renderLogs', 'renderGates', 'renderAll'];
+  const capture = RENDERERS.map(
+    (n) => `try { __capture('${n}', ${n}); } catch (e) { /* not defined */ }`,
+  ).join('\n');
+
+  const fn = new Function(...Object.keys(globals), `${source}\n${capture}\nreturn __state();`);
+  const withState = new Function(
+    ...Object.keys(globals),
+    `${source}\n${capture}\nreturn typeof state !== 'undefined' ? state : {};`,
+  );
+  void fn;
+  const state = withState(...Object.values(globals)) as Record<string, unknown>;
+  return { ...exported, state };
+}
+
+describe('the renderers execute', () => {
+  const worker = (over: Record<string, unknown> = {}) => ({
+    issue: { identifier: 'GAG-1', title: 'Fix it' },
+    repo_alias: 'api',
+    run_id: '9136a161-35d0-82cb-9f0a-c75523b3b56e',
+    turn_count: 3,
+    started_at: new Date().toISOString(),
+    claude_total_tokens: 1234,
+    last_message: 'working',
+    ...over,
+  });
+
+  test('renderWorkers survives a running worker', () => {
+    // The exact shape that threw: one live worker with a run id.
+    const dash = loadDashboard();
+    const render = dash.renderWorkers as ((...a: unknown[]) => void) | undefined;
+    const state = dash.state as Record<string, unknown>;
+    if (!render) throw new Error('renderWorkers was not found — did it get renamed?');
+
+    state.gaggles = [{ name: 'acme', status: 'running' }];
+    state.states = { acme: { running: [worker()] } };
+
+    expect(() => render()).not.toThrow();
+  });
+
+  test('renderWorkers survives a worker whose run has not started', () => {
+    const dash = loadDashboard();
+    const render = dash.renderWorkers as ((...a: unknown[]) => void) | undefined;
+    const state = dash.state as Record<string, unknown>;
+    if (!render) throw new Error('renderWorkers was not found — did it get renamed?');
+
+    state.gaggles = [{ name: 'acme', status: 'running' }];
+    state.states = { acme: { running: [worker({ run_id: null, last_message: null })] } };
+
+    expect(() => render()).not.toThrow();
+  });
+
+  test('renderWorkers survives having nothing to show', () => {
+    const dash = loadDashboard();
+    const render = dash.renderWorkers as ((...a: unknown[]) => void) | undefined;
+    const state = dash.state as Record<string, unknown>;
+    if (!render) throw new Error('renderWorkers was not found — did it get renamed?');
+
+    state.gaggles = [];
+    state.states = {};
+
+    expect(() => render()).not.toThrow();
   });
 });

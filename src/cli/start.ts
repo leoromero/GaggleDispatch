@@ -3,11 +3,14 @@
  */
 
 import chalk from 'chalk';
-import { basename } from 'node:path';
+import { basename, join } from 'node:path';
 import { commandExists } from '../util/subprocess.ts';
-import { loadConfig, fatal } from './common.ts';
+import { buildExecutor, loadConfig, fatal } from './common.ts';
 import { runSyncPass, startPeriodicSyncer } from '../registry/repo-syncer.ts';
 import { startRegistryLoader } from '../registry/loader.ts';
+import { PostgresStore } from '../executor/store/postgres.ts';
+import { recoverInterruptedRuns } from '../executor/engine/recovery.ts';
+import { sweepStaleWorktrees } from '../executor/engine/cleanup.ts';
 import { LinearClient } from '../tracker/linear.ts';
 import { ApiKeyAuth, OAuthAuth } from '../tracker/linear-auth.ts';
 import { IssueAnalyzer } from '../analyzer/issue-analyzer.ts';
@@ -67,27 +70,44 @@ export async function runStart(opts: {
     );
   }
 
+  // The engine owns its own persistence, and the registry now lives there
+  // too, so the schema has to be up before the first sync pass.
+  const store = new PostgresStore(cfg.database.url);
+  await store.migrate();
+
   if (cfg.registry.sync_on_startup) {
     console.log(chalk.cyan('Running initial sync pass...'));
-    await runSyncPass(cfg, { quiet: false });
+    await runSyncPass(cfg, { store, quiet: false });
   }
 
-  const registry = startRegistryLoader(cfg);
+  const registry = startRegistryLoader(cfg, store);
   const ctx = registry.getContext();
   if (ctx.repositories.length === 0) {
     fatal('Registry context has no repositories with sync_status=ok. Add a gaggle.md to at least one registered repo.');
   }
 
-  // Sweep stale Archon worktrees (abandoned/cancelled/orphaned) before
-  // polling kicks in. The per-run `after_run` hook handles merged branches
-  // continuously; this catches the long tail. Configured via
-  // archon.startup_cleanup_age_days (default 7; 0 to disable).
+  const executor = buildExecutor(cfg, store);
+
+  // Reclaim runs whose executor died. Idempotent nodes resume; a run that was
+  // mid-way through an at_most_once node parks for a human instead.
+  const recovered = await recoverInterruptedRuns({ store, executor, autoResume: true });
+  if (recovered.length > 0) {
+    console.log(chalk.cyan(`Recovered ${recovered.length} interrupted run(s):`));
+    for (const r of recovered) {
+      console.log(`  ${r.run_id.slice(0, 8)}  ${r.workflow_name}  ${r.action}`);
+    }
+  }
+
+  // Sweep stale worktrees before polling starts. Anything backing an open PR
+  // is preserved. Configured via executor.startup_cleanup_age_days (0 disables).
   if (cfg.executor.startup_cleanup_age_days > 0) {
-    console.log(chalk.cyan(`Sweeping Archon worktrees idle > ${cfg.executor.startup_cleanup_age_days} days...`));
-    const { runStartupArchonCleanup } = await import('../executor/archon-cleanup.ts');
-    await runStartupArchonCleanup({
+    console.log(
+      chalk.cyan(`Sweeping worktrees idle > ${cfg.executor.startup_cleanup_age_days} days...`),
+    );
+    await sweepStaleWorktrees({
+      store,
       ageDays: cfg.executor.startup_cleanup_age_days,
-      repos: ctx.repositories.map((r) => ({ alias: r.name, cwd: r.local_path })),
+      repos: ctx.repositories.map((r) => ({ repo_slug: r.name, repo_path: r.local_path })),
     });
   }
 
@@ -96,7 +116,7 @@ export async function runStart(opts: {
   const workspace = new WorkspaceManager(cfg);
   workspace.ensureAuxRoot();
 
-  const syncer = startPeriodicSyncer(cfg);
+  const syncer = startPeriodicSyncer(cfg, store);
 
   const workspaceName = opts.workspaceName ?? basename(cfg.project_dir);
   const orchestrator = new Orchestrator({
@@ -107,6 +127,7 @@ export async function runStart(opts: {
     registry,
     syncer,
     workspaceName,
+    executor,
   });
 
   // Hot-reload WORKFLOW.md template body (a full reload would be more invasive;

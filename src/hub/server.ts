@@ -13,7 +13,6 @@ import type { Server, ServerWebSocket } from 'bun';
 import type { HubConfig } from './config.ts';
 import { HubProcessManager } from './process-manager.ts';
 import type { HistoryStore } from './history.ts';
-import type { ArchonSupervisor } from './archon-supervisor.ts';
 import type { ControlApi } from '../control/api.ts';
 import { crossSiteWrite } from './cross-site.ts';
 import { logger } from '../util/logger.ts';
@@ -48,7 +47,6 @@ const MIME: Record<string, string> = {
 export interface HubServerOptions {
   cfg: HubConfig;
   manager: HubProcessManager;
-  archon: ArchonSupervisor;
   dashboardDir: string;
   /**
    * The control plane's read/intent half.
@@ -237,9 +235,6 @@ export function startHubServer(opts: HubServerOptions): HubServerHandle {
         const ok = srv.upgrade(req, { data: { id } });
         if (ok) return undefined;
         return new Response('upgrade failed', { status: 400 });
-      }
-      if (url.pathname === '/api/archon') {
-        return Response.json(opts.archon.getState());
       }
       // ── control plane: the board, and operator actions ──────────────────
       if (url.pathname.startsWith('/api/control/')) {

@@ -103,60 +103,21 @@ body {
   color: var(--red);
 }
 
-.archon-chip {
-  text-decoration: none;
-  padding: 2px 8px;
-  border-radius: 4px;
-  border: 1px solid var(--border);
-  background: var(--panel-2);
-  color: var(--text-dim);
-  font-size: 11px;
-}
-
-.archon-chip.running {
-  color: var(--green);
-  border-color: rgba(16, 185, 129, 0.3);
-}
-
-.archon-chip.unavailable,
-.archon-chip.crashed {
-  color: var(--red);
-  border-color: rgba(239, 68, 68, 0.3);
-}
-
-.archon-chip.disabled {
-  color: var(--text-faint);
-}
-
 .worker-card .actions {
   margin-top: 4px;
 }
 
-.worker-card .actions a {
+.worker-card .actions .run-id {
   font-size: 11px;
-  color: var(--accent);
-  text-decoration: none;
-}
-
-.worker-card .actions a:hover {
-  text-decoration: underline;
-}
-
-.worker-card .actions a.disabled {
-  color: var(--text-faint);
-  text-decoration: line-through;
-  cursor: not-allowed;
-  pointer-events: none;
-}
-
-.worker-card .actions a.fallback {
+  font-family: var(--mono, ui-monospace, SFMono-Regular, Menlo, monospace);
   color: var(--text-dim);
+}
+
+.worker-card .actions .run-id.disabled {
+  color: var(--text-faint);
   font-style: italic;
 }
 
-.worker-card .actions a.fallback:hover {
-  color: var(--accent);
-}
 
 main {
   display: grid;
@@ -255,24 +216,6 @@ main {
   display: flex;
   gap: 4px;
   flex-wrap: wrap;
-}
-
-.target-chip {
-  padding: 1px 6px;
-  border-radius: 4px;
-  font-size: 10px;
-  background: var(--border);
-  color: var(--text-dim);
-}
-
-.target-chip.running {
-  background: rgba(16, 185, 129, 0.15);
-  color: var(--green);
-}
-
-.target-chip.gate {
-  background: rgba(245, 158, 11, 0.15);
-  color: var(--amber);
 }
 
 /* Workers */

@@ -58,7 +58,6 @@ function liveSessionToJson(s: LiveSession): unknown {
       url: s.issue.url,
     },
     repo_alias: s.repo_alias,
-    run_pid: s.run_pid,
     run_id: s.run_id,
     workflow: s.workflow,
     last_event: s.last_event,

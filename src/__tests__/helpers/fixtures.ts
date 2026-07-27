@@ -130,18 +130,16 @@ export function makeServiceConfig(overrides: Partial<ServiceConfig> = {}): Servi
     agent: {
       max_concurrent_agents: 5,
       max_turns: 20,
-      max_retry_backoff_ms: 60_000,
-      max_concurrent_agents_by_state: {},
     },
     executor: {
-      command: 'archon workflow run',
-      api_url: 'http://localhost:3090',
-      poll_interval_ms: 5_000,
-      turn_timeout_ms: 60_000,
-      stall_timeout_ms: 30_000,
       default_workflow: 'gaggle/gaggle-fix-issue',
+      max_run_duration_ms: 60_000,
+      node_idle_timeout_ms: 30_000,
+      bash_timeout_ms: 10_000,
       gate_timeout_ms: 0,
       startup_cleanup_age_days: 0,
+      lease_heartbeat_ms: 15_000,
+      lease_ttl_ms: 60_000,
     },
     database: { url: '', max_connections: 0 },
     claude: {
