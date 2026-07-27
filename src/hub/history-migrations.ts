@@ -19,7 +19,7 @@
  * left on disk for archaeology and the new tables start empty.
  */
 
-import type { Migration } from '../store/migrate.ts';
+import { assertInRange, type Migration } from '../store/migrate.ts';
 
 const M200_HUB_HISTORY = `
 CREATE TABLE hub_workspaces (
@@ -59,3 +59,5 @@ CREATE TABLE hub_token_daily (
 export const HUB_MIGRATIONS: Migration[] = [
   { version: 200, name: 'hub_history', sql: M200_HUB_HISTORY },
 ];
+
+assertInRange('hub', HUB_MIGRATIONS);

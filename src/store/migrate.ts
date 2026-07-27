@@ -23,6 +23,32 @@ export interface Migration {
   sql: string;
 }
 
+/**
+ * Who owns which version range.
+ *
+ * This is not documentation, it is a check — see {@link assertInRange}. The
+ * ranges were written down in a design doc first and that was not enough: two
+ * branches independently created `scaffold_jobs`, `hub_workspaces`, and
+ * `hub_token_daily`, one at versions 2–3 and the other at 100–200. Neither used
+ * `CREATE TABLE IF NOT EXISTS`, so the merged schema could not migrate a fresh
+ * database at all, and nothing failed until someone tried.
+ *
+ * A range is a claim on *tables*, not just on numbers. Before adding a migration,
+ * check that no other owner already creates what you are about to create.
+ */
+export const MIGRATION_RANGES = {
+  /** The workflow engine: runs, nodes, approvals, worktrees, registries. */
+  engine: [1, 99],
+  /** The control plane: tickets, targets, events, outbox, scaffold jobs. */
+  control: [100, 199],
+  /** Hub history: workspaces, logs, token accounting, run and gate history. */
+  hub: [200, 299],
+  /** Anything joining two owners' tables — foreign keys in particular. */
+  crosscutting: [300, 999],
+} as const;
+
+export type MigrationOwner = keyof typeof MIGRATION_RANGES;
+
 const BOOTSTRAP = `
   CREATE TABLE IF NOT EXISTS schema_migrations (
     version    INT PRIMARY KEY,
@@ -140,5 +166,27 @@ function assertUniqueVersions(migrations: readonly Migration[]): void {
       throw new Error(`Duplicate migration version ${m.version} (${m.name})`);
     }
     seen.add(m.version);
+  }
+}
+
+/**
+ * Assert every migration in a set falls inside its owner's range.
+ *
+ * Call it where the set is declared, so a stray version fails at import rather
+ * than on whichever database happens to be migrated first. It cannot catch a
+ * *table* collision between two owners — only a human comparing their
+ * `CREATE TABLE` lists can do that — but it does stop the numbering from drifting
+ * across a boundary, which is how the collision became invisible last time.
+ */
+export function assertInRange(owner: MigrationOwner, migrations: readonly Migration[]): void {
+  const [lo, hi] = MIGRATION_RANGES[owner];
+  for (const m of migrations) {
+    if (m.version < lo || m.version > hi) {
+      throw new Error(
+        `Migration ${m.version} (${m.name}) is outside the '${owner}' range ${lo}–${hi}. ` +
+          `Ranges are listed in MIGRATION_RANGES; pick a free version inside yours, ` +
+          `and check no other owner already creates the same tables.`,
+      );
+    }
   }
 }

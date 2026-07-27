@@ -162,19 +162,19 @@ export class ArchonExecutorAdapter implements ExecutorPort {
     const targetId = args.ctx.target.id;
 
     const handle = approveAndResumeArchon(
-      this.deps.cfg.archon.command,
+      this.deps.cfg.executor.command,
       runId,
       args.comment ?? undefined,
-      this.deps.cfg.archon.turn_timeout_ms,
+      this.deps.cfg.executor.turn_timeout_ms,
       (e) => {
-        if (e.type === 'archon_gate_paused') {
+        if (e.type === 'run_gate_paused') {
           void this.onGatePaused(targetId, e.run_id, e.gate_message);
         } else if (
-          e.type === 'archon_succeeded' ||
-          e.type === 'archon_failed' ||
-          e.type === 'archon_timed_out' ||
-          e.type === 'archon_stalled' ||
-          e.type === 'archon_cancelled'
+          e.type === 'run_succeeded' ||
+          e.type === 'run_failed' ||
+          e.type === 'run_timed_out' ||
+          e.type === 'run_stalled' ||
+          e.type === 'run_cancelled'
         ) {
           this.live.delete(targetId);
           void this.onExit(targetId, { type: e.type }, () => runId);
@@ -226,7 +226,7 @@ export class ArchonExecutorAdapter implements ExecutorPort {
     // Everything below is reached from a fire-and-forget subprocess callback, so an
     // escaping rejection is unhandled and Bun terminates the daemon. And it *will*
     // escape on the ordinary Cancel path: `cancel_confirmed` commits `cancelled`,
-    // then kills the process, which exits and reports `archon_cancelled` — and
+    // then kills the process, which exits and reports `run_cancelled` — and
     // `run_failed` is not accepted from `cancelled`. A refused transition here
     // means the outcome was already recorded, which is not an error.
     try {
@@ -248,7 +248,7 @@ export class ArchonExecutorAdapter implements ExecutorPort {
     const sink = this.deps.sink();
     const id = runId();
 
-    if (event.type === 'archon_succeeded') {
+    if (event.type === 'run_succeeded') {
       if (!id) {
         // Exited 0 without ever logging a run id: the workflow never started.
         await sink.runFailed(targetId, 'archon exited 0 without starting a workflow');
@@ -378,7 +378,7 @@ export function repoTargetFrom(ticket: TicketRow, target: TargetRow): RepoTarget
     repo_url: target.repo_url,
     repo_alias: target.repo_alias,
     local_path: target.local_path,
-    archon_workflow: target.workflow,
+    workflow: target.workflow,
     rationale: target.rationale ?? ticket.title,
     components: target.components,
     depends_on: target.depends_on,

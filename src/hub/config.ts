@@ -28,7 +28,7 @@ export interface HubArchonConfig {
   ui_url: string;
   /**
    * Path template for a single workflow run page. `{run_id}` is replaced
-   * with the LiveSession's `archon_db_run_id`.
+   * with the LiveSession's `run_id`.
    */
   run_path: string;
   /** Command used to launch Archon's web UI (only when autostart applies). */

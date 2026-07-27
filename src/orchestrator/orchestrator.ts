@@ -77,7 +77,7 @@ export class Orchestrator {
     this.deps = deps;
     this.cfg = deps.cfg;
     this.state = createInitialState(deps.cfg);
-    this.archon = deps.archonClient ?? new ArchonClient(deps.cfg.archon.api_url);
+    this.archon = deps.archonClient ?? new ArchonClient(deps.cfg.executor.api_url);
 
     // The adapter needs to report outcomes to a service that does not exist yet,
     // so the sink is resolved lazily. See the note in adapters/archon.ts.
@@ -254,25 +254,25 @@ export class Orchestrator {
           onStarted: (pid) => {
             const s = this.state.running.get(key);
             if (s) {
-              s.archon_pid = pid;
-              s.last_archon_timestamp = new Date().toISOString();
+              s.run_pid = pid;
+              s.last_event_at = new Date().toISOString();
             }
             callbacks.onStarted(pid);
           },
           onOutput: (line) => {
             const s = this.state.running.get(key);
             if (s) {
-              s.last_archon_message = line;
-              s.last_archon_timestamp = new Date().toISOString();
+              s.last_message = line;
+              s.last_event_at = new Date().toISOString();
               s.turn_count += 1;
-              s.recent_archon_output.push(line);
-              if (s.recent_archon_output.length > 50) s.recent_archon_output.shift();
+              s.recent_output.push(line);
+              if (s.recent_output.length > 50) s.recent_output.shift();
             }
             callbacks.onOutput(line);
           },
           onRunId: (runId) => {
             const s = this.state.running.get(key);
-            if (s) s.archon_db_run_id = runId;
+            if (s) s.run_id = runId;
             log.info('Captured run id', { run_id: runId });
             callbacks.onRunId(runId);
           },
@@ -282,9 +282,9 @@ export class Orchestrator {
           },
           onExit: (event) => {
             const s = this.state.running.get(key);
-            const tail = s?.recent_archon_output.slice(-15) ?? [];
+            const tail = s?.recent_output.slice(-15) ?? [];
             this.state.running.delete(key);
-            if (event.type !== 'archon_succeeded') {
+            if (event.type !== 'run_succeeded') {
               // The tail is the difference between a diagnosable failure and a
               // trip into Archon's own logs.
               log.warn('Worker exited abnormally', { event: event.type, recent_output: tail });
@@ -296,7 +296,7 @@ export class Orchestrator {
 
       const s = this.state.running.get(key);
       if (s) s.cancel = handle.cancel;
-      log.info('Worker spawned', { workflow: args.repo_target.archon_workflow });
+      log.info('Worker spawned', { workflow: args.repo_target.workflow });
       return { cancel: handle.cancel };
     } catch (err) {
       this.state.running.delete(key);

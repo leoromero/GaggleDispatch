@@ -28,7 +28,7 @@ describe('IssueAnalyzer.analyze', () => {
         {
           repo_url: 'https://github.com/o/repo-a',
           repo_alias: 'repo-a',
-          archon_workflow: 'gaggle/gaggle-supervised',
+          workflow: 'gaggle/gaggle-supervised',
           rationale: 'because',
           components: ['comp-a'],
         },
@@ -38,7 +38,7 @@ describe('IssueAnalyzer.analyze', () => {
     const result = await a.analyze(makeIssue(), ctx);
     expect(result.repo_targets.length).toBe(1);
     expect(result.repo_targets[0]!.local_path).toBe('/abs/repo-a');
-    expect(result.repo_targets[0]!.archon_workflow).toBe('gaggle/gaggle-supervised');
+    expect(result.repo_targets[0]!.workflow).toBe('gaggle/gaggle-supervised');
     expect(result.analysis_summary).toBe('[complexity: complex] fix it');
   });
 
@@ -46,7 +46,7 @@ describe('IssueAnalyzer.analyze', () => {
     const ctx = makeRegistryContext();
     const fenced = '```json\n' + JSON.stringify({
       analysis_summary: 'x',
-      repo_targets: [{ repo_url: 'https://github.com/o/repo-a', repo_alias: 'repo-a', archon_workflow: 'gaggle/gaggle-fix-issue', rationale: '', components: [] }],
+      repo_targets: [{ repo_url: 'https://github.com/o/repo-a', repo_alias: 'repo-a', workflow: 'gaggle/gaggle-fix-issue', rationale: '', components: [] }],
     }) + '\n```';
     const a = new IssueAnalyzer(makeServiceConfig(), fakeRunner(fenced));
     const r = await a.analyze(makeIssue(), ctx);
@@ -57,13 +57,13 @@ describe('IssueAnalyzer.analyze', () => {
     const ctx = makeRegistryContext();
     const messy = `Here is the analysis:\n\n${JSON.stringify({
       analysis_summary: 'p',
-      repo_targets: [{ repo_url: '', repo_alias: 'repo-a', archon_workflow: '', rationale: '', components: [] }],
+      repo_targets: [{ repo_url: '', repo_alias: 'repo-a', workflow: '', rationale: '', components: [] }],
     })}\n\nLet me know if you need more.`;
     const a = new IssueAnalyzer(makeServiceConfig(), fakeRunner(messy));
     const r = await a.analyze(makeIssue(), ctx);
     expect(r.repo_targets[0]!.repo_alias).toBe('repo-a');
     // No complexity field → defaults to 'complex' → gaggle/gaggle-supervised
-    expect(r.repo_targets[0]!.archon_workflow).toBe('gaggle/gaggle-supervised');
+    expect(r.repo_targets[0]!.workflow).toBe('gaggle/gaggle-supervised');
   });
 
   test('reconciles alias-only response (no repo_url) against registry name', async () => {
@@ -159,7 +159,7 @@ describe('IssueAnalyzer.analyze', () => {
       }),
     ]);
     const cfg = makeServiceConfig();
-    cfg.archon.default_workflow = 'gaggle/fallback-wf';
+    cfg.executor.default_workflow = 'gaggle/fallback-wf';
     const a = new IssueAnalyzer(cfg, fakeRunner(
       JSON.stringify({
         analysis_summary: '',
@@ -167,7 +167,7 @@ describe('IssueAnalyzer.analyze', () => {
       }),
     ));
     const r = await a.analyze(makeIssue(), ctx);
-    expect(r.repo_targets[0]!.archon_workflow).toBe('gaggle/fallback-wf');
+    expect(r.repo_targets[0]!.workflow).toBe('gaggle/fallback-wf');
   });
 
   test('sanitizes alias when populating repo_alias', async () => {
@@ -202,7 +202,7 @@ describe('IssueAnalyzer complexity routing', () => {
     });
     const r = await new IssueAnalyzer(makeServiceConfig(), fakeRunner(json)).analyze(makeIssue(), ctx);
     expect(r.complexity).toBe('simple');
-    expect(r.repo_targets[0]!.archon_workflow).toBe('gaggle/gaggle-fix-issue');
+    expect(r.repo_targets[0]!.workflow).toBe('gaggle/gaggle-fix-issue');
     expect(r.analysis_summary).toContain('[complexity: simple]');
   });
 
@@ -222,7 +222,7 @@ describe('IssueAnalyzer complexity routing', () => {
     });
     const r = await new IssueAnalyzer(makeServiceConfig(), fakeRunner(json)).analyze(makeIssue(), ctx);
     expect(r.complexity).toBe('complex');
-    expect(r.repo_targets[0]!.archon_workflow).toBe('gaggle/gaggle-supervised');
+    expect(r.repo_targets[0]!.workflow).toBe('gaggle/gaggle-supervised');
     expect(r.analysis_summary).toContain('[complexity: complex]');
   });
 
@@ -242,7 +242,7 @@ describe('IssueAnalyzer complexity routing', () => {
     });
     const r = await new IssueAnalyzer(makeServiceConfig(), fakeRunner(json)).analyze(makeIssue(), ctx);
     expect(r.complexity).toBe('complex');
-    expect(r.repo_targets[0]!.archon_workflow).toBe('gaggle/gaggle-supervised');
+    expect(r.repo_targets[0]!.workflow).toBe('gaggle/gaggle-supervised');
   });
 
   test('falls back to repo default_workflow when complexity-derived workflow not in available_workflows', async () => {
@@ -261,7 +261,7 @@ describe('IssueAnalyzer complexity routing', () => {
     });
     const r = await new IssueAnalyzer(makeServiceConfig(), fakeRunner(json)).analyze(makeIssue(), ctx);
     // gaggle-fix-issue not available → fallback to default_workflow
-    expect(r.repo_targets[0]!.archon_workflow).toBe('gaggle/gaggle-supervised');
+    expect(r.repo_targets[0]!.workflow).toBe('gaggle/gaggle-supervised');
   });
 
   test('complexity routing applied consistently across all repo_targets in a multi-repo result', async () => {
@@ -288,7 +288,7 @@ describe('IssueAnalyzer complexity routing', () => {
       ],
     });
     const r = await new IssueAnalyzer(makeServiceConfig(), fakeRunner(json)).analyze(makeIssue(), ctx);
-    expect(r.repo_targets[0]!.archon_workflow).toBe('gaggle/gaggle-supervised');
-    expect(r.repo_targets[1]!.archon_workflow).toBe('gaggle/gaggle-supervised');
+    expect(r.repo_targets[0]!.workflow).toBe('gaggle/gaggle-supervised');
+    expect(r.repo_targets[1]!.workflow).toBe('gaggle/gaggle-supervised');
   });
 });

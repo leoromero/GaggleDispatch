@@ -9,11 +9,11 @@ import { dirname, isAbsolute, join, resolve } from 'node:path';
 import { ConfigValidationError } from '../domain/errors.ts';
 import { applyEnvFile } from '../util/env-file.ts';
 import type {
-  ArchonConfig,
   AgentConfig,
   AuthConfig,
   ClaudeConfig,
   DatabaseConfig,
+  ExecutorConfig,
   HooksConfig,
   PollingConfig,
   RegistryConfig,
@@ -26,6 +26,7 @@ import type {
   WorkspaceConfig,
 } from '../domain/types.ts';
 import { validateRedirectUri } from '../tracker/linear-oauth.ts';
+import { logger } from '../util/logger.ts';
 import { expandEnvString, expandPath, isInside } from '../util/paths.ts';
 
 function asObject(v: unknown, name: string): Record<string, unknown> {
@@ -262,17 +263,37 @@ export function buildServiceConfig(def: WorkflowDefinition): ServiceConfig {
     max_concurrent_agents_by_state,
   };
 
-  // ── archon ───────────────────────────────────────────────────────────────
+  // ── executor ─────────────────────────────────────────────────────────────
+  // `executor:` is the name; `archon:` is accepted as a deprecated alias.
+  //
+  // The block describes *the executor*, which happens to be Archon today and
+  // will be the in-house engine shortly. Naming it after the current
+  // implementation is what made `cfg.executor.gate_timeout_ms` read like an
+  // Archon-specific setting when it is a policy of ours. The engine branch
+  // removes `archon:` outright; warning here rather than failing gives operators
+  // a release to rename in, and means neither branch has to break a working
+  // WORKFLOW.md on merge day.
+  const executorRaw = asObject(root.executor, 'executor');
   const archonRaw = asObject(root.archon, 'archon');
-  const archon: ArchonConfig = {
-    command: asString(archonRaw.command, 'archon.command', 'archon workflow run'),
-    api_url: asString(archonRaw.api_url, 'archon.api_url', 'http://localhost:3090'),
-    poll_interval_ms: asPositiveInt(archonRaw.poll_interval_ms, 'archon.poll_interval_ms', 5_000),
-    turn_timeout_ms: asPositiveInt(archonRaw.turn_timeout_ms, 'archon.turn_timeout_ms', 3_600_000),
-    stall_timeout_ms: asInt(archonRaw.stall_timeout_ms, 'archon.stall_timeout_ms', 300_000),
-    default_workflow: asString(archonRaw.default_workflow, 'archon.default_workflow', 'gaggle/gaggle-fix-issue'),
-    gate_timeout_ms: asInt(archonRaw.gate_timeout_ms, 'archon.gate_timeout_ms', 0),
-    startup_cleanup_age_days: asInt(archonRaw.startup_cleanup_age_days, 'archon.startup_cleanup_age_days', 7),
+  if (root.archon !== undefined) {
+    logger.warn(
+      'The `archon:` config block is deprecated — rename it to `executor:`. It will stop being read once the workflow engine lands.',
+    );
+  }
+  /** Prefer `executor:`, fall back to the deprecated `archon:`. */
+  const exec = (key: string): unknown => executorRaw[key] ?? archonRaw[key];
+  const executor: ExecutorConfig = {
+    // Archon transport. These four go away with Archon; nothing in the control
+    // plane reads them.
+    command: asString(exec('command'), 'executor.command', 'archon workflow run'),
+    api_url: asString(exec('api_url'), 'executor.api_url', 'http://localhost:3090'),
+    poll_interval_ms: asPositiveInt(exec('poll_interval_ms'), 'executor.poll_interval_ms', 5_000),
+    turn_timeout_ms: asPositiveInt(exec('turn_timeout_ms'), 'executor.turn_timeout_ms', 3_600_000),
+    // Policy, not transport. These four keep their names across the engine swap.
+    stall_timeout_ms: asInt(exec('stall_timeout_ms'), 'executor.stall_timeout_ms', 300_000),
+    default_workflow: asString(exec('default_workflow'), 'executor.default_workflow', 'gaggle/gaggle-fix-issue'),
+    gate_timeout_ms: asInt(exec('gate_timeout_ms'), 'executor.gate_timeout_ms', 0),
+    startup_cleanup_age_days: asInt(exec('startup_cleanup_age_days'), 'executor.startup_cleanup_age_days', 7),
   };
 
   // ── database ─────────────────────────────────────────────────────────────
@@ -280,7 +301,6 @@ export function buildServiceConfig(def: WorkflowDefinition): ServiceConfig {
   // alias because the workflow-engine branch introduced that name; whichever the
   // operator has written, both halves resolve to the same connection.
   const databaseRaw = asObject(root.database, 'database');
-  const executorRaw = asObject(root.executor, 'executor');
   const databaseUrlRaw =
     asOptionalString(databaseRaw.url, 'database.url') ??
     asOptionalString(executorRaw.database_url, 'executor.database_url') ??
@@ -382,7 +402,7 @@ export function buildServiceConfig(def: WorkflowDefinition): ServiceConfig {
     workspace,
     hooks,
     agent,
-    archon,
+    executor,
     database,
     claude,
     workflow_templates,

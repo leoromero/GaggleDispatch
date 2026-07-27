@@ -14,7 +14,16 @@
  */
 
 import { describe, expect, test, beforeEach, afterAll } from 'bun:test';
-import { applyMigrations, currentVersion, pendingVersions, type Migration } from '../store/migrate.ts';
+import {
+  applyMigrations,
+  assertInRange,
+  currentVersion,
+  pendingVersions,
+  MIGRATION_RANGES,
+  type Migration,
+} from '../store/migrate.ts';
+import { CONTROL_MIGRATIONS } from '../control/store/migrations.ts';
+import { HUB_MIGRATIONS } from '../hub/history-migrations.ts';
 import { openSql, type Sql } from '../store/sql.ts';
 
 const PG_URL = process.env.TEST_DATABASE_URL ?? '';
@@ -132,3 +141,44 @@ if (!PG_URL) {
     });
   });
 }
+
+// ─── range ownership ────────────────────────────────────────────────────────
+//
+// No database needed: this is a static claim about who may number what. It is a
+// check rather than a comment because a design doc already said the same thing
+// and two branches still collided — one creating `scaffold_jobs`,
+// `hub_workspaces`, and `hub_token_daily` at versions 2–3 while the other created
+// them at 100 and 200. Neither used IF NOT EXISTS, so the merged schema could not
+// migrate a fresh database, and nothing failed until someone tried.
+
+describe('migration range ownership', () => {
+  test('the shipped sets sit inside their own ranges', () => {
+    // These call assertInRange at import time; calling again documents which
+    // owner each set belongs to and fails here rather than at import if it moves.
+    expect(() => assertInRange('control', CONTROL_MIGRATIONS)).not.toThrow();
+    expect(() => assertInRange('hub', HUB_MIGRATIONS)).not.toThrow();
+  });
+
+  test('a version outside the range is rejected, naming the range', () => {
+    const stray: Migration[] = [{ version: 3, name: 'hub_history', sql: 'SELECT 1' }];
+    expect(() => assertInRange('hub', stray)).toThrow(/outside the 'hub' range 200–299/);
+  });
+
+  test('the ranges do not overlap', () => {
+    const bands = Object.entries(MIGRATION_RANGES).sort((a, b) => a[1][0] - b[1][0]);
+    for (let i = 1; i < bands.length; i++) {
+      const [prevName, [, prevHi]] = bands[i - 1]!;
+      const [name, [lo]] = bands[i]!;
+      expect({ pair: `${prevName}→${name}`, ok: prevHi < lo }).toEqual({
+        pair: `${prevName}→${name}`,
+        ok: true,
+      });
+    }
+  });
+
+  test('every owner in MIGRATION_RANGES is a well-formed band', () => {
+    for (const [owner, [lo, hi]] of Object.entries(MIGRATION_RANGES)) {
+      expect({ owner, ok: lo > 0 && hi >= lo }).toEqual({ owner, ok: true });
+    }
+  });
+});

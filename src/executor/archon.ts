@@ -15,14 +15,14 @@ import { logger } from '../util/logger.ts';
 export type ArchonEvent =
   | { type: 'archon_started'; pid: number }
   | { type: 'archon_output'; line: string }
-  | { type: 'archon_gate_paused'; run_id: string; gate_message: string; raw: string }
+  | { type: 'run_gate_paused'; run_id: string; gate_message: string; raw: string }
   /** Emitted once when Archon logs the workflowRunId — use this to correlate with the DB. */
-  | { type: 'archon_run_id'; db_run_id: string }
-  | { type: 'archon_succeeded' }
-  | { type: 'archon_failed'; exit_code: number }
-  | { type: 'archon_timed_out' }
-  | { type: 'archon_stalled' }
-  | { type: 'archon_cancelled' };
+  | { type: 'run_id'; db_run_id: string }
+  | { type: 'run_succeeded' }
+  | { type: 'run_failed'; exit_code: number }
+  | { type: 'run_timed_out' }
+  | { type: 'run_stalled' }
+  | { type: 'run_cancelled' };
 
 /**
  * Matches Archon's `workflow_starting` log line to extract the DB run id.
@@ -131,7 +131,7 @@ export function startArchon(opts: ExecutorOptions, onEvent: (e: ArchonEvent) => 
     if (proc.exitCode === undefined) {
       timedOut = true;
       logger.warn('Archon turn timeout — killing', { pid: proc.pid });
-      onEvent({ type: 'archon_timed_out' });
+      onEvent({ type: 'run_timed_out' });
       try {
         proc.kill();
       } catch {
@@ -151,7 +151,7 @@ export function startArchon(opts: ExecutorOptions, onEvent: (e: ArchonEvent) => 
       const m = line.match(WORKFLOW_RUN_ID_REGEX);
       if (m?.[1]) {
         capturedDbRunId = m[1];
-        onEvent({ type: 'archon_run_id', db_run_id: capturedDbRunId });
+        onEvent({ type: 'run_id', db_run_id: capturedDbRunId });
       }
     }
 
@@ -160,7 +160,7 @@ export function startArchon(opts: ExecutorOptions, onEvent: (e: ArchonEvent) => 
       if (detected) {
         capturedRunId = detected.run_id;
         onEvent({
-          type: 'archon_gate_paused',
+          type: 'run_gate_paused',
           run_id: capturedRunId,
           gate_message: line.trim(),
           raw: line,
@@ -181,13 +181,13 @@ export function startArchon(opts: ExecutorOptions, onEvent: (e: ArchonEvent) => 
       clearTimeout(turnTimer);
 
       if (cancelled) {
-        onEvent({ type: 'archon_cancelled' });
+        onEvent({ type: 'run_cancelled' });
       } else if (timedOut) {
         // already emitted
       } else if (exitCode === 0) {
-        onEvent({ type: 'archon_succeeded' });
+        onEvent({ type: 'run_succeeded' });
       } else {
-        onEvent({ type: 'archon_failed', exit_code: exitCode ?? -1 });
+        onEvent({ type: 'run_failed', exit_code: exitCode ?? -1 });
       }
     } finally {
       resolveDone();
@@ -251,7 +251,7 @@ export function approveAndResumeArchon(
     if (proc.exitCode === undefined) {
       timedOut = true;
       logger.warn('Archon approve+resume turn timeout — killing', { pid: proc.pid, runId });
-      onEvent({ type: 'archon_timed_out' });
+      onEvent({ type: 'run_timed_out' });
       try { proc.kill(); } catch { /* ignore */ }
     }
   }, turnTimeoutMs);
@@ -263,14 +263,14 @@ export function approveAndResumeArchon(
       const m = line.match(WORKFLOW_RUN_ID_REGEX);
       if (m?.[1]) {
         capturedDbRunId = m[1];
-        onEvent({ type: 'archon_run_id', db_run_id: capturedDbRunId });
+        onEvent({ type: 'run_id', db_run_id: capturedDbRunId });
       }
     }
     if (capturedRunId === null) {
       const detected = detectGatePause(line);
       if (detected) {
         capturedRunId = detected.run_id;
-        onEvent({ type: 'archon_gate_paused', run_id: capturedRunId, gate_message: line.trim(), raw: line });
+        onEvent({ type: 'run_gate_paused', run_id: capturedRunId, gate_message: line.trim(), raw: line });
       }
     }
   };
@@ -283,10 +283,10 @@ export function approveAndResumeArchon(
       const exitCode = await proc.exited;
       clearTimeout(turnTimer);
       if (cancelled) {
-        onEvent({ type: 'archon_cancelled' });
+        onEvent({ type: 'run_cancelled' });
       } else if (!timedOut) {
-        if (exitCode === 0) onEvent({ type: 'archon_succeeded' });
-        else onEvent({ type: 'archon_failed', exit_code: exitCode ?? -1 });
+        if (exitCode === 0) onEvent({ type: 'run_succeeded' });
+        else onEvent({ type: 'run_failed', exit_code: exitCode ?? -1 });
       }
     } finally {
       resolveDone();

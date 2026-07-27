@@ -791,3 +791,35 @@ if (PG_URL) {
     test.skip('set TEST_DATABASE_URL to run against real Postgres', () => {});
   });
 }
+
+// ── schema contracts the other branch relies on ──────────────────────────────
+//
+// Not store behaviour — the shape of the columns themselves, asserted because
+// another module writes this table with SQL of its own. A TypeScript signature
+// cannot constrain that; the column default is the only thing that does.
+
+if (PG_URL) {
+  describe('control-plane schema — cross-branch contracts', () => {
+    test("scaffold_jobs.workspace defaults, so a workspace-unaware INSERT still works", async () => {
+      const store = new PostgresControlStore(PG_URL, { maxConnections: 2 });
+      try {
+        await store.migrate();
+        const sql = (store as unknown as { sql: (s: TemplateStringsArray) => Promise<unknown> })
+          .sql as unknown as (strings: TemplateStringsArray, ...v: unknown[]) => Promise<
+          Array<{ column_default: string | null; is_nullable: string }>
+        >;
+        const rows = await sql`
+          SELECT column_default, is_nullable
+            FROM information_schema.columns
+           WHERE table_name = 'scaffold_jobs' AND column_name = 'workspace'`;
+        expect(rows).toHaveLength(1);
+        // NOT NULL — the column is meaningful — but defaulted, so the workflow
+        // engine's scaffold store can insert without knowing about workspaces.
+        expect(rows[0]!.is_nullable).toBe('NO');
+        expect(String(rows[0]!.column_default)).toContain("''");
+      } finally {
+        await store.close();
+      }
+    });
+  });
+}

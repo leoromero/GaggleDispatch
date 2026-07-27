@@ -18,7 +18,7 @@
  *     irrelevant.
  */
 
-import type { Migration } from '../../store/migrate.ts';
+import { assertInRange, type Migration } from '../../store/migrate.ts';
 
 const M100_CONTROL_PLANE = `
 CREATE TABLE tickets (
@@ -144,7 +144,12 @@ CREATE INDEX idx_outbox_unsent ON tracker_outbox (id) WHERE sent_at IS NULL;
 
 CREATE TABLE scaffold_jobs (
   slug           TEXT PRIMARY KEY,
-  workspace      TEXT NOT NULL,
+  -- Defaulted, not just NOT NULL: the workflow-engine branch writes this table
+  -- from code that predates the nest and knows nothing about workspaces. A
+  -- default lets those inserts keep working unchanged instead of failing on a
+  -- column they have never heard of. '' is the same "no workspace of its own"
+  -- value the hub's ControlService already uses.
+  workspace      TEXT NOT NULL DEFAULT '',
   url            TEXT NOT NULL,
   checkout_path  TEXT NOT NULL,
   run_id         TEXT,
@@ -161,6 +166,8 @@ CREATE TABLE scaffold_jobs (
 export const CONTROL_MIGRATIONS: Migration[] = [
   { version: 100, name: 'control_plane', sql: M100_CONTROL_PLANE },
 ];
+
+assertInRange('control', CONTROL_MIGRATIONS);
 
 export const CONTROL_LATEST_VERSION = CONTROL_MIGRATIONS.reduce(
   (m, x) => Math.max(m, x.version),

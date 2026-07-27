@@ -59,7 +59,7 @@ export async function runStatus(opts: { cwd?: string; json?: boolean }): Promise
   } else {
     for (const j of jobs.jobs) {
       const age = j.started_at ? ageFromIso(j.started_at) : '?';
-      console.log(`  ${j.slug}: ${j.last_status} (run-id ${j.archon_run_id ?? '?'}, ${age} ago)`);
+      console.log(`  ${j.slug}: ${j.last_status} (run-id ${j.run_id ?? '?'}, ${age} ago)`);
       if (j.pr_url) console.log(chalk.gray(`    PR: ${j.pr_url}`));
     }
   }

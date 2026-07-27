@@ -50,7 +50,7 @@ export class ControlAnalyzerAdapter implements AnalyzerPort {
         repo_alias: repo.name,
         repo_url: repo.url,
         local_path: repo.local_path,
-        workflow: resolveWorkflow(t.archon_workflow, repo, this.deps.cfg, ticket.identifier),
+        workflow: resolveWorkflow(t.workflow, repo, this.deps.cfg, ticket.identifier),
         rationale: t.rationale ?? null,
         components: t.components ?? [],
         depends_on: t.depends_on ?? [],
@@ -79,7 +79,7 @@ function resolveWorkflow(
   cfg: ServiceConfig,
   identifier: string,
 ): string {
-  const fallback = repo.default_workflow || cfg.archon.default_workflow;
+  const fallback = repo.default_workflow || cfg.executor.default_workflow;
   if (!chosen) return fallback;
   if (repo.available_workflows.length === 0) return chosen;
   if (repo.available_workflows.includes(chosen)) return chosen;

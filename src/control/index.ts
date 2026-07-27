@@ -112,7 +112,7 @@ export async function openControlPlane(opts: OpenControlPlaneOptions): Promise<C
     trackerWrites: new LinearWriteAdapter(opts.tracker),
     cfg: {
       workspace: opts.workspace,
-      gate_timeout_ms: opts.cfg.archon.gate_timeout_ms,
+      gate_timeout_ms: opts.cfg.executor.gate_timeout_ms,
       outbox: {
         workspace: opts.workspace,
         batch_size: 50,
@@ -130,7 +130,7 @@ export async function openControlPlane(opts: OpenControlPlaneOptions): Promise<C
   logger.info('Control plane open', {
     workspace: opts.workspace,
     mirror_labels: opts.cfg.tracker.mirror_labels,
-    gate_timeout_ms: opts.cfg.archon.gate_timeout_ms,
+    gate_timeout_ms: opts.cfg.executor.gate_timeout_ms,
   });
 
   return {

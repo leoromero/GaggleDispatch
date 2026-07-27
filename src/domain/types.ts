@@ -127,21 +127,32 @@ export interface AgentConfig {
   max_concurrent_agents_by_state: Record<string, number>;
 }
 
-export interface ArchonConfig {
+/**
+ * Whatever is executing workflows for us.
+ *
+ * Named for the role, not the implementation: Archon today, the in-house engine
+ * shortly. The split below is the one that matters when that swap happens — the
+ * transport fields go with Archon, and the policy fields are ours and stay.
+ * `gate_timeout_ms` in particular is a decision about how long we let a human
+ * think, which was never Archon's business.
+ */
+export interface ExecutorConfig {
+  // ── transport: replaced wholesale when the engine lands ──
   command: string;
   /** Base URL of the Archon HTTP API. Default: http://localhost:3090. */
   api_url: string;
-  /** How often (ms) to poll Archon's API for run status. Default: 5 000. */
+  /** How often (ms) to poll the executor's API for run status. Default: 5 000. */
   poll_interval_ms: number;
   turn_timeout_ms: number;
+
+  // ── policy: survives the swap under these names ──
   stall_timeout_ms: number;
   default_workflow: string;
   gate_timeout_ms: number;
   /**
-   * If > 0, run `archon isolation cleanup <days>` once at orchestrator
-   * startup, per registered repo. Removes Archon worktrees idle for more
-   * than N days — catches abandoned, cancelled, and orphaned ones in one
-   * sweep. The per-run `after_run` hook handles merged-branch cleanup
+   * If > 0, sweep worktrees idle for more than N days once at orchestrator
+   * startup, per registered repo — catching abandoned, cancelled, and orphaned
+   * ones in one pass. The per-run `after_run` hook handles merged-branch cleanup
    * continuously; this complements it for the long tail.
    * Set to 0 to disable. Default: 7.
    */
@@ -204,7 +215,7 @@ export interface ServiceConfig {
   workspace: WorkspaceConfig;
   hooks: HooksConfig;
   agent: AgentConfig;
-  archon: ArchonConfig;
+  executor: ExecutorConfig;
   database: DatabaseConfig;
   claude: ClaudeConfig;
   workflow_templates: WorkflowTemplatesConfig;
@@ -291,7 +302,7 @@ export interface RepoTarget {
   repo_url: string;
   repo_alias: string;
   local_path: string;
-  archon_workflow: string;
+  workflow: string;
   rationale: string;
   components: string[];
   depends_on?: string[];
@@ -321,19 +332,19 @@ export interface LiveSession {
   repo_alias: string;
   repo_target: RepoTarget;
   sub_issue_id: string | null;
-  archon_pid: number | null;
+  run_pid: number | null;
   /** Archon DB run id captured from the `workflowRunId` log line at startup. */
-  archon_db_run_id: string | null;
-  archon_workflow: string;
-  last_archon_event: string | null;
-  last_archon_timestamp: string | null;
-  last_archon_message: string | null;
+  run_id: string | null;
+  workflow: string;
+  last_event: string | null;
+  last_event_at: string | null;
+  last_message: string | null;
   /**
    * Ring buffer of the most recent stdout/stderr lines from the Archon CLI
    * subprocess (capped). Surfaced in the worker-exit log when a worker fails
    * so the operator doesn't have to dig into Archon's own logs to see why.
    */
-  recent_archon_output: string[];
+  recent_output: string[];
   claude_input_tokens: number;
   claude_output_tokens: number;
   claude_total_tokens: number;
@@ -371,7 +382,7 @@ export interface ScaffoldJob {
   slug: string;
   url: string;
   checkout_path: string;
-  archon_run_id: string | null;
+  run_id: string | null;
   workflow_name: string;
   branch: string;
   started_at: string;

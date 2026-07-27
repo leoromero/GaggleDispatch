@@ -201,7 +201,7 @@ describe('ArchonExecutorAdapter — exit translation', () => {
     });
     await a2.spawnRun(ctx());
     sink.calls = [];
-    onExit({ type: 'archon_succeeded' });
+    onExit({ type: 'run_succeeded' });
     await Bun.sleep(5);
 
     expect(sink.kinds()).toEqual(['runSucceeded']);
@@ -226,7 +226,7 @@ describe('ArchonExecutorAdapter — exit translation', () => {
     await a.spawnRun(ctx());
     sink.calls = [];
 
-    onExit({ type: 'archon_succeeded' });
+    onExit({ type: 'run_succeeded' });
     await Bun.sleep(5);
 
     expect(sink.kinds()).not.toContain('runSucceeded');
@@ -252,7 +252,7 @@ describe('ArchonExecutorAdapter — exit translation', () => {
     });
     await a.spawnRun(ctx());
 
-    onExit({ type: 'archon_succeeded' });
+    onExit({ type: 'run_succeeded' });
     await Bun.sleep(5);
 
     const failed = sink.calls.find((c) => c[0] === 'runFailed');
@@ -276,7 +276,7 @@ describe('ArchonExecutorAdapter — exit translation', () => {
     await a.spawnRun(ctx());
     sink.calls = [];
 
-    onExit({ type: 'archon_succeeded' });
+    onExit({ type: 'run_succeeded' });
     await Bun.sleep(5);
     expect(sink.kinds()).toContain('runFailed');
   });
@@ -300,7 +300,7 @@ describe('ArchonExecutorAdapter — exit translation', () => {
     await a.spawnRun(ctx());
     sink.calls = [];
 
-    onExit({ type: 'archon_succeeded' });
+    onExit({ type: 'run_succeeded' });
     await Bun.sleep(5);
 
     expect(sink.kinds()).toEqual([]);
@@ -325,7 +325,7 @@ describe('ArchonExecutorAdapter — exit translation', () => {
       await a.spawnRun(ctx());
       sink.calls = [];
 
-      onExit({ type: 'archon_succeeded' });
+      onExit({ type: 'run_succeeded' });
       await Bun.sleep(5);
       expect(sink.kinds()).toEqual([]);
     }
@@ -345,9 +345,9 @@ describe('ArchonExecutorAdapter — exit translation', () => {
     });
     await a.spawnRun(ctx());
 
-    onExit({ type: 'archon_timed_out' });
+    onExit({ type: 'run_timed_out' });
     await Bun.sleep(5);
-    expect(sink.calls.find((c) => c[0] === 'runFailed')?.[2]).toBe('archon_timed_out');
+    expect(sink.calls.find((c) => c[0] === 'runFailed')?.[2]).toBe('run_timed_out');
   });
 
   test('a run id arriving on a log line is recorded immediately', async () => {
@@ -495,7 +495,7 @@ describe('control rows → worker shapes', () => {
 
   test('repoTargetFrom carries the operator-chosen workflow', () => {
     const r = repoTargetFrom(ticket(), target({ workflow: 'gaggle/gaggle-supervised' }));
-    expect(r.archon_workflow).toBe('gaggle/gaggle-supervised');
+    expect(r.workflow).toBe('gaggle/gaggle-supervised');
     expect(r.local_path).toBe('/repos/api');
     expect(r.depends_on).toEqual([]);
   });
@@ -548,7 +548,7 @@ describe('ControlAnalyzerAdapter', () => {
             repo_url: 'https://wrong',
             repo_alias: 'api',
             local_path: '/wrong/path',
-            archon_workflow: 'gaggle/gaggle-fix-issue',
+            workflow: 'gaggle/gaggle-fix-issue',
             rationale: 'r',
             components: [],
           },
@@ -571,7 +571,7 @@ describe('ControlAnalyzerAdapter', () => {
             repo_url: '',
             repo_alias: 'hallucinated',
             local_path: '/nope',
-            archon_workflow: 'w',
+            workflow: 'w',
             rationale: 'r',
             components: [],
           },
@@ -591,7 +591,7 @@ describe('ControlAnalyzerAdapter', () => {
             repo_url: '',
             repo_alias: 'api',
             local_path: '',
-            archon_workflow: 'gaggle/does-not-exist',
+            workflow: 'gaggle/does-not-exist',
             rationale: 'r',
             components: [],
           },
@@ -612,7 +612,7 @@ describe('ControlAnalyzerAdapter', () => {
             repo_url: '',
             repo_alias: 'api',
             local_path: '',
-            archon_workflow: 'gaggle/gaggle-supervised',
+            workflow: 'gaggle/gaggle-supervised',
             rationale: 'r',
             components: [],
           },
@@ -635,7 +635,7 @@ describe('ControlAnalyzerAdapter', () => {
             repo_url: '',
             repo_alias: 'api',
             local_path: '',
-            archon_workflow: 'gaggle/gaggle-fix-issue',
+            workflow: 'gaggle/gaggle-fix-issue',
             rationale: 'r',
             components: ['widget'],
             depends_on: ['db'],

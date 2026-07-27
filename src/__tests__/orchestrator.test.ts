@@ -124,7 +124,7 @@ async function rig(over: { mirrorLabels?: boolean; maxAgents?: number } = {}): P
       repo_url: 'https://github.com/acme/api',
       repo_alias: 'api',
       local_path: '/repos/api',
-      archon_workflow: 'gaggle/gaggle-fix-issue',
+      workflow: 'gaggle/gaggle-fix-issue',
       rationale: 'owns it',
       components: [],
     },
@@ -304,7 +304,7 @@ describe('Orchestrator — Analyze, Start, run, complete', () => {
     expect(args.issue.id).toBe('lin-1');
     expect(args.repo_target.repo_alias).toBe('api');
     expect(args.repo_target.local_path).toBe('/repos/api');
-    expect(args.repo_target.archon_workflow).toBe('gaggle/gaggle-fix-issue');
+    expect(args.repo_target.workflow).toBe('gaggle/gaggle-fix-issue');
 
     const target = (await targetsOf(r, ticket.id))[0]!;
     expect(target.status).toBe('running');
@@ -338,7 +338,7 @@ describe('Orchestrator — Analyze, Start, run, complete', () => {
     r.spawns[0]!.cb.onRunId!('run-1');
     r.runDetail.set('run-1', detail('completed'));
 
-    r.spawns[0]!.cb.onExit({ type: 'archon_succeeded' });
+    r.spawns[0]!.cb.onExit({ type: 'run_succeeded' });
     await Bun.sleep(10);
     await r.tick(); // drains the outbox
 
@@ -356,11 +356,11 @@ describe('Orchestrator — Analyze, Start, run, complete', () => {
     r.spawns[0]!.cb.onOutput('thinking about the widget');
     const running = [...r.orchestrator.getState().running.values()];
     expect(running).toHaveLength(1);
-    expect(running[0]!.archon_pid).toBe(4242);
-    expect(running[0]!.last_archon_message).toBe('thinking about the widget');
+    expect(running[0]!.run_pid).toBe(4242);
+    expect(running[0]!.last_message).toBe('thinking about the widget');
     expect(running[0]!.turn_count).toBe(1);
 
-    r.spawns[0]!.cb.onExit({ type: 'archon_succeeded' });
+    r.spawns[0]!.cb.onExit({ type: 'run_succeeded' });
     await Bun.sleep(10);
     expect(r.orchestrator.getState().running.size).toBe(0);
   });
@@ -385,22 +385,22 @@ describe('Orchestrator — failure and gates', () => {
     const r = await rig();
     const { ticket } = await started(r);
 
-    r.spawns[0]!.cb.onExit({ type: 'archon_failed', exit_code: 1 });
+    r.spawns[0]!.cb.onExit({ type: 'run_failed', exit_code: 1 });
     await Bun.sleep(10);
     await r.tick();
 
     const target = (await targetsOf(r, ticket.id))[0]!;
     expect(target.status).toBe('failed');
-    expect(target.failure_reason).toBe('archon_failed');
+    expect(target.failure_reason).toBe('run_failed');
     // The ticket stays running: a failed target keeps it on the operator's board.
     expect((await only(r)).status).toBe('running');
-    expect(r.tracker.comments.some((c) => c.body.includes('archon_failed'))).toBe(true);
+    expect(r.tracker.comments.some((c) => c.body.includes('run_failed'))).toBe(true);
   });
 
   test('Re-dispatch after a failure runs it again with a bumped attempt', async () => {
     const r = await rig();
     const { api, ticket } = await started(r);
-    r.spawns[0]!.cb.onExit({ type: 'archon_failed' });
+    r.spawns[0]!.cb.onExit({ type: 'run_failed' });
     await Bun.sleep(10);
 
     const target = (await targetsOf(r, ticket.id))[0]!;
@@ -437,7 +437,7 @@ describe('Orchestrator — failure and gates', () => {
     r.spawns[0]!.cb.onRunId!('run-1');
     r.runDetail.set('run-1', detail('paused', 'Still need approval'));
 
-    r.spawns[0]!.cb.onExit({ type: 'archon_succeeded' });
+    r.spawns[0]!.cb.onExit({ type: 'run_succeeded' });
     await Bun.sleep(10);
 
     expect((await targetsOf(r, ticket.id))[0]!.status).toBe('gate_waiting');
@@ -487,7 +487,7 @@ describe('Orchestrator — multi-repo fan-out', () => {
         repo_url: 'https://github.com/acme/api',
         repo_alias: 'api',
         local_path: '/repos/api',
-        archon_workflow: 'gaggle/gaggle-fix-issue',
+        workflow: 'gaggle/gaggle-fix-issue',
         rationale: 'be',
         components: [],
       },
@@ -495,7 +495,7 @@ describe('Orchestrator — multi-repo fan-out', () => {
         repo_url: 'https://github.com/acme/web',
         repo_alias: 'web',
         local_path: '/repos/web',
-        archon_workflow: 'gaggle/gaggle-fix-issue',
+        workflow: 'gaggle/gaggle-fix-issue',
         rationale: 'fe',
         components: [],
         depends_on: ['api'],
@@ -520,7 +520,7 @@ describe('Orchestrator — multi-repo fan-out', () => {
 
     r.spawns[0]!.cb.onRunId!('run-api');
     r.runDetail.set('run-api', detail('completed'));
-    r.spawns[0]!.cb.onExit({ type: 'archon_succeeded' });
+    r.spawns[0]!.cb.onExit({ type: 'run_succeeded' });
     await Bun.sleep(10);
 
     await r.tick();
@@ -535,8 +535,8 @@ describe('Orchestrator — multi-repo fan-out', () => {
   test('the concurrency ceiling holds across ticks', async () => {
     const r = await rig({ maxAgents: 1 });
     r.setAnalysisTargets([
-      { repo_url: 'https://github.com/acme/api', repo_alias: 'api', local_path: '/repos/api', archon_workflow: 'w', rationale: '', components: [] },
-      { repo_url: 'https://github.com/acme/web', repo_alias: 'web', local_path: '/repos/web', archon_workflow: 'w', rationale: '', components: [] },
+      { repo_url: 'https://github.com/acme/api', repo_alias: 'api', local_path: '/repos/api', workflow: 'w', rationale: '', components: [] },
+      { repo_url: 'https://github.com/acme/web', repo_alias: 'web', local_path: '/repos/web', workflow: 'w', rationale: '', components: [] },
     ]);
     r.tracker.candidates = [issue()];
     await r.tick();

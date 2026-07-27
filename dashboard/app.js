@@ -267,7 +267,7 @@ function renderWorkers() {
   for (const { name, w } of cards) {
     const tokens = w.claude_total_tokens ?? 0;
     const pct = Math.min(100, Math.round((tokens / 200000) * 100));
-    const runUrl = archonRunUrl(w.archon_db_run_id);
+    const runUrl = archonRunUrl(w.run_id);
     const indexUrl = archonRunsIndexUrl();
     const linkAttrs = runUrl
       ? { href: runUrl, target: '_blank', rel: 'noopener' }
@@ -287,8 +287,8 @@ function renderWorkers() {
         el('div', { class: 'meta' }, `turn ${w.turn_count} · ${formatAgo(w.started_at)}`),
         el('div', { class: 'meta' }, `${tokens.toLocaleString()} tokens`),
         el('div', { class: 'token-bar' }, [el('div', { class: 'fill', style: { width: `${pct}%` } })]),
-        w.last_archon_message
-          ? el('div', { class: 'meta', style: { fontStyle: 'italic', marginTop: '4px' } }, w.last_archon_message.slice(0, 120))
+        w.last_message
+          ? el('div', { class: 'meta', style: { fontStyle: 'italic', marginTop: '4px' } }, w.last_message.slice(0, 120))
           : null,
         el('div', { class: 'actions' }, [el('a', linkAttrs, runUrl ? 'View run ↗' : 'Open runs ↗')]),
       ]),
