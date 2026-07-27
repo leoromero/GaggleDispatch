@@ -292,9 +292,12 @@ function suite(name: string, makeStore: () => Promise<ControlStore>, cleanup?: (
       // handed back to it. The round trip has to be byte-exact.
       const t = await store.upsertTicket(ticketInput());
       const [target] = await store.replaceTargets(t.id, [targetSpec()]);
-      const archonId = '9136a16135d082cb9f0ac75523b3b56e';
-      await store.updateTarget(target!.id, { status: 'running', run_id: archonId });
-      expect((await store.getTarget(target!.id))!.run_id).toBe(archonId);
+      // A dash-free 32-hex id, which is what a UUID column would silently
+      // reformat. The engine's ids are UUIDs, but the column's promise is that
+      // it returns whatever any executor gave it, byte for byte.
+      const opaqueId = '9136a16135d082cb9f0ac75523b3b56e';
+      await store.updateTarget(target!.id, { status: 'running', run_id: opaqueId });
+      expect((await store.getTarget(target!.id))!.run_id).toBe(opaqueId);
 
       // And a dashed uuid, for an executor that uses those.
       const dashed = '11111111-1111-4111-8111-111111111111';

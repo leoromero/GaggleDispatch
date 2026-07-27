@@ -365,7 +365,7 @@ describe('Reconciler — run observation', () => {
     const [api, web] = targets as [typeof targets[0], typeof targets[0]];
     await h.service.gateOpened(api.id, 'appr-1', 'ok?');
 
-    runs.observations.set(api.run_id!, { status: 'failed', error: 'archon crashed' });
+    runs.observations.set(api.run_id!, { status: 'failed', error: 'the run crashed' });
     runs.observations.set(web.run_id!, { status: 'completed' });
     await reconciler.tick();
 
@@ -373,7 +373,7 @@ describe('Reconciler — run observation', () => {
       (await h.store.listTargets(ticket.id)).map((t) => [t.repo_alias, t]),
     );
     expect(after.api!.status).toBe('failed');
-    expect(after.api!.failure_reason).toBe('archon crashed');
+    expect(after.api!.failure_reason).toBe('the run crashed');
     // The sibling was reconciled in the same pass rather than being blocked by it.
     expect(after.web!.status).toBe('succeeded');
   });

@@ -61,7 +61,7 @@ describe('dashboard/app.js', () => {
       'supervised_gates',
       'pending_targets',
       'retry_attempts',
-      'detached_archon_runs',
+      'detached_runs',
       'target_machine_states',
       'renderPipeline',
     ]) {

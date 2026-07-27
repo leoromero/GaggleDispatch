@@ -80,9 +80,10 @@ CREATE TABLE ticket_targets (
   external_target_state  TEXT,
   external_target_labels JSONB NOT NULL DEFAULT '[]'::jsonb,
   -- TEXT, not UUID, and deliberately so. The control plane never interprets a
-  -- run id; it hands the string back to whichever executor produced it. Archon's
-  -- ids are 32 hex characters with no dashes, which a UUID column would silently
-  -- normalize into dashed form — and Archon does not recognize that form back.
+  -- run id; it hands the string back to whichever executor produced it. The
+  -- engine's ids happen to be UUIDs today, but a UUID column would normalize
+  -- whatever it is given — Archon's dash-free 32-hex form came back dashed and
+  -- unrecognizable — and the next executor's ids may not be UUIDs at all.
   -- An opaque identifier from an unknown producer gets an opaque column type.
   run_id               TEXT,
   attempt              INT NOT NULL DEFAULT 0,
