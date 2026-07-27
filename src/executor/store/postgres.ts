@@ -496,6 +496,10 @@ export class PostgresStore implements Store {
     return rows[0] ? mapApproval(rows[0]) : null;
   }
 
+  async updateApprovalMessage(id: string, message: string): Promise<void> {
+    await this.sql`UPDATE workflow_approvals SET message = ${message} WHERE id = ${id}`;
+  }
+
   async decideApproval(
     id: string,
     decision: ApprovalDecision,

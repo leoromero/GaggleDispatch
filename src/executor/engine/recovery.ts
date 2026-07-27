@@ -100,21 +100,34 @@ export async function recoverInterruptedRuns(opts: RecoveryOptions): Promise<Rec
     });
 
     if (unsafe.length > 0) {
-      const message = buildAtMostOnceGateMessage(unsafe);
-      // A gate may already exist if the crash happened while parked.
+      const warning = buildAtMostOnceGateMessage(unsafe);
+      // A gate may already exist: a run parks while sibling nodes are still in
+      // flight, so a crash in that window leaves both a pending question and
+      // an interrupted node. Only one gate may be pending, so the warning is
+      // appended to what the human is already being asked rather than
+      // replacing it — approving "ship it?" must not silently authorise
+      // re-running a node that may already have opened a pull request.
+      //
+      // The gate keeps its own node id in that case. The decision still
+      // governs every interrupted at_most_once node; `prepareResume` works
+      // that set out from the node rows rather than from the gate's id.
       const existing = await store.getPendingApproval(run.id);
-      if (!existing) {
+      const message = existing ? `${existing.message}\n\n---\n\n${warning}` : warning;
+      const nodeId = existing?.node_id ?? unsafe[0]!.node_id;
+      if (existing) {
+        await store.updateApprovalMessage(existing.id, message);
+      } else {
         await store.createApproval({
           id: randomUUID(),
           run_id: run.id,
-          node_id: unsafe[0]!.node_id,
+          node_id: nodeId,
           message,
         });
       }
       await store.updateRun(run.id, {
         status: 'paused',
         metadata: {
-          approval: { nodeId: unsafe[0]!.node_id, message },
+          approval: { nodeId, message },
           interrupted_reason: 'executor died while an at_most_once node was running',
         },
       });

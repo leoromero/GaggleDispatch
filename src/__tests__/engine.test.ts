@@ -364,6 +364,32 @@ describe('cancel nodes', () => {
     expect(run.status).toBe('cancelled');
     expect(run.metadata.cancel_reason).toContain('refusing to run on main');
   });
+
+  ifBash('cancelling stops the siblings that are still running', async () => {
+    // Review finding: the run reported cancelled while nodes it had decided
+    // not to run kept going — for a rejected at_most_once node that is the
+    // side effect the human just refused, happening anyway.
+    writeWorkflow(
+      'stop-siblings',
+      `name: stop-siblings
+description: d
+nodes:
+  - id: slow
+    bash: "sleep 20; echo finished"
+  - id: stop
+    cancel: "stopping now"
+`,
+    );
+    const exec = makeExecutor(stubAi([{ when: always, reply: { text: 'x' } }]));
+    const started = Date.now();
+    const { runId } = await runToCompletion(exec, 'stop-siblings');
+    const elapsed = Date.now() - started;
+
+    expect((await exec.getRun(runId))!.status).toBe('cancelled');
+    // The sleep would have held the run for 20s; the abort has to cut it short.
+    expect(elapsed).toBeLessThan(10_000);
+    expect((await store.getNode(runId, 'slow'))!.status).toBe('cancelled');
+  }, 30_000);
 });
 
 // ── loops ───────────────────────────────────────────────────────────────────

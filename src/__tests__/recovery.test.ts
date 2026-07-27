@@ -11,7 +11,7 @@
 import { describe, expect, test, beforeEach, afterEach, afterAll } from 'bun:test';
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
-import { tmpdir } from 'node:os';
+import { tmpdir, hostname } from 'node:os';
 import { randomUUID } from 'node:crypto';
 import { MemoryStore } from '../executor/store/memory.ts';
 import { PostgresStore } from '../executor/store/postgres.ts';
@@ -82,6 +82,57 @@ async function simulateCrash(
   });
   // No lease acquired, so the run reads as abandoned.
   return id;
+}
+
+/** Poll until a condition holds, for the paths that resume in the background. */
+async function until(cond: () => Promise<boolean>, timeoutMs = 5_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (await cond()) return;
+    await Bun.sleep(20);
+  }
+  throw new Error('condition never became true');
+}
+
+/**
+ * A crashed run with *two* interrupted `at_most_once` nodes.
+ *
+ * Two is the interesting number: the gate row carries one node id, so a
+ * decision that only reaches that node leaves the other free to re-run.
+ */
+async function twinRiskCrash(): Promise<{ id: string; calls: string[]; exec: GaggleExecutor }> {
+  writeWorkflow(
+    'twin-risk',
+    `name: twin-risk
+description: d
+nodes:
+  - id: pr-one
+    prompt: "one"
+    side_effects: at_most_once
+  - id: pr-two
+    prompt: "two"
+    side_effects: at_most_once
+`,
+  );
+  const calls: string[] = [];
+  const exec = makeExecutor(store, async (req) => {
+    calls.push(req.prompt.trim());
+    return { text: 'ok', sessionId: null, inputTokens: 0, outputTokens: 0, timedOut: false, cancelled: false };
+  });
+
+  // Run it for real so the workflow hash matches, then rewind both nodes to
+  // the state a killed process leaves behind.
+  const handle = await exec.startRun({ workflow: 'twin-risk', cwd: repo, message: 'm' }, () => {});
+  await handle.done;
+  await store.updateRun(handle.run_id, { status: 'running' });
+  for (const nodeId of ['pr-one', 'pr-two']) {
+    await store.upsertNode({
+      run_id: handle.run_id, node_id: nodeId, node_type: 'prompt', status: 'running',
+      side_effects: 'at_most_once',
+    });
+  }
+  await store.releaseLease(handle.run_id, `${hostname()}:${process.pid}`);
+  return { id: handle.run_id, calls, exec };
 }
 
 describe('buildAtMostOnceGateMessage', () => {
@@ -168,17 +219,26 @@ describe('recoverInterruptedRuns', () => {
     expect(gate?.node_id).toBe('create-pr');
   });
 
-  test('does not create a second gate when one is already pending', async () => {
+  test('extends the pending gate rather than raising a second one', async () => {
+    // A run parks while sibling nodes are still in flight, so a crash in that
+    // window leaves a pending question *and* an interrupted node. Only one
+    // gate may be pending, and dropping the warning would mean approving
+    // "ship it?" silently authorised re-opening a pull request.
     const id = await simulateCrash(store, {
       workflowName: 'w', nodeId: 'create-pr', sideEffects: 'at_most_once',
     });
     await store.createApproval({
-      id: randomUUID(), run_id: id, node_id: 'create-pr', message: 'existing',
+      id: randomUUID(), run_id: id, node_id: 'ship-gate', message: 'ship it?',
     });
-    // The one-pending-gate constraint would throw if recovery created another.
     const [res] = await recoverInterruptedRuns({ store, executor: makeExecutor(store) });
+
     expect(res!.action).toBe('parked_for_review');
-    expect((await store.getPendingApproval(id))!.message).toBe('existing');
+    const gate = (await store.getPendingApproval(id))!;
+    expect(gate.node_id).toBe('ship-gate');
+    expect(gate.message).toContain('ship it?');
+    expect(gate.message).toContain('duplicate');
+    // The run metadata is what the orchestrator posts, so it has to agree.
+    expect((await store.getRun(id))!.metadata.approval?.message).toBe(gate.message);
   });
 
   test('a mixed run parks if any interrupted node is at_most_once', async () => {
@@ -207,7 +267,7 @@ describe('recoverInterruptedRuns', () => {
     await store.upsertNode({
       run_id: handle.run_id, node_id: 'b', node_type: 'prompt', status: 'running',
     });
-    await store.releaseLease(handle.run_id, `${require('node:os').hostname()}:${process.pid}`);
+    await store.releaseLease(handle.run_id, `${hostname()}:${process.pid}`);
 
     const [res] = await recoverInterruptedRuns({ store, executor: exec, autoResume: true });
     expect(res!.action).toBe('resumed');
@@ -224,6 +284,45 @@ describe('recoverInterruptedRuns', () => {
     expect(res!.action).toBe('resume_failed');
     expect(res!.detail).toContain('not found');
     expect((await store.getRun(id))!.status).toBe('interrupted');
+  });
+
+  test('one answer governs every interrupted at_most_once node', async () => {
+    // Review finding: recovery names all the unsafe nodes in the gate message
+    // but the gate row can only carry one node id. When the decision only
+    // reached that one node, the others re-ran unasked — a second pull
+    // request from a run the human just refused.
+    const { id, calls, exec } = await twinRiskCrash();
+    const [res] = await recoverInterruptedRuns({ store, executor: exec });
+    expect(res!.action).toBe('parked_for_review');
+    calls.length = 0;
+
+    const handle = await exec.approveAndWatch(id, 'go ahead', () => {});
+    await handle!.done;
+
+    expect(calls.sort()).toEqual(['one', 'two']);
+    expect((await store.getRun(id))!.status).toBe('completed');
+  });
+
+  test('rejecting stops every covered node, not just the one the gate names', async () => {
+    const { id, calls, exec } = await twinRiskCrash();
+    await recoverInterruptedRuns({ store, executor: exec });
+    calls.length = 0;
+
+    await exec.reject(id, 'do not re-run these');
+    await until(async () => (await store.getRun(id))!.status === 'cancelled');
+
+    expect(calls).toEqual([]);
+    const nodes = await store.getNodes(id);
+    expect(nodes.every((n) => n.status === 'cancelled')).toBe(true);
+  });
+
+  test('resuming refuses to walk past the unanswered gate', async () => {
+    const { id, calls, exec } = await twinRiskCrash();
+    await recoverInterruptedRuns({ store, executor: exec });
+    calls.length = 0;
+
+    await expect(exec.resumeRun(id, () => {})).rejects.toThrow(/approve or reject/i);
+    expect(calls).toEqual([]);
   });
 
   test('handles several crashed runs in one pass', async () => {

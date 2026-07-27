@@ -274,6 +274,15 @@ export interface Store {
   }): Promise<ApprovalRow>;
   /** The gate currently holding the run, if any. */
   getPendingApproval(runId: string): Promise<ApprovalRow | null>;
+  /**
+   * Rewrite a pending gate's question.
+   *
+   * Startup recovery needs this: a run can crash while already parked, and
+   * only one gate may be pending at a time, so the `at_most_once` warning is
+   * appended to the question the human is already being asked rather than
+   * silently dropped.
+   */
+  updateApprovalMessage(id: string, message: string): Promise<void>;
   decideApproval(
     id: string,
     decision: ApprovalDecision,

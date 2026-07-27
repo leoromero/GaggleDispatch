@@ -61,6 +61,18 @@ export class WorkflowChangedError extends Error {
   }
 }
 
+export class GatePendingError extends Error {
+  readonly node_id: string;
+  constructor(runId: string, nodeId: string) {
+    super(
+      `run '${runId}' is waiting on the gate at '${nodeId}'. Approve or reject it — resuming ` +
+        `would step past the question unanswered.`,
+    );
+    this.name = 'GatePendingError';
+    this.node_id = nodeId;
+  }
+}
+
 export class GaggleExecutor implements WorkflowExecutor {
   private readonly store: Store;
   private readonly artifactsRoot: string;
@@ -179,6 +191,13 @@ export class GaggleExecutor implements WorkflowExecutor {
     onEvent: RunEventHandler,
     opts: ResumeOptions = {},
   ): Promise<RunHandle> {
+    // Resuming past an unanswered gate would walk straight through the
+    // question — including the synthetic gate recovery raises for an
+    // interrupted `at_most_once` node, whose whole purpose is to stop exactly
+    // this. Answer it with approve/reject; the run resumes from there.
+    const pending = await this.store.getPendingApproval(runId);
+    if (pending) throw new GatePendingError(runId, pending.node_id);
+
     const { runner } = await this.prepareResume(runId, onEvent, opts);
     return this.launch(runId, runner);
   }
@@ -221,8 +240,28 @@ export class GaggleExecutor implements WorkflowExecutor {
       await this.store.updateRun(runId, { });
     }
 
-    if (decision) runner.primeDecision(decision);
+    if (decision) {
+      runner.primeDecision({
+        ...decision,
+        covers: await this.interruptedUnsafeNodes(runId, decision.node_id),
+      });
+    }
     return { runner, row };
+  }
+
+  /**
+   * Interrupted `at_most_once` nodes the gate's answer has to govern.
+   *
+   * Derived from the node rows rather than the gate row: recovery can only
+   * raise one gate, and when a gate was already pending it keeps its own node
+   * id, so the gate alone does not say which nodes are waiting on the answer.
+   */
+  private async interruptedUnsafeNodes(runId: string, gateNodeId: string): Promise<string[]> {
+    const nodes = await this.store.getNodes(runId);
+    return nodes
+      .filter((n) => n.status === 'interrupted' && n.side_effects === 'at_most_once')
+      .map((n) => n.node_id)
+      .filter((id) => id !== gateNodeId);
   }
 
   private buildRunner(

@@ -317,6 +317,21 @@ function suite(name: string, getStore: () => Promise<Store>) {
       expect(await store.decideApproval(id, 'rejected', 'changed my mind')).toBeNull();
     });
 
+    test('a pending gate’s question can be rewritten', async () => {
+      // Recovery appends its at_most_once warning to a gate that is already
+      // pending — only one may be pending, so the alternative is dropping it.
+      const input = runInput();
+      await store.createRun(input);
+      const id = randomUUID();
+      await store.createApproval({ id, run_id: input.id, node_id: 'gate', message: 'ship it?' });
+
+      await store.updateApprovalMessage(id, 'ship it?\n\nalso: a node was interrupted');
+      const pending = (await store.getPendingApproval(input.id))!;
+      expect(pending.message).toContain('interrupted');
+      // Rewriting the question must not answer it.
+      expect(pending.decision).toBeNull();
+    });
+
     test('rework attempts accumulate', async () => {
       const input = runInput();
       await store.createRun(input);

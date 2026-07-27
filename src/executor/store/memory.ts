@@ -306,6 +306,11 @@ export class MemoryStore implements Store {
     return pending[0] ? clone(pending[0]) : null;
   }
 
+  async updateApprovalMessage(id: string, message: string): Promise<void> {
+    const a = this.approvals.get(id);
+    if (a) a.message = message;
+  }
+
   async decideApproval(
     id: string,
     decision: ApprovalDecision,

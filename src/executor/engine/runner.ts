@@ -86,6 +86,16 @@ const LEASE_OWNER = `${hostname()}:${process.pid}`;
 /** A gate decision made while the run was parked, replayed on resume. */
 export interface PendingDecision {
   node_id: string;
+  /**
+   * Other nodes the same answer governs.
+   *
+   * Startup recovery parks *every* interrupted `at_most_once` node behind one
+   * gate — the store allows a single pending gate per run and the message
+   * names them all. If the answer only reached the node the gate row happens
+   * to carry, the rest would re-run unasked, which is exactly the duplicate
+   * side effect the marker exists to prevent.
+   */
+  covers?: string[];
   decision: 'approved' | 'rejected';
   comment: string | null;
   /** How many rework cycles this gate has already been through. */
@@ -687,9 +697,14 @@ export class WorkflowRunner {
   }
 
   private takeDecisionFor(nodeId: string): PendingDecision | null {
-    if (!this.pendingDecision || this.pendingDecision.node_id !== nodeId) return null;
     const d = this.pendingDecision;
-    this.pendingDecision = null;
+    if (!d) return null;
+    const covered = d.node_id === nodeId || (d.covers?.includes(nodeId) ?? false);
+    if (!covered) return null;
+    // A decision covering several nodes stays available for each of them. It
+    // cannot be consumed twice by one node: an `at_most_once` node never
+    // retries, and no node runs twice in a single attempt.
+    if (!d.covers?.length) this.pendingDecision = null;
     return d;
   }
 
@@ -907,7 +922,11 @@ export class WorkflowRunner {
         output: '',
         completed_at: new Date().toISOString(),
       });
+      // Stop the siblings too. Without this the run reports cancelled while
+      // nodes it decided not to run are still executing — and for a rejected
+      // `at_most_once` node that is the side effect the human just refused.
       this.stopped = { kind: 'cancelled', reason: result.cancel.reason };
+      this.abort.abort();
       return;
     }
 
