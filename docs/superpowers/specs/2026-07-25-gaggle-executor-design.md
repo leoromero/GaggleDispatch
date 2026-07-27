@@ -185,6 +185,13 @@ on resume — the run pauses at a synthetic gate asking the human whether the ef
 landed. `create-pr`, `post-summary`, and the Linear-comment bash nodes are the
 obvious candidates.
 
+One gate covers all of them. Only one approval may be pending per run, so when
+several such nodes were interrupted together the single answer governs every
+one; and if a gate was *already* pending when the process died, the warning is
+appended to that question rather than dropped. A graceful shutdown does not
+cancel these runs — it suspends them, leaving the row and its in-flight nodes
+`running` with no lease, which is exactly the state the sweep below looks for.
+
 ## 6. Context and artifact wiring
 
 This is the part you specifically want, so it gets first-class treatment. Three
@@ -192,8 +199,14 @@ independent mechanisms, and a node picks any combination:
 
 **6.1 Output injection (explicit, bounded).** `$nodeId.output` substitutes an
 upstream node's full text; `$nodeId.output.field` parses its structured output and
-pulls one field. Shell-quoted in `bash:` bodies, raw in `script:` bodies, plain in
-prompts. This is how `classify` routes to `investigate` vs `plan`.
+pulls one field. Raw in `script:` bodies, plain in prompts. In `bash:` bodies the
+value is *not* pasted in at all: it is bound to `GAGGLE_OUT_<id>` in the
+subprocess environment and the reference becomes `${GAGGLE_OUT_<id>}`, which the
+shell will not re-parse for command substitution. Shell-quoting was tried first
+and abandoned — `'value'` is only safe unquoted, and the substituter cannot see
+that a template wrote `"$node.output"`. The same binding covers `$ARGUMENTS` and
+the other variables carrying text from outside the system. This is how `classify`
+routes to `investigate` vs `plan`.
 
 **6.2 Conversation inheritance (`context:`).** `fresh` starts a clean Claude session.
 `shared` threads the previous node's conversation — implemented with the Agent SDK's
