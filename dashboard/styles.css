@@ -103,31 +103,6 @@ body {
   color: var(--red);
 }
 
-.archon-chip {
-  text-decoration: none;
-  padding: 2px 8px;
-  border-radius: 4px;
-  border: 1px solid var(--border);
-  background: var(--panel-2);
-  color: var(--text-dim);
-  font-size: 11px;
-}
-
-.archon-chip.running {
-  color: var(--green);
-  border-color: rgba(16, 185, 129, 0.3);
-}
-
-.archon-chip.unavailable,
-.archon-chip.crashed {
-  color: var(--red);
-  border-color: rgba(239, 68, 68, 0.3);
-}
-
-.archon-chip.disabled {
-  color: var(--text-faint);
-}
-
 .worker-card .actions {
   margin-top: 4px;
 }
@@ -705,3 +680,197 @@ main {
   color: var(--text-faint);
   font-size: 11px;
 }
+
+/* ─── Board: tickets and their statuses ─────────────────────────────────── */
+
+.panel-header .board-controls {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.board-filters {
+  display: flex;
+  gap: 4px;
+  flex-wrap: wrap;
+}
+
+.filter-chip {
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  color: var(--text-dim);
+  border-radius: 10px;
+  padding: 2px 8px;
+  font-size: 10px;
+  font-family: inherit;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.filter-chip:hover { color: var(--text); }
+.filter-chip.active {
+  color: var(--accent);
+  border-color: var(--accent);
+}
+
+#board-search {
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  color: var(--text);
+  border-radius: 4px;
+  padding: 3px 8px;
+  font-size: 11px;
+  font-family: inherit;
+  min-width: 160px;
+}
+
+.board-list { display: flex; flex-direction: column; }
+
+.ticket-row {
+  border-bottom: 1px solid var(--border);
+  padding: 6px 10px;
+}
+.ticket-row:last-child { border-bottom: none; }
+
+.ticket-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.ticket-toggle {
+  background: none;
+  border: none;
+  color: var(--text-faint);
+  cursor: pointer;
+  font-size: 11px;
+  padding: 0 2px;
+  font-family: inherit;
+}
+.ticket-toggle:hover { color: var(--text); }
+
+.ticket-key {
+  color: var(--accent);
+  font-size: 11px;
+  font-weight: 600;
+  text-decoration: none;
+  white-space: nowrap;
+}
+.ticket-key:hover { text-decoration: underline; }
+
+.ticket-title {
+  flex: 1;
+  min-width: 0;
+  font-size: 11px;
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.status-pill {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 1px 7px;
+  font-size: 9px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  white-space: nowrap;
+}
+
+.target-chips { display: flex; gap: 4px; }
+.target-chip {
+  font-size: 9px;
+  border: 1px solid currentColor;
+  border-radius: 8px;
+  padding: 1px 6px;
+  opacity: 0.85;
+  white-space: nowrap;
+}
+
+.ticket-actions, .target-actions { display: flex; gap: 4px; }
+.nest-btn.primary {
+  color: var(--accent);
+  border-color: var(--accent);
+}
+
+.ticket-badges { display: flex; gap: 6px; margin: 4px 0 0 22px; flex-wrap: wrap; }
+.badge {
+  font-size: 9px;
+  border-radius: 8px;
+  padding: 1px 7px;
+  border: 1px solid var(--border);
+  color: var(--text-dim);
+}
+.badge.warn { color: var(--amber); border-color: var(--amber); }
+.badge.err { color: var(--red); border-color: var(--red); }
+
+.ticket-detail {
+  margin: 6px 0 4px 22px;
+  border-left: 2px solid var(--border);
+  padding-left: 10px;
+}
+.detail-summary {
+  font-size: 10px;
+  color: var(--text-dim);
+  margin-bottom: 6px;
+  white-space: pre-wrap;
+}
+
+.target-table { display: flex; flex-direction: column; gap: 3px; }
+.target-line {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 10px;
+  min-width: 0;
+}
+.target-alias { color: var(--text); font-weight: 600; min-width: 90px; }
+.target-workflow {
+  color: var(--text-faint);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 220px;
+}
+.target-meta { flex: 1; min-width: 0; color: var(--text-dim); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* ─── Gates: answered here and nowhere else ─────────────────────────────── */
+
+.gates-list { display: flex; flex-direction: column; gap: 8px; }
+
+.gate-card {
+  border: 1px solid var(--amber);
+  border-radius: 6px;
+  padding: 8px 10px;
+  background: var(--panel-2);
+}
+.gate-head { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; }
+.gate-age { font-size: 10px; color: var(--text-dim); }
+
+.gate-message {
+  font-size: 10px;
+  color: var(--text);
+  white-space: pre-wrap;
+  word-break: break-word;
+  margin: 0 0 8px;
+  max-height: 220px;
+  overflow-y: auto;
+  font-family: inherit;
+}
+
+.gate-actions { display: flex; align-items: flex-start; gap: 6px; }
+.gate-input {
+  flex: 1;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  color: var(--text);
+  border-radius: 4px;
+  padding: 4px 6px;
+  font-size: 11px;
+  font-family: inherit;
+  resize: vertical;
+}
+
+.hidden { display: none; }

@@ -1,18 +1,23 @@
 /**
- * `gaggle doctor` — preflight the host before a run can fail halfway through.
+ * `gaggle doctor` — preflight the things that fail confusingly at run time.
  *
- * Every check here corresponds to something that, when missing, produces a
- * confusing failure deep inside a workflow: a `bash:` node that cannot spawn a
- * shell at node 12 of 18, or a run that cannot record its own state. Better to
- * say so up front.
+ * Scoped deliberately: each check answers a question an operator would otherwise
+ * have to answer by reading a stack trace. Postgres is now a hard prerequisite,
+ * so "is the database reachable and migrated" is the headline, and a
+ * non-loopback dashboard host is called out because the board became a surface
+ * that can start agents.
  */
 
 import chalk from 'chalk';
-import { loadConfig, type GlobalOptions } from './common.ts';
-import { PostgresStore } from '../executor/store/postgres.ts';
-import { LATEST_VERSION } from '../executor/store/migrations.ts';
+import { loadHubConfig } from '../hub/config.ts';
+import { openSql } from '../store/sql.ts';
+import { applyMigrations, currentVersion, pendingVersions } from '../store/migrate.ts';
+import { CONTROL_MIGRATIONS } from '../control/store/migrations.ts';
+import { MIGRATIONS as ENGINE_MIGRATIONS } from '../executor/store/migrations.ts';
+import { HUB_MIGRATIONS } from '../hub/history-migrations.ts';
 import { resolveBashPath } from '../executor/engine/shell.ts';
-import { run } from '../util/subprocess.ts';
+import { loadConfig, type GlobalOptions } from './common.ts';
+import { commandExists } from '../util/subprocess.ts';
 
 type Level = 'ok' | 'warn' | 'fail';
 
@@ -20,158 +25,195 @@ interface Check {
   name: string;
   level: Level;
   detail: string;
-  /** What the operator should do about it. */
+  /** What to do about it. Omitted when there is nothing to do. */
   fix?: string;
 }
 
-async function which(cmd: string, args: string[] = ['--version']): Promise<string | null> {
-  try {
-    const res = await run([cmd, ...args], { timeoutMs: 10_000 });
-    if (res.exitCode !== 0) return null;
-    return (res.stdout || res.stderr).split(/\r?\n/)[0]?.trim() ?? '';
-  } catch {
-    return null;
-  }
-}
+export async function runDoctor(opts: GlobalOptions & { json?: boolean } = {}): Promise<void> {
+  const checks: Check[] = [];
 
-async function checkBash(): Promise<Check> {
-  const resolved = resolveBashPath();
-  if (!resolved) {
-    return {
-      name: 'bash',
+  // ── config ──────────────────────────────────────────────────────────────
+  let cfg;
+  try {
+    cfg = loadConfig(opts);
+    checks.push({ name: 'config', level: 'ok', detail: 'WORKFLOW.md parsed' });
+  } catch (err) {
+    // loadConfig exits on a missing file, so reaching here means invalid content.
+    checks.push({
+      name: 'config',
       level: 'fail',
-      detail: 'not found on PATH',
-      fix:
-        process.platform === 'win32'
-          ? 'Install Git for Windows (which ships Git Bash) and ensure bash.exe is on PATH. ' +
-            'Workflow `bash:` and `script:` nodes cannot run without it.'
-          : 'Install bash. Workflow `bash:` and `script:` nodes cannot run without it.',
-    };
-  }
-  const version = await which(resolved, ['--version']);
-  return {
-    name: 'bash',
-    level: 'ok',
-    detail: `${resolved}${version ? ` — ${version}` : ''}`,
-  };
-}
-
-async function checkGit(): Promise<Check> {
-  const v = await which('git');
-  return v
-    ? { name: 'git', level: 'ok', detail: v }
-    : {
-        name: 'git',
-        level: 'fail',
-        detail: 'not found on PATH',
-        fix: 'Install git. Worktree isolation and repo syncing both require it.',
-      };
-}
-
-async function checkGh(): Promise<Check> {
-  const v = await which('gh');
-  return v
-    ? { name: 'gh', level: 'ok', detail: v }
-    : {
-        name: 'gh',
-        level: 'warn',
-        detail: 'not found on PATH',
-        fix:
-          'Install the GitHub CLI. Without it, worktree cleanup cannot tell whether a branch ' +
-          'still backs an open PR, and conservatively preserves every worktree.',
-      };
-}
-
-async function checkDatabase(databaseUrl: string): Promise<Check[]> {
-  if (!databaseUrl) {
-    return [
-      {
-        name: 'postgres',
-        level: 'fail',
-        detail: 'executor.database_url is empty',
-        fix:
-          'Set DATABASE_URL, or executor.database_url in WORKFLOW.md. ' +
-          '`docker compose up -d` starts a local Postgres on port 55432.',
-      },
-    ];
+      detail: (err as Error).message,
+      fix: 'Fix the front matter in WORKFLOW.md',
+    });
+    report(checks, opts.json);
+    return;
   }
 
-  let store: PostgresStore | null = null;
-  try {
-    store = new PostgresStore(databaseUrl, { maxConnections: 2 });
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const sql = (store as any).sql;
-    const rows = (await sql.unsafe('SELECT version() AS v')) as { v: string }[];
-    const banner = rows[0]?.v?.split(',')[0] ?? 'connected';
-
-    const applied = (await sql.unsafe(
-      `SELECT COALESCE(MAX(version), 0) AS v FROM schema_migrations`,
-    ).catch(() => [{ v: 0 }])) as { v: number }[];
-    const at = Number(applied[0]?.v ?? 0);
-
-    const checks: Check[] = [{ name: 'postgres', level: 'ok', detail: banner }];
+  // ── external tools ──────────────────────────────────────────────────────
+  for (const [tool, why] of [
+    ['git', 'worktrees and branch operations'],
+    ['gh', 'PR creation and merge detection'],
+  ] as const) {
     checks.push(
-      at === LATEST_VERSION
-        ? { name: 'schema', level: 'ok', detail: `at version ${at}` }
+      (await commandExists(tool))
+        ? { name: tool, level: 'ok', detail: `on PATH (${why})` }
+        : { name: tool, level: 'fail', detail: `not on PATH — needed for ${why}`, fix: `Install ${tool}` },
+    );
+  }
+
+  // Checked separately from git and gh because it is resolved, not just found:
+  // on Windows the engine looks for Git Bash in the places Git for Windows
+  // installs it, not only on PATH. Without it every `bash:` node fails — and it
+  // fails at node twelve of eighteen, long after the run looked healthy.
+  const bash = resolveBashPath();
+  checks.push(
+    bash
+      ? { name: 'bash', level: 'ok', detail: `${bash} (workflow bash: nodes)` }
+      : {
+          name: 'bash',
+          level: 'fail',
+          detail: 'no bash found — every `bash:` workflow node will fail',
+          fix:
+            process.platform === 'win32'
+              ? 'Install Git for Windows (it ships Git Bash), or set executor.bash_path'
+              : 'Install bash, or set executor.bash_path',
+        },
+  );
+
+  // ── database ────────────────────────────────────────────────────────────
+  if (!cfg.database.url) {
+    checks.push({
+      name: 'database',
+      level: 'fail',
+      detail: 'no connection string configured',
+      fix: 'Set DATABASE_URL, or database.url in WORKFLOW.md, then run `docker compose up -d`',
+    });
+  } else {
+    const sql = openSql(cfg.database.url);
+    try {
+      const rows = (await sql`SELECT current_database() AS db, version() AS v`) as Array<{
+        db: string;
+        v: string;
+      }>;
+      const server = String(rows[0]?.v ?? '').split(' ').slice(0, 2).join(' ');
+      checks.push({
+        name: 'database',
+        level: 'ok',
+        detail: `connected to ${rows[0]?.db} (${server})`,
+      });
+
+      // All three owners share one database and one schema_migrations table, so
+      // checking a single set would report "current" while another owner's
+      // tables are missing entirely.
+      const all = [...ENGINE_MIGRATIONS, ...CONTROL_MIGRATIONS, ...HUB_MIGRATIONS];
+      const pending = await pendingVersions(sql, all);
+      const applied = await currentVersion(sql);
+      checks.push(
+        pending.length === 0
+          ? { name: 'migrations', level: 'ok', detail: `schema current (at ${applied})` }
+          : {
+              name: 'migrations',
+              level: 'warn',
+              detail: `${pending.length} migration(s) pending: ${pending.join(', ')}`,
+              fix: 'They apply automatically on `gaggle start`',
+            },
+      );
+    } catch (err) {
+      checks.push({
+        name: 'database',
+        level: 'fail',
+        detail: (err as Error).message,
+        fix: 'Start Postgres with `docker compose up -d`, then check database.url',
+      });
+    } finally {
+      await sql.close().catch(() => {});
+    }
+  }
+
+  // ── dashboard exposure ──────────────────────────────────────────────────
+  // The board can start agents that write code and open PRs, and there is no
+  // authentication in front of it. Loopback is the only thing protecting it.
+  try {
+    const hub = loadHubConfig();
+    const host = hub.ui.host ?? '127.0.0.1';
+    const loopback = host === '127.0.0.1' || host === 'localhost' || host === '::1';
+    checks.push(
+      loopback
+        ? { name: 'dashboard', level: 'ok', detail: `bound to ${host} (loopback)` }
         : {
-            name: 'schema',
+            name: 'dashboard',
             level: 'warn',
-            detail: `at version ${at}, latest is ${LATEST_VERSION}`,
-            fix: 'Run `gaggle db migrate` (or start the orchestrator — it migrates on boot).',
+            detail: `bound to ${host} — the board can dispatch work and has no authentication`,
+            fix: 'Set ui.host to 127.0.0.1, or put an authenticating proxy in front of it',
           },
     );
-    return checks;
-  } catch (err) {
-    return [
-      {
-        name: 'postgres',
-        level: 'fail',
-        detail: (err as Error).message.split('\n')[0] ?? 'connection failed',
-        fix: '`docker compose up -d` starts a local Postgres on port 55432.',
-      },
-    ];
-  } finally {
-    await store?.close().catch(() => {});
+  } catch {
+    checks.push({ name: 'dashboard', level: 'ok', detail: 'no nest config yet' });
   }
+
+  // ── tracker credentials ─────────────────────────────────────────────────
+  const hasKey = cfg.tracker.auth.mode === 'oauth' || Boolean(cfg.tracker.api_key);
+  checks.push(
+    hasKey
+      ? { name: 'tracker', level: 'ok', detail: `${cfg.tracker.kind} auth via ${cfg.tracker.auth.mode}` }
+      : {
+          name: 'tracker',
+          level: 'fail',
+          detail: 'no tracker credentials — tickets cannot be imported',
+          fix: 'Set LINEAR_API_KEY, or run `gaggle auth linear`',
+        },
+  );
+
+  report(checks, opts.json);
 }
 
-const MARK: Record<Level, string> = {
-  ok: chalk.green('✓'),
-  warn: chalk.yellow('!'),
-  fail: chalk.red('✗'),
-};
-
-export async function runDoctor(opts: GlobalOptions & { json?: boolean } = {}): Promise<void> {
-  const cfg = loadConfig(opts);
-
-  const checks: Check[] = [
-    ...(await Promise.all([checkBash(), checkGit(), checkGh()])),
-    ...(await checkDatabase(cfg.executor.database_url)),
-  ];
-
-  if (opts.json) {
+function report(checks: Check[], json?: boolean): void {
+  if (json) {
     console.log(JSON.stringify({ checks }, null, 2));
   } else {
-    console.log(chalk.bold('gaggle doctor\n'));
     for (const c of checks) {
-      console.log(`  ${MARK[c.level]} ${c.name.padEnd(10)} ${c.detail}`);
-      if (c.fix && c.level !== 'ok') console.log(chalk.gray(`      ${c.fix}`));
+      const mark = c.level === 'ok' ? chalk.green('✓') : c.level === 'warn' ? chalk.yellow('⚠') : chalk.red('✗');
+      console.log(`  ${mark} ${chalk.bold(c.name.padEnd(11))} ${c.detail}`);
+      if (c.fix && c.level !== 'ok') console.log(`    ${chalk.dim('→ ' + c.fix)}`);
     }
+    const failed = checks.filter((c) => c.level === 'fail').length;
+    const warned = checks.filter((c) => c.level === 'warn').length;
     console.log();
+    console.log(
+      failed > 0
+        ? chalk.red(`${failed} check(s) failed`)
+        : warned > 0
+          ? chalk.yellow(`All required checks passed, ${warned} warning(s)`)
+          : chalk.green('All checks passed'),
+    );
   }
-
-  // Warnings are survivable; a failed check means a workflow would break.
-  if (checks.some((c) => c.level === 'fail')) process.exit(1);
+  if (checks.some((c) => c.level === 'fail')) process.exitCode = 1;
 }
 
-/** `gaggle db migrate` — apply pending migrations and report the version. */
+/**
+ * `gaggle db migrate` — apply every pending migration, from every owner.
+ *
+ * Explicit because `gaggle start` migrating on boot is convenient but opaque:
+ * when a deploy needs the schema moved first, an operator wants a command that
+ * does only that and says what it did. All three sets go through one
+ * advisory-locked run, so this is safe to invoke while other processes start.
+ */
 export async function runDbMigrate(opts: GlobalOptions = {}): Promise<void> {
   const cfg = loadConfig(opts);
-  const store = new PostgresStore(cfg.executor.database_url, { maxConnections: 2 });
+  const sql = openSql(cfg.database.url);
   try {
-    await store.migrate();
-    console.log(chalk.green(`✓ schema at version ${LATEST_VERSION}`));
+    const before = await currentVersion(sql);
+    const applied = await applyMigrations(sql, [
+      ...ENGINE_MIGRATIONS,
+      ...CONTROL_MIGRATIONS,
+      ...HUB_MIGRATIONS,
+    ]);
+    console.log(
+      applied.length === 0
+        ? chalk.green(`✓ schema already current (at ${before})`)
+        : chalk.green(`✓ applied ${applied.length} migration(s): ${applied.join(', ')}`),
+    );
   } finally {
-    await store.close();
+    await sql.close().catch(() => {});
   }
 }

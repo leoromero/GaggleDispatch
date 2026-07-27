@@ -550,9 +550,7 @@ ${approvalExtra}
     expect(await statusOf(exec, handle.run_id)).toBe('paused');
 
     await exec.approve(handle.run_id, 'looks good');
-    await Bun.sleep(150);
-
-    expect(await statusOf(exec, handle.run_id)).toBe('completed');
+    await until(async () => (await statusOf(exec, handle.run_id)) === 'completed');
     expect((await nodeMap(exec, handle.run_id)).build!.status).toBe('completed');
   });
 
@@ -575,9 +573,7 @@ nodes:
     const handle = await exec.startRun({ workflow: 'gatecap', cwd: repo, message: 'm' }, () => {});
     await handle.done;
     await exec.approve(handle.run_id, 'use REST not GraphQL');
-    await Bun.sleep(150);
-
-    expect(seen.at(-1)!.prompt).toContain('human said: use REST not GraphQL');
+    await until(async () => (seen.at(-1)?.prompt ?? '').includes('human said: use REST not GraphQL'));
   });
 
   test('without capture_response the comment is not injected', async () => {
@@ -589,8 +585,7 @@ nodes:
     const handle = await exec.startRun({ workflow: 'gatenocap', cwd: repo, message: 'm' }, () => {});
     await handle.done;
     await exec.approve(handle.run_id, 'some comment');
-    await Bun.sleep(150);
-    expect(seen.at(-1)!.prompt).toContain('said:[]');
+    await until(async () => (seen.at(-1)?.prompt ?? '').includes('said:[]'));
   });
 
   test('rejecting without on_reject cancels the run', async () => {
@@ -600,7 +595,7 @@ nodes:
     await handle.done;
 
     await exec.reject(handle.run_id, 'plan misses tests');
-    await Bun.sleep(150);
+    await until(async () => (await statusOf(exec, handle.run_id)) === 'cancelled');
 
     const run = (await exec.getRun(handle.run_id))!;
     expect(run.status).toBe('cancelled');
@@ -622,7 +617,7 @@ nodes:
     await handle.done;
 
     await exec.reject(handle.run_id, 'needs more detail');
-    await Bun.sleep(200);
+    await until(async () => (await statusOf(exec, handle.run_id)) === 'paused');
 
     // The rework prompt ran with the reason substituted...
     expect(seen.some((s) => s.prompt.includes('revise given: needs more detail'))).toBe(true);
@@ -980,7 +975,7 @@ describe('the at_most_once recovery gate', () => {
     });
 
     await exec.reject(handle.run_id, 'it already published');
-    await Bun.sleep(250);
+    await until(async () => (await statusOf(exec, handle.run_id)) === 'cancelled');
 
     const run = (await exec.getRun(handle.run_id))!;
     expect(run.status).toBe('cancelled');
@@ -1008,8 +1003,7 @@ describe('the at_most_once recovery gate', () => {
     });
 
     await exec.approve(handle.run_id, 'it never got that far');
-    await Bun.sleep(250);
-    expect(await statusOf(exec, handle.run_id)).toBe('completed');
+    await until(async () => (await statusOf(exec, handle.run_id)) === 'completed');
   });
 });
 

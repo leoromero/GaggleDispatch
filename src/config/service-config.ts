@@ -9,10 +9,11 @@ import { dirname, isAbsolute, join, resolve } from 'node:path';
 import { ConfigValidationError } from '../domain/errors.ts';
 import { applyEnvFile } from '../util/env-file.ts';
 import type {
-  ExecutorConfig,
   AgentConfig,
   AuthConfig,
   ClaudeConfig,
+  DatabaseConfig,
+  ExecutorConfig,
   HooksConfig,
   PollingConfig,
   RegistryConfig,
@@ -25,6 +26,7 @@ import type {
   WorkspaceConfig,
 } from '../domain/types.ts';
 import { validateRedirectUri } from '../tracker/linear-oauth.ts';
+import { logger } from '../util/logger.ts';
 import { expandEnvString, expandPath, isInside } from '../util/paths.ts';
 
 function asObject(v: unknown, name: string): Record<string, unknown> {
@@ -218,6 +220,10 @@ export function buildServiceConfig(def: WorkflowDefinition): ServiceConfig {
     pr_ready_state: asOptionalString(trackerRaw.pr_ready_state, 'tracker.pr_ready_state'),
     gaggle_labels,
     auth: parseAuthConfig(trackerRaw.auth),
+    // Off by default: the control plane is the state machine, so labels are a
+    // courtesy for humans reading the tracker, not an input.
+    mirror_labels: asBool(trackerRaw.mirror_labels, 'tracker.mirror_labels', false),
+    outbox_max_attempts: asPositiveInt(trackerRaw.outbox_max_attempts, 'tracker.outbox_max_attempts', 5),
   };
 
   // ── polling ──────────────────────────────────────────────────────────────
@@ -258,26 +264,50 @@ export function buildServiceConfig(def: WorkflowDefinition): ServiceConfig {
   };
 
   // ── executor ─────────────────────────────────────────────────────────────
+  // `executor:` is the name; `archon:` is still accepted as a deprecated alias.
+  //
+  // The block describes *the executor*, which is now the in-house engine. The
+  // four Archon transport settings (command, api_url, poll_interval_ms,
+  // turn_timeout_ms) are gone with it — nothing reads them. Everything that
+  // remains is policy, and kept its name across the swap, so a WORKFLOW.md
+  // written against Archon still parses; it just warns.
+  const executorRaw = asObject(root.executor, 'executor');
+  const archonRaw = asObject(root.archon, 'archon');
   if (root.archon !== undefined) {
-    throw new ConfigValidationError(
-      'The `archon:` config block was removed. Rename it to `executor:` — GaggleDispatch now runs workflows itself.',
+    logger.warn(
+      'The `archon:` config block is deprecated — rename it to `executor:`. Its transport settings ' +
+        '(command, api_url, poll_interval_ms, turn_timeout_ms) are no longer read: GaggleDispatch runs workflows itself.',
     );
   }
-  const execRaw = asObject(root.executor, 'executor');
+  /** Prefer `executor:`, fall back to the deprecated `archon:`. */
+  const exec = (key: string): unknown => executorRaw[key] ?? archonRaw[key];
   const executor: ExecutorConfig = {
-    database_url: resolveSecretOrLiteral(
-      asOptionalString(execRaw.database_url, 'executor.database_url') ?? '$DATABASE_URL',
-    ),
-    default_workflow: asString(execRaw.default_workflow, 'executor.default_workflow', 'gaggle/gaggle-fix-issue'),
-    max_run_duration_ms: asPositiveInt(execRaw.max_run_duration_ms, 'executor.max_run_duration_ms', 3_600_000),
-    node_idle_timeout_ms: asPositiveInt(execRaw.node_idle_timeout_ms, 'executor.node_idle_timeout_ms', 300_000),
-    bash_timeout_ms: asPositiveInt(execRaw.bash_timeout_ms, 'executor.bash_timeout_ms', 120_000),
-    stall_timeout_ms: asInt(execRaw.stall_timeout_ms, 'executor.stall_timeout_ms', 300_000),
-    gate_timeout_ms: asInt(execRaw.gate_timeout_ms, 'executor.gate_timeout_ms', 0),
-    startup_cleanup_age_days: asInt(execRaw.startup_cleanup_age_days, 'executor.startup_cleanup_age_days', 7),
-    /** Heartbeat cadence for the run lease. Must be well under the lease TTL. */
-    lease_heartbeat_ms: asPositiveInt(execRaw.lease_heartbeat_ms, 'executor.lease_heartbeat_ms', 15_000),
-    lease_ttl_ms: asPositiveInt(execRaw.lease_ttl_ms, 'executor.lease_ttl_ms', 60_000),
+    default_workflow: asString(exec('default_workflow'), 'executor.default_workflow', 'gaggle/gaggle-fix-issue'),
+    stall_timeout_ms: asInt(exec('stall_timeout_ms'), 'executor.stall_timeout_ms', 300_000),
+    gate_timeout_ms: asInt(exec('gate_timeout_ms'), 'executor.gate_timeout_ms', 0),
+    startup_cleanup_age_days: asInt(exec('startup_cleanup_age_days'), 'executor.startup_cleanup_age_days', 7),
+    // Engine timings. Idle and bash timeouts bound a single node; the run
+    // duration bounds the whole graph; the lease pair is what lets another
+    // process tell a live run from an abandoned one.
+    max_run_duration_ms: asPositiveInt(exec('max_run_duration_ms'), 'executor.max_run_duration_ms', 3_600_000),
+    node_idle_timeout_ms: asPositiveInt(exec('node_idle_timeout_ms'), 'executor.node_idle_timeout_ms', 300_000),
+    bash_timeout_ms: asPositiveInt(exec('bash_timeout_ms'), 'executor.bash_timeout_ms', 120_000),
+    lease_heartbeat_ms: asPositiveInt(exec('lease_heartbeat_ms'), 'executor.lease_heartbeat_ms', 15_000),
+    lease_ttl_ms: asPositiveInt(exec('lease_ttl_ms'), 'executor.lease_ttl_ms', 60_000),
+  };
+
+  // ── database ─────────────────────────────────────────────────────────────
+  // One key names the shared database. `executor.database_url` is accepted as an
+  // alias because the workflow-engine branch introduced that name; whichever the
+  // operator has written, every half resolves to the same connection.
+  const databaseRaw = asObject(root.database, 'database');
+  const databaseUrlRaw =
+    asOptionalString(databaseRaw.url, 'database.url') ??
+    asOptionalString(executorRaw.database_url, 'executor.database_url') ??
+    '$DATABASE_URL';
+  const database: DatabaseConfig = {
+    url: resolveSecretOrLiteral(databaseUrlRaw),
+    max_connections: asInt(databaseRaw.max_connections, 'database.max_connections', 0),
   };
 
   // ── claude ───────────────────────────────────────────────────────────────
@@ -373,6 +403,7 @@ export function buildServiceConfig(def: WorkflowDefinition): ServiceConfig {
     hooks,
     agent,
     executor,
+    database,
     claude,
     workflow_templates,
     registry,

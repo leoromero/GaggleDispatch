@@ -10,6 +10,7 @@
 import { SQL } from 'bun';
 import { logger } from '../../util/logger.ts';
 import { LATEST_VERSION, MIGRATIONS } from './migrations.ts';
+import { applyMigrations } from '../../store/migrate.ts';
 import type {
   ApprovalDecision,
   ApprovalRow,
@@ -17,7 +18,6 @@ import type {
   EventRow,
   LoopIterationRow,
   NodeRow,
-  RetryRow,
   RunQuery,
   RunRow,
   ScaffoldJobRow,
@@ -137,19 +137,6 @@ function mapWorktree(r: Row): WorktreeRow {
   };
 }
 
-function mapRetry(r: Row): RetryRow {
-  return {
-    worker_key: String(r.worker_key),
-    parent_issue_id: String(r.parent_issue_id),
-    sub_issue_id: (r.sub_issue_id as string) ?? null,
-    repo_alias: String(r.repo_alias),
-    attempt: Number(r.attempt ?? 0),
-    due_at: isoRequired(r.due_at),
-    reason: (r.reason as string) ?? null,
-    updated_at: isoRequired(r.updated_at),
-  };
-}
-
 function mapScaffold(r: Row): ScaffoldJobRow {
   return {
     slug: String(r.slug),
@@ -187,7 +174,7 @@ export class PostgresStore implements Store {
   constructor(databaseUrl: string, opts: { maxConnections?: number } = {}) {
     if (!databaseUrl) {
       throw new Error(
-        'executor.database_url is empty. Set DATABASE_URL (see docker-compose.yml) or executor.database_url in WORKFLOW.md.',
+        'No database URL. Set DATABASE_URL (see docker-compose.yml) or database.url in WORKFLOW.md.',
       );
     }
     // A modest pool on purpose. The engine's concurrency is bounded by
@@ -202,27 +189,19 @@ export class PostgresStore implements Store {
 
   // ── migrations ────────────────────────────────────────────────────────────
 
+  /**
+   * Apply the engine's migrations.
+   *
+   * Delegates to the shared runner rather than looping here: the database is
+   * shared with the control plane and hub history, `gaggle nest start` migrates
+   * from several processes at once, and the runner holds a transaction-scoped
+   * advisory lock across the whole run. The loop this replaced read the applied
+   * set outside any lock and died inside `CREATE TABLE` when two processes
+   * raced a virgin database.
+   */
   async migrate(): Promise<void> {
-    await this.sql`
-      CREATE TABLE IF NOT EXISTS schema_migrations (
-        version    INT PRIMARY KEY,
-        name       TEXT NOT NULL,
-        applied_at TIMESTAMPTZ NOT NULL DEFAULT now()
-      )`;
-
-    const applied = (await this.sql`SELECT version FROM schema_migrations`) as Row[];
-    const have = new Set(applied.map((r) => Number(r.version)));
-
-    for (const m of [...MIGRATIONS].sort((a, b) => a.version - b.version)) {
-      if (have.has(m.version)) continue;
-      logger.info('Applying migration', { version: m.version, name: m.name });
-      // Each migration is atomic: a partially-applied schema is worse than none.
-      await this.sql.begin(async (tx: SQL) => {
-        await tx.unsafe(m.sql);
-        await tx`INSERT INTO schema_migrations (version, name) VALUES (${m.version}, ${m.name})`;
-      });
-    }
-    logger.debug('Schema up to date', { version: LATEST_VERSION });
+    await applyMigrations(this.sql as never, MIGRATIONS);
+    logger.debug('Engine schema up to date', { version: LATEST_VERSION });
   }
 
   // ── runs ──────────────────────────────────────────────────────────────────
@@ -553,37 +532,6 @@ export class PostgresStore implements Store {
   }
 
   // -- retry schedule --------------------------------------------------------
-
-  async upsertRetry(row: Omit<RetryRow, 'updated_at'>): Promise<void> {
-    await this.sql`
-      INSERT INTO retry_schedule
-        (worker_key, parent_issue_id, sub_issue_id, repo_alias, attempt, due_at, reason)
-      VALUES (${row.worker_key}, ${row.parent_issue_id}, ${row.sub_issue_id},
-              ${row.repo_alias}, ${row.attempt}, ${row.due_at}, ${row.reason})
-      ON CONFLICT (worker_key) DO UPDATE SET
-        parent_issue_id = excluded.parent_issue_id,
-        sub_issue_id    = excluded.sub_issue_id,
-        repo_alias      = excluded.repo_alias,
-        attempt         = excluded.attempt,
-        due_at          = excluded.due_at,
-        reason          = excluded.reason,
-        updated_at      = now()`;
-  }
-
-  async getRetry(workerKey: string): Promise<RetryRow | null> {
-    const rows = (await this.sql`
-      SELECT * FROM retry_schedule WHERE worker_key = ${workerKey}`) as Row[];
-    return rows[0] ? mapRetry(rows[0]) : null;
-  }
-
-  async deleteRetry(workerKey: string): Promise<void> {
-    await this.sql`DELETE FROM retry_schedule WHERE worker_key = ${workerKey}`;
-  }
-
-  async listRetries(): Promise<RetryRow[]> {
-    const rows = (await this.sql`SELECT * FROM retry_schedule ORDER BY due_at`) as Row[];
-    return rows.map(mapRetry);
-  }
 
   // -- analysis cache --------------------------------------------------------
 

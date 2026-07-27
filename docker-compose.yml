@@ -7,7 +7,7 @@
 # developer already runs locally.
 #
 # The `gaggle_test` database backs the store conformance suite:
-#   TEST_DATABASE_URL=postgres://gaggle:gaggle@localhost:55432/gaggle_exec_test bun test
+#   TEST_DATABASE_URL=postgres://gaggle:gaggle@localhost:55432/gaggle_test bun test
 
 services:
   postgres:

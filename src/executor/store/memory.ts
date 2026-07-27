@@ -20,7 +20,6 @@ import type {
   EventRow,
   LoopIterationRow,
   NodeRow,
-  RetryRow,
   RunQuery,
   RunRow,
   ScaffoldJobRow,
@@ -50,7 +49,6 @@ export class MemoryStore implements Store {
   private events: EventRow[] = [];
   private approvals = new Map<string, ApprovalRow>();
   private worktrees = new Map<string, WorktreeRow>(); // key(repo_slug, branch)
-  private retries = new Map<string, RetryRow>();
   private analyses = new Map<string, unknown>();
   private scaffolds = new Map<string, ScaffoldJobRow>();
   private syncedRepos: SyncedRepoRow[] = [];
@@ -344,25 +342,6 @@ export class MemoryStore implements Store {
   }
 
   // -- retry schedule --------------------------------------------------------
-
-  async upsertRetry(row: Omit<RetryRow, 'updated_at'>): Promise<void> {
-    this.retries.set(row.worker_key, { ...clone(row), updated_at: nowIso() });
-  }
-
-  async getRetry(workerKey: string): Promise<RetryRow | null> {
-    const r = this.retries.get(workerKey);
-    return r ? clone(r) : null;
-  }
-
-  async deleteRetry(workerKey: string): Promise<void> {
-    this.retries.delete(workerKey);
-  }
-
-  async listRetries(): Promise<RetryRow[]> {
-    return [...this.retries.values()]
-      .sort((a, b) => Date.parse(a.due_at) - Date.parse(b.due_at))
-      .map(clone);
-  }
 
   // -- analysis cache --------------------------------------------------------
 

@@ -180,12 +180,22 @@ program
     await runStatus({ cwd: program.opts().cwd, json: opts.json });
   });
 
+// ── doctor ──────────────────────────────────────────────────────────────────
+program
+  .command('doctor')
+  .description('Check prerequisites: database, migrations, external tools, dashboard exposure')
+  .option('--json', 'machine-readable output')
+  .action(async (opts: { json?: boolean }) => {
+    await runDoctor({ cwd: program.opts().cwd, json: opts.json });
+  });
+
 // ── ps ──────────────────────────────────────────────────────────────────────
 program
   .command('ps')
-  .description('Show live orchestrator state by querying Linear gaggle labels')
-  .action(async () => {
-    await runPs({ cwd: program.opts().cwd });
+  .description('Show what the control plane is working on')
+  .option('--json', 'machine-readable output')
+  .action(async (opts: { json?: boolean }) => {
+    await runPs({ cwd: program.opts().cwd, json: opts.json });
   });
 
 // ── templates ───────────────────────────────────────────────────────────────

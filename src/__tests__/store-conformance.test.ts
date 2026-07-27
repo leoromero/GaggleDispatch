@@ -7,7 +7,7 @@
  * confirmation that the real driver agrees.
  *
  *   docker compose up -d
- *   TEST_DATABASE_URL=postgres://gaggle:gaggle@localhost:5433/gaggle_exec_test bun test store-conformance
+ *   TEST_DATABASE_URL=postgres://gaggle:gaggle@localhost:55432/gaggle_test bun test store-conformance
  */
 
 import { describe, expect, test, beforeEach, afterAll } from 'bun:test';
@@ -15,6 +15,9 @@ import { randomUUID } from 'node:crypto';
 import { MemoryStore } from '../executor/store/memory.ts';
 import { PostgresStore } from '../executor/store/postgres.ts';
 import type { CreateRunInput, Store } from '../executor/store/types.ts';
+import { applyMigrations } from '../store/migrate.ts';
+import { CONTROL_MIGRATIONS } from '../control/store/migrations.ts';
+import { HUB_MIGRATIONS } from '../hub/history-migrations.ts';
 
 const PG_URL = process.env.TEST_DATABASE_URL ?? '';
 
@@ -419,43 +422,6 @@ function suite(name: string, getStore: () => Promise<Store>) {
       expect(await store.findRunByExternalKey('')).toBeNull();
     });
 
-    // ── retry schedule ──────────────────────────────────────────────────────
-
-    const retry = (over: Record<string, unknown> = {}) => ({
-      worker_key: 'ISS-1__api',
-      parent_issue_id: 'ISS-1',
-      sub_issue_id: null,
-      repo_alias: 'api',
-      attempt: 2,
-      due_at: new Date(Date.now() + 60_000).toISOString(),
-      reason: 'transient failure',
-      ...over,
-    });
-
-    test('a retry round-trips and upserts in place', async () => {
-      await store.upsertRetry(retry());
-      const got = await store.getRetry('ISS-1__api');
-      expect(got?.attempt).toBe(2);
-      expect(got?.reason).toBe('transient failure');
-
-      await store.upsertRetry(retry({ attempt: 3, reason: 'still failing' }));
-      expect((await store.listRetries())).toHaveLength(1);
-      expect((await store.getRetry('ISS-1__api'))?.attempt).toBe(3);
-    });
-
-    test('retries list in due order', async () => {
-      await store.upsertRetry(retry({ worker_key: 'later', due_at: new Date(Date.now() + 90_000).toISOString() }));
-      await store.upsertRetry(retry({ worker_key: 'sooner', due_at: new Date(Date.now() + 10_000).toISOString() }));
-      expect((await store.listRetries()).map((r) => r.worker_key)).toEqual(['sooner', 'later']);
-    });
-
-    test('a retry can be deleted, and deleting an absent one is a no-op', async () => {
-      await store.upsertRetry(retry());
-      await store.deleteRetry('ISS-1__api');
-      expect(await store.getRetry('ISS-1__api')).toBeNull();
-      await store.deleteRetry('never-existed');
-    });
-
     // ── analysis cache ──────────────────────────────────────────────────────
 
     test('an analysis round-trips as a structured value', async () => {
@@ -637,7 +603,14 @@ if (PG_URL) {
   suite('PostgresStore', async () => {
     if (!pg) {
       pg = new PostgresStore(PG_URL, { maxConnections: 5 });
+      // Every owner, the way `gaggle start` does it. The engine's own slice is
+      // versions 1–99, but it reads and writes `scaffold_jobs`, which the
+      // control plane creates — migrating only the engine set would leave the
+      // store pointed at a table that does not exist.
       await pg.migrate();
+      const sqlForMigrate = (pg as unknown as { sql: never }).sql;
+      await applyMigrations(sqlForMigrate, CONTROL_MIGRATIONS);
+      await applyMigrations(sqlForMigrate, HUB_MIGRATIONS);
     }
     // DELETE rather than TRUNCATE: TRUNCATE takes an ACCESS EXCLUSIVE lock and
     // blocks behind any other pooled connection, turning a flake into a hang.
@@ -648,7 +621,6 @@ if (PG_URL) {
     // between tests.
     for (const table of [
       'worktrees',
-      'retry_schedule',
       'issue_analyses',
       'scaffold_jobs',
       'synced_repos',

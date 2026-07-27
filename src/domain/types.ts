@@ -90,6 +90,20 @@ export interface TrackerConfig {
   pr_ready_state: string | null;
   gaggle_labels: GaggleLabels;
   auth: AuthConfig;
+  /**
+   * Mirror `gaggle_labels` onto tracker issues as work progresses.
+   *
+   * One-way and off by default. The control plane in Postgres is the state
+   * machine; when this is on the labels exist purely so the team can see activity
+   * in the tracker. Nothing in the codebase reads a gaggle label to make a
+   * decision — turning this off changes what the team sees, never what runs.
+   */
+  mirror_labels: boolean;
+  /**
+   * Attempts before a queued tracker write is dropped with an error log. A
+   * permanently-failing write must not block work.
+   */
+  outbox_max_attempts: number;
 }
 
 export interface PollingConfig {
@@ -113,9 +127,16 @@ export interface AgentConfig {
   max_concurrent_agents_by_state: Record<string, number>;
 }
 
+/**
+ * Whatever is executing workflows for us.
+ *
+ * Named for the role, not the implementation. The transport half of this used
+ * to describe how to reach Archon; the engine runs in-process, so the fields
+ * that remain are policy — decisions about how long we let a node sit idle, a
+ * graph run, or a human think — plus the lease timings that let one process
+ * tell a live run from an abandoned one.
+ */
 export interface ExecutorConfig {
-  /** Postgres connection string. Defaults to `$DATABASE_URL`. */
-  database_url: string;
   /** Workflow dispatched when a repo's gaggle.md declares none. */
   default_workflow: string;
   /** Hard ceiling on a single run's wall-clock time. Default: 1 h. */
@@ -131,7 +152,9 @@ export interface ExecutorConfig {
   /**
    * If > 0, sweep worktrees idle for more than N days once at orchestrator
    * startup, per registered repo — catching abandoned, cancelled, and orphaned
-   * ones. Worktrees backing an open PR are always preserved.
+   * ones in one pass. Worktrees backing an open PR are always preserved, and
+   * the per-run `after_run` hook handles merged branches continuously; this
+   * complements it for the long tail.
    * Set to 0 to disable. Default: 7.
    */
   startup_cleanup_age_days: number;
@@ -139,6 +162,22 @@ export interface ExecutorConfig {
   lease_heartbeat_ms: number;
   /** A run whose lease is older than this is considered crashed and reclaimable. */
   lease_ttl_ms: number;
+}
+
+/**
+ * The shared PostgreSQL database.
+ *
+ * One database serves both the control plane (tickets, targets, audit trail,
+ * tracker outbox — migrations 100–199) and the workflow engine (runs, nodes,
+ * approvals — migrations 1–99). Disjoint migration ranges over one
+ * `schema_migrations` table let each apply its own schema without knowing about
+ * the other; see `src/store/migrate.ts`.
+ */
+export interface DatabaseConfig {
+  /** Connection string. Defaults to `$DATABASE_URL`. */
+  url: string;
+  /** Pool ceiling. Zero leaves the driver's default in place. */
+  max_connections: number;
 }
 
 export interface ClaudeConfig {
@@ -182,6 +221,7 @@ export interface ServiceConfig {
   hooks: HooksConfig;
   agent: AgentConfig;
   executor: ExecutorConfig;
+  database: DatabaseConfig;
   claude: ClaudeConfig;
   workflow_templates: WorkflowTemplatesConfig;
   registry: RegistryConfig;
@@ -281,52 +321,13 @@ export interface IssueAnalysis {
   complexity?: 'simple' | 'complex';
 }
 
-export interface CachedAnalysis {
-  analysis: IssueAnalysis;
-  cached_at: number;
-}
-
-export interface FailedTargetInfo {
-  issue: Issue;
-  repo_target: RepoTarget;
-  reason: string | null;
-  failed_at: number; // unix ms
-}
-
-export interface FailedTargetSummary {
-  issue_id: string;
-  issue_identifier: string;
-  issue_title: string;
-  repo_alias: string;
-  reason: string | null;
-  failed_at: number; // unix ms
-}
-
-// ─── 4.1.7 Run Attempt ──────────────────────────────────────────────────────
-export type RunStatus =
-  | 'PreparingWorkspace'
-  | 'CloningRepository'
-  | 'BuildingPrompt'
-  | 'LaunchingRun'
-  | 'StreamingWorkflow'
-  | 'Finishing'
-  | 'Succeeded'
-  | 'Failed'
-  | 'TimedOut'
-  | 'Stalled'
-  | 'CanceledByReconciliation';
-
-export interface RunAttempt {
-  issue_id: string;
-  issue_identifier: string;
-  repo_alias: string;
-  workflow: string;
-  attempt: number | null;
-  checkout_path: string;
-  started_at: string;
-  status: RunStatus;
-  error?: string;
-}
+// Types that modelled in-memory authority over durable facts are gone with the
+// maps that held them: CachedAnalysis, FailedTargetInfo, FailedTargetSummary,
+// RunStatus, RunAttempt, RetryEntry, SupervisedGateEntry, DetachedArchonRun.
+// Each is now a column or a row in the control plane — a failed target is a
+// ticket_targets row with status 'failed', an open gate is one with
+// status 'gate_waiting', and there is no retry entry because there is no
+// retry timer.
 
 // ─── 4.1.8 Live Session Metadata ────────────────────────────────────────────
 export interface LiveSession {
@@ -356,89 +357,28 @@ export interface LiveSession {
   started_at: string;
   attempt: number | null;
   cancel?: () => void;
-  /** Stops the RunPoller when the session ends. */
-  stopPoller?: () => void;
-}
-
-// ─── 4.1.10 Retry Entry ─────────────────────────────────────────────────────
-export interface RetryEntry {
-  issue_id: string;
-  identifier: string;
-  repo_alias: string;
-  repo_target: RepoTarget;
-  issue: Issue;
-  attempt: number;
-  due_at_ms: number;
-  timer_handle: ReturnType<typeof setTimeout> | null;
-  error: string | null;
-}
-
-// ─── Supervised Gate Entry ──────────────────────────────────────────────────
-export interface SupervisedGateEntry {
-  run_id: string | null;
-  issue_id: string;
-  issue: Issue;
-  repo_alias: string;
-  repo_target: RepoTarget;
-  sub_issue_id: string | null;
-  paused_at: number;
-  gate_message: string;
-  comment_id: string | null;
-  gate_state_applied: boolean;
-  attempt: number | null;
-}
-
-/**
- * A sub-issue whose run was found still alive (or paused) at startup.
- * Its events went to a process that no longer exists, so it is tracked here
- * and followed by polling the store until it settles.
- */
-export interface DetachedRun {
-  /** Engine run id. */
-  run_id: string;
-  parent_issue: Issue;
-  sub_issue_id: string | null;
-  repo_alias: string;
-  repo_target: RepoTarget;
-  recovered_at: number;
 }
 
 // ─── 4.1.11 Orchestrator Runtime State ──────────────────────────────────────
+
+/**
+ * What the orchestrator keeps in memory: live-worker telemetry, and nothing else.
+ *
+ * Every map that used to live here — pending targets, supervised gates, retry
+ * timers, the analysis cache, sibling sub-issue lookups, the two state-machine
+ * status maps — was in-memory authority over durable facts, which is exactly why
+ * a restart had to reconstruct it by reading `gaggle:*` labels back off the
+ * tracker. Those facts now live in Postgres and are read from there.
+ *
+ * What genuinely belongs in memory is what dies with the process anyway: the
+ * subprocess handle, its pid, its recent output, its token counters. That is a
+ * feed for the dashboard's Workers panel, not state anything decides on.
+ */
 export interface OrchestratorState {
   poll_interval_ms: number;
   max_concurrent_agents: number;
+  /** Live workers this process owns, keyed by target id. */
   running: Map<string, LiveSession>;
-  pending_targets: Map<string, RepoTarget[]>;
-  pending_issues: Map<string, Issue>;
-  supervised_gates: Map<string, SupervisedGateEntry>;
-  retry_attempts: Map<string, RetryEntry>;
-  analysis_cache: Map<string, CachedAnalysis>;
-  sibling_subissues: Map<string, Map<string, string>>;
-  sibling_subissue_urls: Map<string, Map<string, string>>;
-  subissue_snapshot: Map<string, { state: string; labels: string[]; refreshed_at: number }>;
-  /**
-   * Sub-issues whose run was found still alive at startup recovery.
-   * Keyed by workerKey (parentId__repoAlias). Polled each reconcile tick.
-   */
-  detached_runs: Map<string, DetachedRun>;
-  /**
-   * Per-target state machine state, keyed by workerKey. Updated after every
-   * targetTransition call via Orchestrator.emitTargetEvent. Phase 5 will
-   * migrate `claimed` / `completed` / parts of `running` consumers to read
-   * from this map instead of the legacy sets.
-   */
-  target_machine_states: Map<string, 'queued' | 'dispatching' | 'running' | 'gate_waiting' | 'retrying' | 'succeeded' | 'failed'>;
-  /**
-   * Per-parent state machine state, keyed by parent issue id. Updated after
-   * every parentTransition call.
-   */
-  parent_machine_states: Map<string, 'unclaimed' | 'analyzing' | 'claimed' | 'done' | 'cancelled'>;
-  /**
-   * In-memory record of currently-failed targets. Keyed by workerKey.
-   * Written when a target enters `failed`, cleared on retry or terminal.
-   * Reason is null after restart (see Linear comment for full context).
-   */
-  failed_targets: Map<string, FailedTargetInfo>;
   claude_totals: { input_tokens: number; output_tokens: number; total_tokens: number; seconds_running: number };
 }
 

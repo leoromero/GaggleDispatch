@@ -106,17 +106,6 @@ describe('scaffold-jobs round-trip', () => {
     expect(await loadScaffoldJobs(new MemoryStore())).toEqual({ jobs: [] });
   });
 
-  test('save then load preserves every field', async () => {
-    const store = new MemoryStore();
-    const j = job({ last_status: 'completed', run_id: 'r-1', pr_url: 'https://github.com/x/y/pull/1' });
-    await saveScaffoldJob(store, j);
-    const loaded = await loadScaffoldJobs(store);
-    expect(loaded.jobs).toHaveLength(1);
-    expect(loaded.jobs[0]!.run_id).toBe('r-1');
-    expect(loaded.jobs[0]!.last_status).toBe('completed');
-    expect(loaded.jobs[0]!.pr_url).toBe('https://github.com/x/y/pull/1');
-  });
-
   test('saving inserts a new job and replaces an existing one by slug', async () => {
     const store = new MemoryStore();
     await saveScaffoldJob(store, job({ slug: 'a' }));

@@ -12,8 +12,9 @@ import { extname, join } from 'node:path';
 import type { Server, ServerWebSocket } from 'bun';
 import type { HubConfig } from './config.ts';
 import { HubProcessManager } from './process-manager.ts';
-import { HistoryDb } from './history.ts';
-import { PostgresStore } from '../executor/store/postgres.ts';
+import type { HistoryStore } from './history.ts';
+import type { ControlApi } from '../control/api.ts';
+import { crossSiteWrite } from './cross-site.ts';
 import { logger } from '../util/logger.ts';
 
 interface DashWsData {
@@ -47,6 +48,20 @@ export interface HubServerOptions {
   cfg: HubConfig;
   manager: HubProcessManager;
   dashboardDir: string;
+  /**
+   * The control plane's read/intent half.
+   *
+   * Optional so the hub still starts without a database — the dashboard then
+   * serves everything except the board, and `/api/control/*` answers 503 rather
+   * than failing to boot. That matters because losing the board should not cost
+   * you the process controls you need to fix it.
+   */
+  control?: ControlApi | null;
+  /**
+   * Log-history store. Optional for the same reason as `control`: the nest is
+   * still worth running without it.
+   */
+  history?: HistoryStore | null;
 }
 
 export interface HubServerHandle {
@@ -54,29 +69,39 @@ export interface HubServerHandle {
   stop: () => Promise<void>;
 }
 
-export async function startHubServer(opts: HubServerOptions): Promise<HubServerHandle> {
-  const databaseUrl = opts.cfg.database_url || process.env.DATABASE_URL || '';
-  const store = new PostgresStore(databaseUrl, { maxConnections: 5 });
-  await store.migrate();
-  const db = new HistoryDb(store);
+export function startHubServer(opts: HubServerOptions): HubServerHandle {
+  const db = opts.history ?? null;
 
-  // Ensure every configured workspace is recorded.
+  // Workspace row ids, resolved in the background. History is optional, so the
+  // server must come up whether or not the database answers.
   const wsRowByName = new Map<string, number>();
-  for (const w of opts.cfg.workspaces) {
-    const row = await db.upsertWorkspace(w.name, w.path, w.color ?? null);
-    wsRowByName.set(w.name, row.id);
+  if (db) {
+    void (async () => {
+      for (const w of opts.cfg.workspaces) {
+        try {
+          const row = await db.upsertWorkspace(w.name, w.path, w.color ?? null);
+          wsRowByName.set(w.name, row.id);
+        } catch (e) {
+          logger.warn('Could not register workspace for history', {
+            workspace: w.name,
+            error: (e as Error).message,
+          });
+        }
+      }
+    })();
   }
 
   // Periodic log retention pass.
   const pruneTimer = setInterval(() => {
-    void (async () => {
-      try {
-        const removed = await db.pruneOldLogs();
+    if (!db) return;
+    void db
+      .pruneOldLogs()
+      .then((removed) => {
         if (removed > 0) logger.debug('Pruned old log events', { removed });
-      } catch (e) {
-        logger.warn('Log retention pass failed', { error: (e as Error).message });
-      }
-    })();
+      })
+      .catch((e: Error) => {
+        logger.warn('Log retention pass failed', { error: e.message });
+      });
   }, 60 * 60 * 1000);
 
   // Dashboard clients (websocket subscribers).
@@ -116,10 +141,11 @@ export async function startHubServer(opts: HubServerOptions): Promise<HubServerH
 
   function recordLog(workspaceName: string, ev: { ts: string; level: string; message: string; context: Record<string, unknown> }): void {
     const wsId = wsRowByName.get(workspaceName);
-    if (!wsId) return;
-    void (async () => {
-      try {
-      await db.appendLog({
+    if (!db || !wsId) return;
+    // Fire and forget: a log event that fails to persist must never delay the
+    // broadcast that puts it in front of the operator.
+    void db
+      .appendLog({
         workspace_id: wsId,
         ts: ev.ts,
         level: ev.level,
@@ -128,49 +154,16 @@ export async function startHubServer(opts: HubServerOptions): Promise<HubServerH
         issue_id: (ev.context?.issue_id as string) ?? null,
         repo_alias: (ev.context?.repo_alias as string) ?? null,
         fields: ev.context ?? null,
+      })
+      .catch((e: Error) => {
+        logger.warn('Failed to persist log event', { error: e.message });
       });
-      } catch (e) {
-        logger.warn('Failed to persist log event', { error: (e as Error).message });
-      }
-    })();
   }
 
-  function diffGates(workspaceName: string, state: { supervised_gates?: Array<{ worker_key: string; issue_id: string; repo_alias: string; run_id: string | null; gate_message: string; paused_at: number }> }): void {
-    const wsId = wsRowByName.get(workspaceName);
-    if (!wsId) return;
-    const gates = state.supervised_gates ?? [];
-    if (!openGates.has(workspaceName)) openGates.set(workspaceName, new Map());
-    const known = openGates.get(workspaceName)!;
-    const seen = new Set<string>();
-    for (const g of gates) {
-      seen.add(g.worker_key);
-      if (!known.has(g.worker_key)) {
-        const paused_at = new Date(g.paused_at).toISOString();
-        known.set(g.worker_key, { paused_at, message: g.gate_message });
-        void db
-          .recordGate({
-            workspace_id: wsId,
-            issue_id: g.issue_id,
-            repo_alias: g.repo_alias,
-            run_id: g.run_id,
-            action: 'paused',
-            gate_message: g.gate_message,
-            paused_at,
-          })
-          .catch((e) => {
-            logger.warn('Failed to persist gate event', { error: (e as Error).message });
-          });
-      }
-    }
-    // Any previously known gate that disappeared is considered resolved.
-    for (const [workerKey] of known) {
-      if (!seen.has(workerKey)) {
-        known.delete(workerKey);
-        // Resolution action/run_id is not visible here without more state;
-        // recording a generic 'approved' would be wrong. We just drop tracking.
-      }
-    }
-  }
+  // `diffGates` lived here. It inferred gate history by watching gates appear and
+  // disappear in state snapshots, and could not tell how one had resolved — the
+  // original comment said as much. `control_events` records the resolution, the
+  // actor, and the comment, so there is nothing left to infer.
 
   // Hook child gaggle streams: forward all events to dashboard clients +
   // persist logs / gate transitions.
@@ -197,7 +190,6 @@ export async function startHubServer(opts: HubServerOptions): Promise<HubServerH
             };
             broadcast({ type: 'log', event: out });
           } else if (e.type === 'state' && e.state) {
-            diffGates(workspaceName, e.state as never);
             const out: AggregateStateEvent = { workspace: workspaceName, state: e.state };
             broadcast({ type: 'state', event: out });
           }
@@ -233,11 +225,57 @@ export async function startHubServer(opts: HubServerOptions): Promise<HubServerH
     hostname: opts.cfg.ui.host ?? '127.0.0.1',
     async fetch(req, srv) {
       const url = new URL(req.url);
+      // Before routing, so it covers the process controls too — those start and
+      // stop daemons, which is no less consequential than the board's verbs.
+      if (crossSiteWrite(req)) {
+        return Response.json({ error: 'cross-site requests are not accepted' }, { status: 403 });
+      }
       if (url.pathname === '/api/ws') {
         const id = nextClientId++;
         const ok = srv.upgrade(req, { data: { id } });
         if (ok) return undefined;
         return new Response('upgrade failed', { status: 400 });
+      }
+      // ── control plane: the board, and operator actions ──────────────────
+      if (url.pathname.startsWith('/api/control/')) {
+        if (!opts.control) {
+          return Response.json(
+            { error: 'the control plane is not configured — check database.url and run `gaggle doctor`' },
+            { status: 503 },
+          );
+        }
+        let body: unknown;
+        if (req.method === 'POST' || req.method === 'PATCH') {
+          const raw = await req.text();
+          if (raw.length > 0) {
+            try {
+              body = JSON.parse(raw);
+            } catch {
+              return Response.json({ error: 'invalid JSON body' }, { status: 400 });
+            }
+          }
+        }
+        try {
+          const res = await opts.control.handle({
+            method: req.method,
+            path: url.pathname.slice('/api/control'.length) || '/',
+            query: Object.fromEntries(url.searchParams),
+            body,
+          });
+          if (res.status < 300 && req.method !== 'GET') {
+            // An operator action moved something; nudge the dashboard rather than
+            // making it wait for the next poll.
+            broadcast({ type: 'control-changed' });
+          }
+          return Response.json(res.body, { status: res.status });
+        } catch (err) {
+          logger.error('Control API error', {
+            method: req.method,
+            path: url.pathname,
+            error: (err as Error).message,
+          });
+          return Response.json({ error: (err as Error).message }, { status: 500 });
+        }
       }
       if (url.pathname === '/api/gaggles') {
         const list = opts.manager.list().map((w) => ({
@@ -317,41 +355,30 @@ export async function startHubServer(opts: HubServerOptions): Promise<HubServerH
         const states = await opts.manager.fetchAllStates();
         return Response.json({ states });
       }
-      if (url.pathname === '/api/history/runs') {
-        const wsName = url.searchParams.get('workspace');
-        const limit = Number(url.searchParams.get('limit') ?? 50);
-        const wsId = wsName ? wsRowByName.get(wsName) ?? null : null;
-        return Response.json({ runs: await db.recentRuns(wsId, limit) });
-      }
+      // Run and gate history are served from the control plane now:
+      // `/api/control/tickets/:id` carries a target's full event timeline, with
+      // statuses that are recorded rather than inferred.
       if (url.pathname === '/api/history/logs') {
+        if (!db) return Response.json({ logs: [] });
         const wsName = url.searchParams.get('workspace');
-        const wsId = wsName ? wsRowByName.get(wsName) : undefined;
-        const since = url.searchParams.get('since') ?? undefined;
-        const level = url.searchParams.get('level') ?? undefined;
-        const issue = url.searchParams.get('issue') ?? undefined;
-        const repo = url.searchParams.get('repo') ?? undefined;
-        const limit = Number(url.searchParams.get('limit') ?? 200);
         return Response.json({
           logs: await db.queryLogs({
-            workspace_id: wsId,
-            since,
-            level,
-            issue_id: issue,
-            repo_alias: repo,
-            limit,
+            workspace_id: wsName ? wsRowByName.get(wsName) : undefined,
+            since: url.searchParams.get('since') ?? undefined,
+            level: url.searchParams.get('level') ?? undefined,
+            issue_id: url.searchParams.get('issue') ?? undefined,
+            repo_alias: url.searchParams.get('repo') ?? undefined,
+            limit: Number(url.searchParams.get('limit') ?? 200),
           }),
         });
       }
-      if (url.pathname === '/api/history/gates') {
-        const wsName = url.searchParams.get('workspace');
-        const wsId = wsName ? wsRowByName.get(wsName) ?? null : null;
-        return Response.json({ gates: await db.recentGateEvents(wsId, 50) });
-      }
       if (url.pathname === '/api/history/tokens') {
+        if (!db) return Response.json({ tokens: [] });
         const wsName = url.searchParams.get('workspace');
         const wsId = wsName ? wsRowByName.get(wsName) ?? null : null;
-        const days = Number(url.searchParams.get('days') ?? 30);
-        return Response.json({ tokens: await db.tokenHistory(wsId, days) });
+        return Response.json({
+          tokens: await db.tokenHistory(wsId, Number(url.searchParams.get('days') ?? 30)),
+        });
       }
       return serveStatic(url.pathname);
     },
@@ -389,8 +416,7 @@ export async function startHubServer(opts: HubServerOptions): Promise<HubServerH
         }
       }
       server.stop(true);
-      db.close();
-      void store.close();
+      await db?.close();
     },
   };
 }

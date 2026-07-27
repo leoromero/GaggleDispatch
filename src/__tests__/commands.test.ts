@@ -174,13 +174,12 @@ describe('the shipped templates resolve every command they reference', () => {
 // ── worker identity round-trip ──────────────────────────────────────────────
 
 describe('the worker key reaches the run row', () => {
-  test('startRun stamps external_key and worker metadata, and allRunLinks reads them back', async () => {
+  test('startRun stamps external_key and worker metadata, and the run is findable by it', async () => {
     // This is the seam that replaced gaggle-runs.json. If the worker stops
     // passing the key, recovery silently finds nothing — tests that seed the
     // store directly would still pass, so this asserts the real path.
     const { MemoryStore } = await import('../executor/store/memory.ts');
     const { GaggleExecutor } = await import('../executor/engine/index.ts');
-    const { allRunLinks, readRunLink } = await import('../registry/run-registry.ts');
 
     const dir = mkdtempSync(join(tmpdir(), 'gaggle-link-'));
     try {
@@ -212,18 +211,20 @@ describe('the worker key reaches the run row', () => {
         () => {},
       );
 
-      // Readable while the run is live.
-      const link = await readRunLink(store, 'p1__trialmatch-be');
-      expect(link?.run_id).toBe(handle.run_id);
-      expect(link?.sub_issue_id).toBe('sub-be');
-      expect((await allRunLinks(store))['p1__trialmatch-be']?.parent_issue_id).toBe('p1');
+      // The key is on the run, so finding the run again is a query.
+      const found = await store.findRunByExternalKey('p1__trialmatch-be');
+      expect(found?.id).toBe(handle.run_id);
+      const worker = found?.metadata.worker as { parent_issue_id?: string; sub_issue_id?: string } | undefined;
+      expect(worker?.parent_issue_id).toBe('p1');
+      expect(worker?.sub_issue_id).toBe('sub-be');
 
       await handle.done;
 
-      // Once the run finishes the link is gone — the run's own status is the
-      // truth, so there is no stale entry to prune.
-      expect(await readRunLink(store, 'p1__trialmatch-be')).toBeNull();
-      expect(await allRunLinks(store)).toEqual({});
+      // Still findable after it finishes: the row *is* the record, so there is
+      // no separate link to go stale, and the run's own status says it is done.
+      const after = await store.findRunByExternalKey('p1__trialmatch-be');
+      expect(after?.id).toBe(handle.run_id);
+      expect(after?.status).toBe('completed');
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }

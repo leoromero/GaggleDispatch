@@ -136,17 +136,6 @@ export interface CreateRunInput {
 
 // ─── Registry rows ──────────────────────────────────────────────────────────
 
-export interface RetryRow {
-  worker_key: string;
-  parent_issue_id: string;
-  sub_issue_id: string | null;
-  repo_alias: string;
-  attempt: number;
-  due_at: string;
-  reason: string | null;
-  updated_at: string;
-}
-
 export interface ScaffoldJobRow {
   slug: string;
   url: string;
@@ -293,12 +282,6 @@ export interface Store {
   // run lookup by caller identity
   /** Most recent run stamped with this external key, whatever its status. */
   findRunByExternalKey(externalKey: string): Promise<RunRow | null>;
-
-  // retry schedule
-  upsertRetry(row: Omit<RetryRow, 'updated_at'>): Promise<void>;
-  getRetry(workerKey: string): Promise<RetryRow | null>;
-  deleteRetry(workerKey: string): Promise<void>;
-  listRetries(): Promise<RetryRow[]>;
 
   // analysis cache
   saveAnalysis(issueId: string, analysis: unknown): Promise<void>;

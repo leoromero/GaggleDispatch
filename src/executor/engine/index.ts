@@ -376,12 +376,17 @@ export class GaggleExecutor implements WorkflowExecutor {
   }
 
   /**
-   * Resume a gate decision while streaming events to a listener. Used by the
-   * orchestrator, which wants the resumed run's events on its own session.
+   * Answer a gate and resume, streaming the resumed run's events to a listener.
+   *
+   * Rejection needs this as much as approval does. A rejected gate is not the
+   * end of the run: `on_reject` runs its rework prompt and parks at the same
+   * gate again, so a caller that only watched approvals would never hear about
+   * the second question and the target would sit in `running` forever.
    */
-  async approveAndWatch(
+  async decideAndWatch(
     runId: string,
-    comment: string | undefined,
+    decision: 'approved' | 'rejected',
+    comment: string | null,
     onEvent: RunEventHandler,
   ): Promise<RunHandle | null> {
     const pending = await this.store.getPendingApproval(runId);
@@ -389,11 +394,11 @@ export class GaggleExecutor implements WorkflowExecutor {
     // Prepare first, decide second — see `decide()` for why.
     const { runner } = await this.prepareResume(runId, onEvent, {}, {
       node_id: pending.node_id,
-      decision: 'approved',
-      comment: comment ?? null,
+      decision,
+      comment,
       rework_attempts: pending.rework_attempts,
     });
-    const decided = await this.store.decideApproval(pending.id, 'approved', comment ?? null);
+    const decided = await this.store.decideApproval(pending.id, decision, comment);
     if (!decided) {
       // Another surface answered first; that resume owns the run.
       logger.warn('Gate was already decided elsewhere — not resuming again', {
@@ -402,8 +407,17 @@ export class GaggleExecutor implements WorkflowExecutor {
       });
       return null;
     }
-    await this.store.appendEvent(runId, 'gate_approved', pending.node_id, { comment });
+    await this.store.appendEvent(runId, `gate_${decision}`, pending.node_id, { comment });
     return this.launch(runId, runner);
+  }
+
+  /** {@link decideAndWatch} for the approval case. */
+  approveAndWatch(
+    runId: string,
+    comment: string | undefined,
+    onEvent: RunEventHandler,
+  ): Promise<RunHandle | null> {
+    return this.decideAndWatch(runId, 'approved', comment ?? null, onEvent);
   }
 
   // ── termination ───────────────────────────────────────────────────────────

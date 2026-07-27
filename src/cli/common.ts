@@ -56,7 +56,7 @@ export async function withStore<T>(
   cfg: ServiceConfig,
   fn: (store: PostgresStore) => Promise<T>,
 ): Promise<T> {
-  const store = new PostgresStore(cfg.executor.database_url, { maxConnections: 3 });
+  const store = new PostgresStore(cfg.database.url, { maxConnections: 3 });
   try {
     await store.migrate();
     return await fn(store);

@@ -103,7 +103,7 @@ export async function runRepoScaffold(args: ScaffoldArgs): Promise<void> {
     info(`Synced ${copied} workflow template(s) to ${targetDir}`);
   }
 
-  const store = new PostgresStore(cfg.executor.database_url, { maxConnections: 3 });
+  const store = new PostgresStore(cfg.database.url, { maxConnections: 3 });
   await store.migrate();
   const executor = new GaggleExecutor({
     store,
@@ -185,7 +185,7 @@ export async function runScaffoldStatus(opts: { cwd?: string; json?: boolean; re
 
   // Run ids are recorded at launch, so status is a direct lookup rather than
   // the working-path-and-timestamp matching the CLI used to need.
-  const store = new PostgresStore(cfg.executor.database_url, { maxConnections: 2 });
+  const store = new PostgresStore(cfg.database.url, { maxConnections: 2 });
   const executor = new GaggleExecutor({
     store,
     artifactsRoot: join(baseFolder, 'artifacts'),

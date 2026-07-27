@@ -17,6 +17,10 @@ import { HubProcessManager, resolveCliEntry } from '../hub/process-manager.ts';
 import { startHubServer } from '../hub/server.ts';
 import { logger } from '../util/logger.ts';
 import { readSidecar, isPidAlive } from '../hub/sidecar.ts';
+import { openControlReadPlane } from '../control/index.ts';
+import { openHistoryStore, type HistoryStore } from '../hub/history.ts';
+import type { ControlApi } from '../control/api.ts';
+import { loadConfig } from './common.ts';
 
 export async function runNestInit(): Promise<void> {
   const path = defaultHubConfigPath();
@@ -133,9 +137,29 @@ export async function runNestStart(opts: { only?: string[] }): Promise<void> {
     await manager.startWorkspace(w);
   }
 
+  // Open the control plane's read/intent half so the dashboard can serve the
+  // board and record operator actions. A missing or unreachable database is not
+  // fatal: the nest still gives you process controls and logs, and the board
+  // reports 503 until it is fixed. Losing the board should not cost you the tools
+  // you need to fix it.
+  const control = await openHubControlPlane(manager);
+  if (control) {
+    console.log(chalk.green('✓ Control plane connected'));
+  } else {
+    console.log(
+      chalk.yellow('⚠ Control plane unavailable — the ticket board will be empty. Run `gaggle doctor`.'),
+    );
+  }
+
   // Start hub server.
   const dashboardDir = resolveDashboardDir();
-  const hub = await startHubServer({ cfg, manager, dashboardDir });
+  const hub = startHubServer({
+    cfg,
+    manager,
+    dashboardDir,
+    control: control?.api ?? null,
+    history: control?.history ?? null,
+  });
   console.log(chalk.green(`✓ Nest dashboard at ${hub.url}`));
 
   let shuttingDown = false;
@@ -145,6 +169,7 @@ export async function runNestStart(opts: { only?: string[] }): Promise<void> {
     console.log(chalk.yellow(`\nReceived ${signal}, shutting down nest…`));
     try {
       await hub.stop();
+      await control?.close();
     } catch (e) {
       logger.warn('Hub stop error', { error: (e as Error).message });
     }
@@ -157,6 +182,71 @@ export async function runNestStart(opts: { only?: string[] }): Promise<void> {
   };
   process.on('SIGINT', () => void shutdown('SIGINT'));
   process.on('SIGTERM', () => void shutdown('SIGTERM'));
+}
+
+/**
+ * Open the control plane for the hub, or return null with a reason logged.
+ *
+ * The hub is user-global while `ServiceConfig` is per-workspace, so the database
+ * URL is read from the first managed workspace's config. That is sound because
+ * every workspace shares one database by design — if two workspaces disagreed
+ * about the URL they would be separate boards, which the `workspace` column
+ * exists to avoid.
+ *
+ * Every failure here returns null rather than throwing: the nest's job is to give
+ * you process controls and logs, and those are exactly what you need when the
+ * database is the thing that is broken. Exported so the degradation paths can be
+ * tested without standing up a hub.
+ */
+export async function openHubControlPlane(
+  manager: HubProcessManager,
+): Promise<{ api: ControlApi; history: HistoryStore | null; close: () => Promise<void> } | null> {
+  const first = manager.list()[0]?.entry;
+  if (!first) {
+    logger.info('No workspaces configured; skipping the control plane');
+    return null;
+  }
+  // `loadConfig` calls `fatal()` — which exits — when WORKFLOW.md is missing.
+  // The hub must degrade rather than die, so check first.
+  if (!existsSync(join(first.path, 'WORKFLOW.md'))) {
+    logger.warn('First workspace has no WORKFLOW.md; the ticket board will be unavailable', {
+      workspace: first.name,
+    });
+    return null;
+  }
+  try {
+    const cfg = loadConfig({ cwd: first.path });
+    if (!cfg.database.url) {
+      logger.warn('No database.url configured; the ticket board will be unavailable');
+      return null;
+    }
+    const plane = await openControlReadPlane({
+      cfg,
+      // Sync needs the tracker credentials the daemon holds, so it is proxied to
+      // whichever gaggle owns the workspace rather than run here.
+      requestSync: async (workspace) => {
+        const target = workspace
+          ? manager.get(workspace)
+          : manager.list().find((w) => w.api_url);
+        if (!target?.api_url) throw new Error('no running gaggle to sync with');
+        const res = await fetch(`${target.api_url}/sync`, { method: 'POST' });
+        if (!res.ok) throw new Error(`sync failed: HTTP ${res.status}`);
+        return res.json();
+      },
+    });
+    const history = await openHistoryStore(cfg.database.url);
+    return {
+      api: plane.api,
+      history,
+      close: async () => {
+        await plane.close();
+        await history?.close();
+      },
+    };
+  } catch (err) {
+    logger.warn('Could not open the control plane', { error: (err as Error).message });
+    return null;
+  }
 }
 
 function resolveDashboardDir(): string {

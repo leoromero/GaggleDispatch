@@ -121,6 +121,8 @@ export function makeServiceConfig(overrides: Partial<ServiceConfig> = {}): Servi
         redirect_uri: '',
         scopes: [],
       },
+      mirror_labels: false,
+      outbox_max_attempts: 5,
     },
     polling: { interval_ms: 30_000 },
     workspace: { root: '/tmp/aux' },
@@ -132,7 +134,6 @@ export function makeServiceConfig(overrides: Partial<ServiceConfig> = {}): Servi
       max_concurrent_agents_by_state: {},
     },
     executor: {
-      database_url: '',
       default_workflow: 'gaggle/gaggle-fix-issue',
       max_run_duration_ms: 60_000,
       node_idle_timeout_ms: 30_000,
@@ -143,6 +144,7 @@ export function makeServiceConfig(overrides: Partial<ServiceConfig> = {}): Servi
       lease_heartbeat_ms: 15_000,
       lease_ttl_ms: 60_000,
     },
+    database: { url: '', max_connections: 0 },
     claude: {
       api_key: '',
       analyzer_model: 'claude-sonnet-4-5',
