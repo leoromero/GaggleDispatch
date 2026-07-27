@@ -94,6 +94,15 @@ export interface OrchestratorDeps {
 /** Cadence for following a run this process did not start. */
 const POLL_INTERVAL_MS = 5_000;
 
+/**
+ * How far back startup recovery looks when matching Linear labels to runs.
+ *
+ * Recovery is about what was in flight when the process stopped, so recent
+ * history is the whole question; scanning every run ever recorded to answer
+ * it gets slower every week the deployment stays up.
+ */
+const RECOVERY_RUN_SCAN_LIMIT = 500;
+
 export class Orchestrator {
   private state: OrchestratorState;
   private cfg: ServiceConfig;
@@ -1542,6 +1551,16 @@ export class Orchestrator {
       }
     }
 
+    // The run is over for real — a gate pause returned above. This is the one
+    // place both paths converge (a fresh worker and a resumed one), so it is
+    // where the after_run hook belongs. Best-effort: a failing hook must not
+    // stop the issue from being marked.
+    try {
+      await this.workspace.runHook('after_run', target, issue, attempt);
+    } catch {
+      /* logged inside runHook */
+    }
+
     // Choose the SM event. `run_succeeded` without a run id means the
     // process never emitted workflow_starting → treat as a failure so we retry.
     let smEvent: TargetEvent;
@@ -1966,8 +1985,15 @@ export class Orchestrator {
     // cannot re-attach to). Check if they have since completed, failed, or paused.
     // NOTE: this block must run even when state.running is empty (the typical post-crash case).
     if (this.state.detached_runs.size > 0) {
-      const freshRuns = await this.executorClient.listRuns();
-      const freshById = new Map<string, RunRecord>(freshRuns.map((r) => [r.id, r]));
+      // By id, not by listing everything: this runs on every tick, and the
+      // number of detached runs is small while the run table only grows.
+      const freshById = new Map<string, RunRecord>();
+      await Promise.all(
+        [...this.state.detached_runs.values()].map(async (d) => {
+          const run = await this.executorClient.getRun(d.run_id);
+          if (run) freshById.set(run.id, run);
+        }),
+      );
 
       for (const [key, det] of [...this.state.detached_runs]) {
         const run = freshById.get(det.run_id);
@@ -2098,7 +2124,7 @@ export class Orchestrator {
       this.tracker.fetchIssuesByLabel(this.cfg.tracker.gaggle_labels.queued),
       this.tracker.fetchIssuesByLabel(this.cfg.tracker.gaggle_labels.waiting_human),
       this.tracker.fetchIssuesByLabel(this.cfg.tracker.gaggle_labels.retrying),
-      this.executorClient.listRuns(),
+      this.executorClient.listRuns(undefined, RECOVERY_RUN_SCAN_LIMIT),
     ]);
     const persistedRunIds = await allRunLinks(this.store);
     const persistedRetries = await allRetryEntries(this.store);

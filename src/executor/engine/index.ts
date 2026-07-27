@@ -351,7 +351,16 @@ export class GaggleExecutor implements WorkflowExecutor {
       rework_attempts: pending.rework_attempts,
     });
 
-    await this.store.decideApproval(pending.id, decision, comment);
+    // The store refuses a second decision on the same gate, and says so by
+    // returning null. Launching anyway would put two runners on one run.
+    const decided = await this.store.decideApproval(pending.id, decision, comment);
+    if (!decided) {
+      logger.warn('Gate was already decided elsewhere — not resuming again', {
+        run_id: runId,
+        node_id: pending.node_id,
+      });
+      return;
+    }
     await this.store.appendEvent(runId, `gate_${decision}`, pending.node_id, { comment });
 
     const handle = this.launch(runId, prepared.runner);
@@ -384,7 +393,15 @@ export class GaggleExecutor implements WorkflowExecutor {
       comment: comment ?? null,
       rework_attempts: pending.rework_attempts,
     });
-    await this.store.decideApproval(pending.id, 'approved', comment ?? null);
+    const decided = await this.store.decideApproval(pending.id, 'approved', comment ?? null);
+    if (!decided) {
+      // Another surface answered first; that resume owns the run.
+      logger.warn('Gate was already decided elsewhere — not resuming again', {
+        run_id: runId,
+        node_id: pending.node_id,
+      });
+      return null;
+    }
     await this.store.appendEvent(runId, 'gate_approved', pending.node_id, { comment });
     return this.launch(runId, runner);
   }

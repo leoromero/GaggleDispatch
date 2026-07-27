@@ -198,6 +198,58 @@ function suite(name: string, getStore: () => Promise<Store>) {
       expect(n?.claude_session_id).toBe('sess-1');
     });
 
+    test('upsertNode does not downgrade side_effects on a partial write', async () => {
+      // The most dangerous divergence available: silently turning an
+      // at_most_once node back into an idempotent one removes the marker that
+      // stops recovery re-opening a pull request.
+      const input = runInput();
+      await store.createRun(input);
+      await store.upsertNode({
+        run_id: input.id, node_id: 'create-pr', node_type: 'prompt',
+        status: 'running', side_effects: 'at_most_once',
+      });
+      await store.upsertNode({
+        run_id: input.id, node_id: 'create-pr', node_type: 'prompt', status: 'completed',
+      });
+      expect((await store.getNode(input.id, 'create-pr'))!.side_effects).toBe('at_most_once');
+    });
+
+    test('upsertNode does not reset token counts on a partial write', async () => {
+      const input = runInput();
+      await store.createRun(input);
+      await store.upsertNode({
+        run_id: input.id, node_id: 'n', node_type: 'prompt', status: 'completed',
+        input_tokens: 120, output_tokens: 45,
+      });
+      await store.upsertNode({
+        run_id: input.id, node_id: 'n', node_type: 'prompt', status: 'completed',
+        completed_at: new Date().toISOString(),
+      });
+      const n = (await store.getNode(input.id, 'n'))!;
+      expect(n.input_tokens).toBe(120);
+      expect(n.output_tokens).toBe(45);
+    });
+
+    test('output_json round-trips arrays and scalars, not just objects', async () => {
+      // `$node.output.field` only needs objects, but a model told to answer
+      // with a list or a bare string produces neither — and losing that to
+      // null is a silent wrong answer downstream.
+      const input = runInput();
+      await store.createRun(input);
+      for (const [nodeId, value] of [
+        ['arr', [1, 2, 3]],
+        ['str', 'plain'],
+        ['num', 42],
+        ['bool', true],
+      ] as Array<[string, unknown]>) {
+        await store.upsertNode({
+          run_id: input.id, node_id: nodeId, node_type: 'prompt',
+          status: 'completed', output_json: value,
+        });
+        expect((await store.getNode(input.id, nodeId))!.output_json, nodeId).toEqual(value);
+      }
+    });
+
     test('upsertNode keeps the original started_at', async () => {
       const input = runInput();
       await store.createRun(input);

@@ -730,6 +730,55 @@ describe('cancellation', () => {
   });
 });
 
+describe('concurrent gate decisions', () => {
+  const gateWf = `name: gate
+description: d
+nodes:
+  - id: g
+    approval:
+      message: "ok?"
+  - id: after
+    depends_on: [g]
+    prompt: "go"
+`;
+
+  test('only one decision resumes the run', async () => {
+    // Two surfaces can answer the same gate — a Linear comment and the CLI.
+    // The store refuses the second decision; ignoring that answer would put
+    // two runners on one run.
+    writeWorkflow('gate', gateWf);
+    let afterRuns = 0;
+    const exec = makeExecutor(async (req) => {
+      if (req.prompt.includes('go')) afterRuns += 1;
+      return {
+        text: 'ok', sessionId: null, inputTokens: 0, outputTokens: 0,
+        timedOut: false, cancelled: false,
+      } as AiResult;
+    });
+    const handle = await exec.startRun({ workflow: 'gate', cwd: repo, message: 'm' }, () => {});
+    await handle.done;
+
+    await Promise.all([exec.approve(handle.run_id, 'yes'), exec.approve(handle.run_id, 'also yes')]);
+    await until(async () => (await exec.getRun(handle.run_id))!.status === 'completed');
+    await Bun.sleep(100); // let a second runner, if one started, do its damage
+
+    expect(afterRuns).toBe(1);
+  });
+
+  test('approveAndWatch reports the race rather than resuming twice', async () => {
+    writeWorkflow('gate', gateWf);
+    const exec = makeExecutor(stubAi([{ when: always, reply: { text: 'ok' } }]));
+    const handle = await exec.startRun({ workflow: 'gate', cwd: repo, message: 'm' }, () => {});
+    await handle.done;
+
+    const [first, second] = await Promise.all([
+      exec.approveAndWatch(handle.run_id, 'yes', () => {}),
+      exec.approveAndWatch(handle.run_id, 'yes', () => {}),
+    ]);
+    expect([first, second].filter(Boolean)).toHaveLength(1);
+  });
+});
+
 // ── shutdown ────────────────────────────────────────────────────────────────
 
 describe('shutdown', () => {

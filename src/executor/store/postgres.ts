@@ -46,14 +46,16 @@ function isoRequired(v: unknown): string {
  */
 function parseJson(v: unknown): unknown {
   if (v === null || v === undefined) return null;
-  if (typeof v === 'string') {
-    try {
-      return JSON.parse(v);
-    } catch {
-      return null;
-    }
+  if (typeof v !== 'string') return v;
+  // The driver decodes jsonb for us, so a string arriving here is normally
+  // already the value — `output_json: "plain"` comes back as `plain`, not as
+  // `"plain"`. Try a parse anyway for rows written as JSON text, but fall
+  // back to the string itself: returning null threw away a model's answer.
+  try {
+    return JSON.parse(v);
+  } catch {
+    return v;
   }
-  return v;
 }
 
 function asRecord(v: unknown): Record<string, unknown> {
@@ -366,6 +368,22 @@ export class PostgresStore implements Store {
 
   // ── nodes ─────────────────────────────────────────────────────────────────
 
+  /**
+   * Bind a value for a jsonb column.
+   *
+   * The driver sends numbers and booleans with their native Postgres type,
+   * and there is no implicit cast from those to jsonb — a node whose output
+   * parsed to `42` failed the whole write. `${text}::jsonb` is not the fix:
+   * the driver stores the text as a JSON *string* instead of parsing it.
+   * `to_jsonb` over the native type is. Objects, arrays, strings and null
+   * already bind correctly and are passed straight through.
+   */
+  private jsonb(value: unknown) {
+    return typeof value === 'number' || typeof value === 'boolean'
+      ? this.sql`to_jsonb(${value})`
+      : this.sql`${value ?? null}`;
+  }
+
   async upsertNode(input: UpsertNodeInput): Promise<NodeRow> {
     const rows = (await this.sql`
       INSERT INTO workflow_run_nodes (
@@ -374,10 +392,11 @@ export class PostgresStore implements Store {
       ) VALUES (
         ${input.run_id}, ${input.node_id}, ${input.node_type}, ${input.status},
         COALESCE(${input.attempt ?? null}::int, 0), ${input.output ?? null},
-        ${input.output_json ?? null},
+        ${this.jsonb(input.output_json ?? null)},
         ${input.error ?? null}, ${input.claude_session_id ?? null},
-        ${input.side_effects ?? 'idempotent'},
-        ${input.input_tokens ?? 0}, ${input.output_tokens ?? 0},
+        COALESCE(${input.side_effects ?? null}::text, 'idempotent'),
+        COALESCE(${input.input_tokens ?? null}::int, 0),
+        COALESCE(${input.output_tokens ?? null}::int, 0),
         ${input.started_at ?? null}, ${input.completed_at ?? null}
       )
       ON CONFLICT (run_id, node_id) DO UPDATE SET
@@ -391,9 +410,13 @@ export class PostgresStore implements Store {
         output_json       = COALESCE(excluded.output_json, workflow_run_nodes.output_json),
         error             = excluded.error,
         claude_session_id = COALESCE(excluded.claude_session_id, workflow_run_nodes.claude_session_id),
-        side_effects      = excluded.side_effects,
-        input_tokens      = excluded.input_tokens,
-        output_tokens     = excluded.output_tokens,
+        -- As with attempt: a bare status write carries no side_effects and no
+        -- token counts, and excluded.* has already been defaulted, so these
+        -- have to read the caller's value directly. Downgrading side_effects
+        -- to 'idempotent' here would quietly remove an at_most_once marker.
+        side_effects      = COALESCE(${input.side_effects ?? null}::text, workflow_run_nodes.side_effects),
+        input_tokens      = COALESCE(${input.input_tokens ?? null}::int, workflow_run_nodes.input_tokens),
+        output_tokens     = COALESCE(${input.output_tokens ?? null}::int, workflow_run_nodes.output_tokens),
         started_at        = COALESCE(workflow_run_nodes.started_at, excluded.started_at),
         completed_at      = excluded.completed_at
       RETURNING *`) as Row[];

@@ -1,6 +1,6 @@
 ﻿/**
  * Orchestrator full-cycle tests using fakes â€” exercises the parts of the state
- * machine that don't require spawning real Archon subprocesses:
+ * machine that don't require running real workflows:
  *
  *  â€¢ startup label-driven recovery (Section 12.4)
  *  â€¢ `ensureGaggleLabels` is called on start
@@ -97,11 +97,15 @@ async function seedRunLink(
 }
 
 /** Build a fake ExecutorClient whose listRuns() delegates to the provided function. */
-function makeFakeArchonClient(
+function makeFakeExecutorClient(
   listRunsFn: () => Promise<RunRecord[]> = () => Promise.resolve([]),
 ): ExecutorClient {
   const client = Object.create(ExecutorClient.prototype) as ExecutorClient;
   (client as unknown as { listRuns: () => Promise<RunRecord[]> }).listRuns = listRunsFn;
+  // Reconciliation looks runs up by id rather than listing everything; the
+  // seeded list is still the source of truth for what exists.
+  (client as unknown as { getRun: (id: string) => Promise<RunRecord | null> }).getRun = async (id) =>
+    (await listRunsFn()).find((r) => r.id === id) ?? null;
   (client as unknown as { getRunDetail: () => Promise<null> }).getRunDetail = () => Promise.resolve(null);
   (client as unknown as { approveRun: () => Promise<void> }).approveRun = () => Promise.resolve();
   (client as unknown as { rejectRun: () => Promise<void> }).rejectRun = () => Promise.resolve();
@@ -208,7 +212,7 @@ function makeFakeRegistry(initial?: RegistryContext) {
 function makeOrchestrator(extra: {
   tracker?: ReturnType<typeof makeFakeTracker>['tracker'];
   registry?: RegistryLoaderHandle;
-  archonStatus?: () => Promise<RunRecord[]>;
+  seededRuns?: () => Promise<RunRecord[]>;
   cfg?: ServiceConfig;
 } = {}) {
   const cfg = extra.cfg ?? makeServiceConfig();
@@ -224,7 +228,7 @@ function makeOrchestrator(extra: {
     registry,
     syncer: null,
     ...makeEngineDeps(),
-    executorClient: makeFakeArchonClient(extra.archonStatus),
+    executorClient: makeFakeExecutorClient(extra.seededRuns),
   });
   return { orchestrator, cfg, registry, tracker: trackerObj.tracker };
 }
@@ -463,8 +467,10 @@ describe('Orchestrator.getState', () => {
 function makeDispatchOrchestrator(candidates: Issue[], opts: {
   byLabel?: Record<string, Issue[]>;
   analyzerTargets?: import('../domain/types.ts').RepoTarget[];
-  archonStatus?: () => Promise<RunRecord[]>;
+  seededRuns?: () => Promise<RunRecord[]>;
   prLinksByIssue?: Record<string, string[]>;
+  /** Records every workspace hook the orchestrator fires. */
+  hookCalls?: string[];
 } = {}) {
   const cfg = makeServiceConfig();
   cfg.polling.interval_ms = 86_400_000;
@@ -503,11 +509,14 @@ function makeDispatchOrchestrator(candidates: Issue[], opts: {
     cfg,
     tracker,
     analyzer,
-    workspace: { cleanAuxiliaryWorkspace: () => {} } as unknown as WorkspaceManager,
+    workspace: {
+      cleanAuxiliaryWorkspace: () => {},
+      runHook: async (name: string) => { opts.hookCalls?.push(name); },
+    } as unknown as WorkspaceManager,
     registry: reg.handle,
     syncer: null,
     ...makeEngineDeps(),
-    executorClient: makeFakeArchonClient(opts.archonStatus),
+    executorClient: makeFakeExecutorClient(opts.seededRuns),
   });
   orchestrators.push(o);
 
@@ -691,7 +700,7 @@ describe('emitTargetEvent populates target_machine_states', () => {
       registry: reg.handle,
       syncer: null,
     ...makeEngineDeps(),
-      executorClient: makeFakeArchonClient(),
+      executorClient: makeFakeExecutorClient(),
     });
     orchestrators.push(o);
 
@@ -747,7 +756,7 @@ describe('emitTargetEvent populates target_machine_states', () => {
       registry: reg.handle,
       syncer: null,
     ...makeEngineDeps(),
-      executorClient: makeFakeArchonClient(),
+      executorClient: makeFakeExecutorClient(),
     });
     orchestrators.push(o);
 
@@ -803,7 +812,7 @@ describe('emitTargetEvent populates target_machine_states', () => {
       registry: reg.handle,
       syncer: null,
     ...makeEngineDeps(),
-      executorClient: makeFakeArchonClient(),
+      executorClient: makeFakeExecutorClient(),
     });
     orchestrators.push(o);
 
@@ -847,7 +856,7 @@ describe('emitTargetEvent populates target_machine_states', () => {
       fetchIssuesByLabel: async () => [],
       fetchIssuesByStates: async () => [],
       // GitHub integration just moved the issue to In Review while
-      // Archon's post-PR phases are still running.
+      // The workflow's post-PR phases are still running.
       fetchIssueStatesByIds: async () => [{ ...issue, state: 'In Review' }],
       fetchIssueComments: async () => [],
       applyLabel: async () => {},
@@ -866,7 +875,7 @@ describe('emitTargetEvent populates target_machine_states', () => {
       registry: reg.handle,
       syncer: null,
     ...makeEngineDeps(),
-      executorClient: makeFakeArchonClient(),
+      executorClient: makeFakeExecutorClient(),
     });
     orchestrators.push(o);
 
@@ -921,7 +930,7 @@ describe('emitTargetEvent populates target_machine_states', () => {
       registry: reg.handle,
       syncer: null,
     ...makeEngineDeps(),
-      executorClient: makeFakeArchonClient(),
+      executorClient: makeFakeExecutorClient(),
     });
     orchestrators.push(o);
 
@@ -988,7 +997,7 @@ describe('hot path: handleGatePaused', () => {
       registry: reg.handle,
       syncer: null,
     ...makeEngineDeps(),
-      executorClient: makeFakeArchonClient(),
+      executorClient: makeFakeExecutorClient(),
     });
     orchestrators.push(o);
 
@@ -1053,7 +1062,7 @@ describe('hot path: handleWorkerExit failure â†’ failed (no-auto-retry poli
       registry: reg.handle,
       syncer: null,
     ...makeEngineDeps(),
-      executorClient: makeFakeArchonClient(),
+      executorClient: makeFakeExecutorClient(),
     });
     orchestrators.push(o);
 
@@ -1091,12 +1100,12 @@ describe('hot path: handleWorkerExit failure â†’ failed (no-auto-retry poli
 });
 
 describe('hot path: pollSupervisedGates timeout', () => {
-  test('gate that exceeds gate_timeout_ms â†’ gate_timed_out fires; archon.rejectRun + target parked in failed', async () => {
+  test('gate that exceeds gate_timeout_ms â†’ gate_timed_out fires; executor.rejectRun + target parked in failed', async () => {
     const issue = makeIssue({ id: 'p1', identifier: 'SYM-320' });
     const cfg = makeServiceConfig();
     cfg.executor.gate_timeout_ms = 1000; // tiny timeout
     const calls: TrackerCall[] = [];
-    const archonCalls: string[] = [];
+    const executorCalls: string[] = [];
     const tracker = {
       ensureGaggleLabels: async () => {},
       resolveViewerId: async () => 'u1',
@@ -1116,9 +1125,9 @@ describe('hot path: pollSupervisedGates timeout', () => {
     } as unknown as LinearClient;
 
     const reg = makeFakeRegistry();
-    const archon = makeFakeArchonClient();
-    (archon as unknown as { rejectRun: (id: string, reason: string) => Promise<void> }).rejectRun =
-      async (runId: string, reason: string) => { archonCalls.push(`rejectRun(${runId},${reason})`); };
+    const executorClientStub = makeFakeExecutorClient();
+    (executorClientStub as unknown as { rejectRun: (id: string, reason: string) => Promise<void> }).rejectRun =
+      async (runId: string, reason: string) => { executorCalls.push(`rejectRun(${runId},${reason})`); };
 
     const o = new Orchestrator({
       cfg, tracker,
@@ -1127,7 +1136,7 @@ describe('hot path: pollSupervisedGates timeout', () => {
       registry: reg.handle,
       syncer: null,
     ...makeEngineDeps(),
-      executorClient: archon,
+      executorClient: executorClientStub,
     });
     orchestrators.push(o);
 
@@ -1143,8 +1152,8 @@ describe('hot path: pollSupervisedGates timeout', () => {
 
     await (o as unknown as { pollSupervisedGates(): Promise<void> }).pollSupervisedGates();
 
-    // Archon reject was called via the SM's executor_reject effect
-    expect(archonCalls.some((c) => c.startsWith('rejectRun(run-xyz,'))).toBe(true);
+    // The reject went through the SM's executor_reject effect
+    expect(executorCalls.some((c) => c.startsWith('rejectRun(run-xyz,'))).toBe(true);
     // Target moves to failed (no-auto-retry policy); gate entry deleted
     expect(o.getState().target_machine_states.get('p1__fe')).toBe('failed');
     expect(o.getState().supervised_gates.has('p1__fe')).toBe(false);
@@ -1192,7 +1201,7 @@ describe('hot path: pollFailedTargets retry trigger', () => {
       registry: reg.handle,
       syncer: null,
     ...makeEngineDeps(),
-      executorClient: makeFakeArchonClient(),
+      executorClient: makeFakeExecutorClient(),
     });
     orchestrators.push(o);
     return { o, calls, cfg };
@@ -1348,7 +1357,7 @@ describe('hot path: drainPendingTargets phase 3', () => {
       registry: reg.handle,
       syncer: null,
     ...makeEngineDeps(),
-      executorClient: makeFakeArchonClient(),
+      executorClient: makeFakeExecutorClient(),
     });
     orchestrators.push(o);
 
@@ -1403,7 +1412,7 @@ describe('hot path: drainPendingTargets phase 3', () => {
       registry: reg.handle,
       syncer: null,
     ...makeEngineDeps(),
-      executorClient: makeFakeArchonClient(),
+      executorClient: makeFakeExecutorClient(),
     });
     orchestrators.push(o);
 
@@ -1461,7 +1470,7 @@ describe('hot path: drainPendingTargets phase 3', () => {
       registry: reg.handle,
       syncer: null,
     ...makeEngineDeps(),
-      executorClient: makeFakeArchonClient(),
+      executorClient: makeFakeExecutorClient(),
     });
     orchestrators.push(o);
 
@@ -1487,7 +1496,7 @@ describe('hot path: drainPendingTargets phase 3', () => {
 describe('crash recovery â€” recoverFromLinearLabels', () => {
   function makeRecoveryOrchestrator(
     byLabel: Record<string, Issue[]>,
-    opts: { archonStatus?: () => Promise<RunRecord[]>; baseFolder?: string } = {},
+    opts: { seededRuns?: () => Promise<RunRecord[]>; baseFolder?: string } = {},
   ) {
     const cfg = makeServiceConfig();
     cfg.polling.interval_ms = 86_400_000;
@@ -1526,7 +1535,7 @@ describe('crash recovery â€” recoverFromLinearLabels', () => {
       registry: reg.handle,
       syncer: null,
     ...makeEngineDeps(),
-      executorClient: makeFakeArchonClient(opts.archonStatus),
+      executorClient: makeFakeExecutorClient(opts.seededRuns),
     });
     orchestrators.push(o);
     return { o, calls, cfg };
@@ -1592,7 +1601,7 @@ describe('crash recovery â€” recoverFromLinearLabels', () => {
 
   test('orphaned claimed parent â€” crash before dispatch (no persisted run) â†’ un-claimed for re-dispatch, NOT terminal', async () => {
     // Orchestrator crashed between applyLabel(claimed) and spawning the worker.
-    // No Archon run was ever started, so no run entry exists in the registry.
+    // No run was ever started, so no run entry exists in the registry.
     const orphaned = makeIssue({ id: 'p1', identifier: 'SYM-20', parent_id: null, state: 'In Progress', labels: ['gaggle:claimed'] });
     const { o, calls } = makeRecoveryOrchestrator({
       'gaggle:claimed': [orphaned],
@@ -1608,15 +1617,15 @@ describe('crash recovery â€” recoverFromLinearLabels', () => {
     expect(calls.some((c) => c.op === 'updateIssueState' && c.args[0] === 'p1')).toBe(false);
   });
 
-  test('orphaned claimed parent â€” work completed while down (persisted run + Archon completed) â†’ claim released and parent transitioned to Done', async () => {
+  test('orphaned claimed parent â€” work completed while down (persisted run + executor completed) â†’ claim released and parent transitioned to Done', async () => {
     // All sub-issues finished while the orchestrator was down; crash happened before
     // maybeReleaseClaim could remove the claimed label and transition the parent.
     const BASE = mkdirSync(`/tmp/gaggle-test-orphan-${Date.now()}`, { recursive: true }) as unknown as string ?? `/tmp/gaggle-test-orphan-${Date.now()}`;
     const WORKER_KEY = 'p1__trialmatch-be';
-    const ARCHON_RUN_ID = 'deadbeefdeadbeefdeadbeefdeadbeef';
+    const RUN_ID = 'deadbeefdeadbeefdeadbeefdeadbeef';
     try {
       await seedRunLink(engineStore(), WORKER_KEY, {
-        run_id: ARCHON_RUN_ID,
+        run_id: RUN_ID,
         parent_issue_id: 'p1',
         sub_issue_id: 'sub-be',
         repo_alias: 'trialmatch-be',
@@ -1630,8 +1639,8 @@ describe('crash recovery â€” recoverFromLinearLabels', () => {
         'gaggle:waiting-human': [],
       }, {
         baseFolder: BASE,
-        archonStatus: () => Promise.resolve([{
-          id: ARCHON_RUN_ID, status: 'completed',
+        seededRuns: () => Promise.resolve([{
+          id: RUN_ID, status: 'completed',
           workflow_name: 'gaggle/gaggle-fix-issue',
           working_path: '/some/path/trialmatch-be',
           started_at: new Date().toISOString(),
@@ -1760,9 +1769,9 @@ describe('crash recovery â€” recoverFromLinearLabels', () => {
     const BASE = '/tmp/base';
     mkdirSync(BASE, { recursive: true });
     const WORKER_KEY = 'p1__trialmatch-be';
-    const ARCHON_RUN_ID = 'cafebabecafebabecafebabecafebabe';
+    const RUN_ID = 'cafebabecafebabecafebabecafebabe';
     await seedRunLink(engineStore(), WORKER_KEY, {
-      run_id: ARCHON_RUN_ID,
+      run_id: RUN_ID,
       parent_issue_id: 'p1',
       sub_issue_id: 'sub-be',
       repo_alias: 'trialmatch-be',
@@ -1781,9 +1790,9 @@ describe('crash recovery â€” recoverFromLinearLabels', () => {
       'gaggle:queued': [],
       'gaggle:waiting-human': [],
     }, {
-      // Inject an archonStatus that returns a running record with the exact ARCHON_RUN_ID.
-      archonStatus: () => Promise.resolve([{
-        id: ARCHON_RUN_ID,
+      // Inject an seededRuns that returns a running record with the exact RUN_ID.
+      seededRuns: () => Promise.resolve([{
+        id: RUN_ID,
         status: 'running',
         workflow_name: 'gaggle/gaggle-fix-issue',
         working_path: '/some/path/trialmatch-be',
@@ -1796,7 +1805,7 @@ describe('crash recovery â€” recoverFromLinearLabels', () => {
 
     // The run should be tracked as a detached run (not re-queued).
     const detached = o.getState().detached_runs;
-    const found = [...detached.values()].find((d) => d.run_id === ARCHON_RUN_ID);
+    const found = [...detached.values()].find((d) => d.run_id === RUN_ID);
     expect(found).toBeDefined();
     expect(found?.repo_alias).toBe('trialmatch-be');
 
@@ -1804,15 +1813,15 @@ describe('crash recovery â€” recoverFromLinearLabels', () => {
     rmSync(BASE, { recursive: true, force: true });
   });
 
-  test('running sub + persisted run + Archon completed â†’ sub marked Done, parent claim released', async () => {
-    // Both Gaggle and Archon crashed while Archon was running; Archon completed before the crash.
-    // On restart: running label still on sub, but Archon shows completed â†’ clean finish.
+  test('running sub + persisted run + executor completed â†’ sub marked Done, parent claim released', async () => {
+    // The process died while the run was going; the run finished first.
+    // On restart: running label still on sub, but the run shows completed → clean finish.
     const BASE = mkdirSync(`/tmp/gaggle-test-rc-${Date.now()}`, { recursive: true }) as unknown as string ?? `/tmp/gaggle-test-rc-${Date.now()}`;
     const WORKER_KEY = 'p1__trialmatch-be';
-    const ARCHON_RUN_ID = 'c0ffeec0ffeec0ffeec0ffeec0ffeec0';
+    const RUN_ID = 'c0ffeec0ffeec0ffeec0ffeec0ffeec0';
     try {
       await seedRunLink(engineStore(), WORKER_KEY, {
-        run_id: ARCHON_RUN_ID,
+        run_id: RUN_ID,
         parent_issue_id: 'p1',
         sub_issue_id: 'sub-be',
         repo_alias: 'trialmatch-be',
@@ -1832,8 +1841,8 @@ describe('crash recovery â€” recoverFromLinearLabels', () => {
         'gaggle:waiting-human': [],
       }, {
         baseFolder: BASE,
-        archonStatus: () => Promise.resolve([{
-          id: ARCHON_RUN_ID, status: 'completed',
+        seededRuns: () => Promise.resolve([{
+          id: RUN_ID, status: 'completed',
           workflow_name: 'gaggle/gaggle-fix-issue',
           working_path: '/some/path/trialmatch-be',
           started_at: new Date().toISOString(),
@@ -1856,15 +1865,15 @@ describe('crash recovery â€” recoverFromLinearLabels', () => {
     }
   });
 
-  test('running sub + persisted run + Archon paused â†’ supervised gate restored, label swapped to waiting-human', async () => {
-    // Both crashed while Archon was at a plan gate waiting for human approval.
-    // On restart: running label on sub, but Archon shows paused â†’ restore gate.
+  test('running sub + persisted run + executor paused â†’ supervised gate restored, label swapped to waiting-human', async () => {
+    // The process died while the run sat at a plan gate awaiting approval.
+    // On restart: running label on sub, but the run shows paused → restore gate.
     const BASE = mkdirSync(`/tmp/gaggle-test-rp-${Date.now()}`, { recursive: true }) as unknown as string ?? `/tmp/gaggle-test-rp-${Date.now()}`;
     const WORKER_KEY = 'p1__trialmatch-be';
-    const ARCHON_RUN_ID = 'babe1234babe1234babe1234babe1234';
+    const RUN_ID = 'babe1234babe1234babe1234babe1234';
     try {
       await seedRunLink(engineStore(), WORKER_KEY, {
-        run_id: ARCHON_RUN_ID,
+        run_id: RUN_ID,
         parent_issue_id: 'p1',
         sub_issue_id: 'sub-be',
         repo_alias: 'trialmatch-be',
@@ -1884,8 +1893,8 @@ describe('crash recovery â€” recoverFromLinearLabels', () => {
         'gaggle:waiting-human': [],
       }, {
         baseFolder: BASE,
-        archonStatus: () => Promise.resolve([{
-          id: ARCHON_RUN_ID, status: 'paused',
+        seededRuns: () => Promise.resolve([{
+          id: RUN_ID, status: 'paused',
           workflow_name: 'gaggle/gaggle-fix-issue',
           working_path: '/some/path/trialmatch-be',
           started_at: new Date().toISOString(),
@@ -1902,7 +1911,7 @@ describe('crash recovery â€” recoverFromLinearLabels', () => {
       // Gate entry restored with correct metadata
       const gate = o.getState().supervised_gates.get('p1__trialmatch-be');
       expect(gate).toBeDefined();
-      expect(gate?.run_id).toBe(ARCHON_RUN_ID);
+      expect(gate?.run_id).toBe(RUN_ID);
       expect(gate?.repo_alias).toBe('trialmatch-be');
       expect(gate?.sub_issue_id).toBe('sub-be');
       expect(gate?.gate_message).toBe('Please review the implementation plan.');
@@ -1999,15 +2008,62 @@ describe('shouldDispatchSubIssue eligibility', () => {
   });
 });
 
+describe('the after_run hook', () => {
+  const seedRunning = (o: Orchestrator, issue: Issue) => {
+    o.getState().pending_issues.set('p1', issue);
+    o.getState().target_machine_states.set('p1__fe', 'running');
+    o.getState().running.set('p1__fe', {
+      session_id: 'x', issue, identifier: 'SYM-400', repo_alias: 'fe',
+      repo_target: makeRepoTarget({ repo_alias: 'fe' }), sub_issue_id: null,
+      run_pid: 1, run_id: 'r1',
+      workflow: '', last_event: null, last_event_at: null, last_message: null, recent_output: [],
+      claude_input_tokens: 0, claude_output_tokens: 0, claude_total_tokens: 0, turn_count: 0,
+      started_at: new Date().toISOString(), attempt: null,
+    });
+  };
+
+  test('runs when the workflow actually finishes', async () => {
+    const hookCalls: string[] = [];
+    const issue = makeIssue({ id: 'p1', identifier: 'SYM-400' });
+    const { o } = makeDispatchOrchestrator([], { hookCalls });
+    seedRunning(o, issue);
+
+    await (o as unknown as {
+      handleWorkerExit(i: Issue, t: ReturnType<typeof makeRepoTarget>, e: { type: string }, a: number | null): Promise<void>;
+    }).handleWorkerExit(issue, makeRepoTarget({ repo_alias: 'fe' }), { type: 'run_succeeded' }, null);
+
+    expect(hookCalls).toEqual(['after_run']);
+  });
+
+  test('does not run at an approval gate', async () => {
+    // Review finding: the hook hung off the run handle, which settles at a
+    // gate as well — so it fired mid-workflow and never again when the
+    // resumed run finished for real.
+    const hookCalls: string[] = [];
+    const issue = makeIssue({ id: 'p1', identifier: 'SYM-401' });
+    const { o } = makeDispatchOrchestrator([], { hookCalls });
+    seedRunning(o, issue);
+
+    await (o as unknown as {
+      handleGatePaused(
+        i: Issue, t: ReturnType<typeof makeRepoTarget>, subId: string | null, runId: string,
+        msg: string, a: number | null,
+      ): Promise<void>;
+    }).handleGatePaused(issue, makeRepoTarget({ repo_alias: 'fe' }), null, 'r1', 'review?', null);
+
+    expect(hookCalls).toEqual([]);
+  });
+});
+
 describe('reconcileRunningIssues â€” detached run transitions', () => {
   test('completed detached run â†’ sub-issue marked Done and removed from detached map', async () => {
     const parent = makeIssue({ id: 'p1', identifier: 'SYM-60', state: 'In Progress' });
     const target = makeRepoTarget({ repo_alias: 'trialmatch-be' });
-    const ARCHON_RUN_ID = 'cafecafecafecafecafecafecafecafe';
+    const RUN_ID = 'cafecafecafecafecafecafecafecafe';
 
     const { o, calls } = makeDispatchOrchestrator([], {
-      archonStatus: () => Promise.resolve([{
-        id: ARCHON_RUN_ID, status: 'completed',
+      seededRuns: () => Promise.resolve([{
+        id: RUN_ID, status: 'completed',
         workflow_name: 'gaggle/gaggle-fix-issue',
         working_path: '/path', started_at: new Date().toISOString(),
         user_message: '', completed_at: null, last_activity_at: null, metadata: {},
@@ -2017,7 +2073,7 @@ describe('reconcileRunningIssues â€” detached run transitions', () => {
     // Seed detached run (as if recovered from crash)
     const state = o.getState();
     state.detached_runs.set('p1__trialmatch-be', {
-      run_id: ARCHON_RUN_ID,
+      run_id: RUN_ID,
       parent_issue: parent,
       sub_issue_id: 'sub-be',
       repo_alias: 'trialmatch-be',
@@ -2040,11 +2096,11 @@ describe('reconcileRunningIssues â€” detached run transitions', () => {
   test('failed detached run â†’ sub-issue re-queued', async () => {
     const parent = makeIssue({ id: 'p1', identifier: 'SYM-61', state: 'In Progress' });
     const target = makeRepoTarget({ repo_alias: 'trialmatch-be' });
-    const ARCHON_RUN_ID = 'deadbeefdeadbeefdeadbeefdeadbeef';
+    const RUN_ID = 'deadbeefdeadbeefdeadbeefdeadbeef';
 
     const { o, calls } = makeDispatchOrchestrator([], {
-      archonStatus: () => Promise.resolve([{
-        id: ARCHON_RUN_ID, status: 'failed',
+      seededRuns: () => Promise.resolve([{
+        id: RUN_ID, status: 'failed',
         workflow_name: 'gaggle/gaggle-fix-issue',
         working_path: '/path', started_at: new Date().toISOString(),
         user_message: '', completed_at: null, last_activity_at: null, metadata: {},
@@ -2053,7 +2109,7 @@ describe('reconcileRunningIssues â€” detached run transitions', () => {
 
     const state = o.getState();
     state.detached_runs.set('p1__trialmatch-be', {
-      run_id: ARCHON_RUN_ID,
+      run_id: RUN_ID,
       parent_issue: parent,
       sub_issue_id: 'sub-be',
       repo_alias: 'trialmatch-be',
@@ -2073,8 +2129,8 @@ describe('reconcileRunningIssues â€” detached run transitions', () => {
     const target = makeRepoTarget({ repo_alias: 'trialmatch-be' });
 
     const { o, calls } = makeDispatchOrchestrator([], {
-      // archonStatus returns empty â€” run not found in Archon DB
-      archonStatus: () => Promise.resolve([]),
+      // no seeded runs — the run no longer exists
+      seededRuns: () => Promise.resolve([]),
     });
 
     const state = o.getState();
@@ -2096,11 +2152,11 @@ describe('reconcileRunningIssues â€” detached run transitions', () => {
   test('still-running detached run â†’ left in detached map', async () => {
     const parent = makeIssue({ id: 'p1', identifier: 'SYM-63', state: 'In Progress' });
     const target = makeRepoTarget({ repo_alias: 'trialmatch-be' });
-    const ARCHON_RUN_ID = 'aaaabbbbccccddddaaaabbbbccccdddd';
+    const RUN_ID = 'aaaabbbbccccddddaaaabbbbccccdddd';
 
     const { o, calls } = makeDispatchOrchestrator([], {
-      archonStatus: () => Promise.resolve([{
-        id: ARCHON_RUN_ID, status: 'running',
+      seededRuns: () => Promise.resolve([{
+        id: RUN_ID, status: 'running',
         workflow_name: 'gaggle/gaggle-fix-issue',
         working_path: '/path', started_at: new Date().toISOString(),
         user_message: '', completed_at: null, last_activity_at: null, metadata: {},
@@ -2109,7 +2165,7 @@ describe('reconcileRunningIssues â€” detached run transitions', () => {
 
     const state = o.getState();
     state.detached_runs.set('p1__trialmatch-be', {
-      run_id: ARCHON_RUN_ID,
+      run_id: RUN_ID,
       parent_issue: parent,
       sub_issue_id: 'sub-be',
       repo_alias: 'trialmatch-be',
@@ -2394,7 +2450,7 @@ describe('gray-zone state guards', () => {
       registry: reg.handle,
       syncer: null,
     ...makeEngineDeps(),
-      executorClient: makeFakeArchonClient(),
+      executorClient: makeFakeExecutorClient(),
     });
     orchestrators.push(o);
 
@@ -2455,7 +2511,7 @@ describe('gray-zone state guards', () => {
       registry: reg.handle,
       syncer: null,
     ...makeEngineDeps(),
-      executorClient: makeFakeArchonClient(),
+      executorClient: makeFakeExecutorClient(),
     });
     orchestrators.push(o);
 
@@ -2470,11 +2526,11 @@ describe('reconcileRunningIssues â€” detached paused transition', () => {
   test('paused detached run â†’ moved to supervised_gates and label swapped', async () => {
     const parent = makeIssue({ id: 'p1', identifier: 'SYM-90', state: 'In Progress' });
     const target = makeRepoTarget({ repo_alias: 'trialmatch-be' });
-    const ARCHON_RUN_ID = 'bebebebebebebebebebebebebebebebe';
+    const RUN_ID = 'bebebebebebebebebebebebebebebebe';
 
     const { o, calls } = makeDispatchOrchestrator([], {
-      archonStatus: () => Promise.resolve([{
-        id: ARCHON_RUN_ID, status: 'paused',
+      seededRuns: () => Promise.resolve([{
+        id: RUN_ID, status: 'paused',
         workflow_name: 'gaggle/gaggle-fix-issue',
         working_path: '/path', started_at: new Date().toISOString(),
         user_message: '', completed_at: null, last_activity_at: null,
@@ -2484,7 +2540,7 @@ describe('reconcileRunningIssues â€” detached paused transition', () => {
 
     const state = o.getState();
     state.detached_runs.set('p1__trialmatch-be', {
-      run_id: ARCHON_RUN_ID,
+      run_id: RUN_ID,
       parent_issue: parent,
       sub_issue_id: 'sub-be',
       repo_alias: 'trialmatch-be',

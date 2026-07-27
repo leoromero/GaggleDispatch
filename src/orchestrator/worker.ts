@@ -169,14 +169,10 @@ export async function spawnWorker(args: WorkerStartArgs, cb: WorkerCallbacks): P
   // `toWorkerCallbacks` turns into onRunId. Announcing it here as well fired
   // the callback twice for one run.
 
-  // Run the after_run hook upon completion (best-effort).
-  void handle.done.then(async () => {
-    try {
-      await workspace.runHook('after_run', repo_target, issue, attempt);
-    } catch {
-      /* logged inside */
-    }
-  });
+  // `after_run` deliberately does not hang off `handle.done`: that settles at
+  // an approval gate too, so the hook fired mid-workflow and never again when
+  // the resumed run actually finished. The orchestrator runs it from
+  // handleWorkerExit, which is the one place that knows an outcome is final.
 
   return { cancel: handle.cancel, done: handle.done };
 }

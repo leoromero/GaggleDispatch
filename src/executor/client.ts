@@ -52,8 +52,15 @@ export class ExecutorClient {
     return this.executor.getRun(runId);
   }
 
-  async listRuns(statuses?: RunStatus[]): Promise<RunRecord[]> {
-    return this.executor.listRuns(statuses ? { status: statuses } : {});
+  /**
+   * Runs, newest first. `limit` is worth passing on any path that only needs
+   * recent history — the table grows for the life of the deployment.
+   */
+  async listRuns(statuses?: RunStatus[], limit?: number): Promise<RunRecord[]> {
+    return this.executor.listRuns({
+      ...(statuses ? { status: statuses } : {}),
+      ...(limit !== undefined ? { limit } : {}),
+    });
   }
 
   /** Store the decision and resume. Returns false when there was no gate. */

@@ -259,10 +259,20 @@ CREATE TABLE hub_token_daily (
 );
 `;
 
+/**
+ * Startup recovery reads the most recent runs, ordered by start time with no
+ * repo filter. `idx_runs_repo_started` cannot serve that, so the query sorted
+ * the whole table — fine at a hundred runs, not at a hundred thousand.
+ */
+const M004_RUNS_STARTED_INDEX = `
+CREATE INDEX IF NOT EXISTS idx_runs_started ON workflow_runs (started_at DESC);
+`;
+
 export const MIGRATIONS: Migration[] = [
   { version: 1, name: 'init', sql: M001_INIT },
   { version: 2, name: 'registries', sql: M002_REGISTRIES },
   { version: 3, name: 'hub_history', sql: M003_HUB_HISTORY },
+  { version: 4, name: 'runs_started_index', sql: M004_RUNS_STARTED_INDEX },
 ];
 
 export const LATEST_VERSION = MIGRATIONS.reduce((m, x) => Math.max(m, x.version), 0);
