@@ -62,7 +62,6 @@ export interface WorkerLauncher {
     repo_target: RepoTarget;
     analysis: IssueAnalysis;
     callbacks: {
-      onStarted: (pid: number) => void;
       onOutput: (line: string) => void;
       onRunId: (runId: string) => void;
       onGatePaused: (runId: string, message: string) => void;
@@ -100,9 +99,6 @@ export class EngineExecutorAdapter implements ExecutorPort {
       repo_target: repoTarget,
       analysis: analysisFrom(ticket, target, repoTarget),
       callbacks: {
-        onStarted: (pid) => {
-          logger.info('Worker started', { repo_alias: target.repo_alias, pid });
-        },
         onOutput: () => {
           /* Telemetry is the orchestrator's concern, not the control plane's. */
         },
@@ -216,6 +212,8 @@ export class EngineExecutorAdapter implements ExecutorPort {
         void this.onExit(targetId, { type: 'run_succeeded' });
         break;
       case 'run_failed':
+        void this.onExit(targetId, { type: e.type, error: e.error });
+        break;
       case 'run_timed_out':
       case 'run_cancelled':
         void this.onExit(targetId, { type: e.type });
@@ -247,7 +245,10 @@ export class EngineExecutorAdapter implements ExecutorPort {
    * distinguishes a pause from a completion with its own event, so a
    * `run_succeeded` really is one.
    */
-  private async onExit(targetId: string, event: { type: string }): Promise<void> {
+  private async onExit(
+    targetId: string,
+    event: { type: string; error?: string },
+  ): Promise<void> {
     // Reached from a fire-and-forget event callback, so an escaping rejection is
     // unhandled and Bun terminates the daemon. It *will* escape on the ordinary
     // Cancel path: `cancel_confirmed` commits `cancelled`, then kills the run,
@@ -264,7 +265,10 @@ export class EngineExecutorAdapter implements ExecutorPort {
       if (event.type === 'run_succeeded') {
         await sink.runSucceeded(targetId);
       } else {
-        await sink.runFailed(targetId, event.type);
+        // The engine's error, when it gave one. Reporting the bare event name
+        // put `Reason: \`run_failed\`` on every failed target's tracker
+        // comment while the actual message sat unused in the event.
+        await sink.runFailed(targetId, event.error ?? event.type);
       }
     } catch (err) {
       if (err instanceof InvalidControlTransitionError) {

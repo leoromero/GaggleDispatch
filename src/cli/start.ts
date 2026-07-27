@@ -5,11 +5,10 @@
 import chalk from 'chalk';
 import { basename, join } from 'node:path';
 import { commandExists } from '../util/subprocess.ts';
-import { loadConfig, fatal } from './common.ts';
+import { buildExecutor, loadConfig, fatal } from './common.ts';
 import { runSyncPass, startPeriodicSyncer } from '../registry/repo-syncer.ts';
 import { startRegistryLoader } from '../registry/loader.ts';
 import { PostgresStore } from '../executor/store/postgres.ts';
-import { GaggleExecutor } from '../executor/engine/index.ts';
 import { recoverInterruptedRuns } from '../executor/engine/recovery.ts';
 import { sweepStaleWorktrees } from '../executor/engine/cleanup.ts';
 import { LinearClient } from '../tracker/linear.ts';
@@ -87,17 +86,7 @@ export async function runStart(opts: {
     fatal('Registry context has no repositories with sync_status=ok. Add a gaggle.md to at least one registered repo.');
   }
 
-  const executor = new GaggleExecutor({
-    store,
-    artifactsRoot: join(cfg.registry.base_folder, 'artifacts'),
-    config: {
-      nodeIdleTimeoutMs: cfg.executor.node_idle_timeout_ms,
-      bashTimeoutMs: cfg.executor.bash_timeout_ms,
-      maxRunDurationMs: cfg.executor.max_run_duration_ms,
-      leaseHeartbeatMs: cfg.executor.lease_heartbeat_ms,
-      leaseTtlMs: cfg.executor.lease_ttl_ms,
-    },
-  });
+  const executor = buildExecutor(cfg, store);
 
   // Reclaim runs whose executor died. Idempotent nodes resume; a run that was
   // mid-way through an at_most_once node parks for a human instead.

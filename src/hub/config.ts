@@ -24,9 +24,6 @@ export interface HubUiConfig {
 export interface HubConfig {
   workspaces: HubWorkspaceEntry[];
   ui: HubUiConfig;
-  /** Optional override for the history DB location. */
-  /** Postgres for hub history. Defaults to $DATABASE_URL. */
-  database_url?: string;
 }
 
 const DEFAULT_CONFIG: HubConfig = {

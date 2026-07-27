@@ -41,6 +41,14 @@ export interface RunnerConfig {
   leaseTtlMs: number;
   /** Bounds how many nodes execute at once within a single run. */
   maxParallelNodes: number;
+  /**
+   * Ceiling on agent turns per AI node, or 0 for the SDK's own default.
+   *
+   * A cost bound, so it is worth having even though no shipped workflow sets
+   * one per node. It was parsed from `agent.max_turns` and read by nothing,
+   * which meant an operator lowering it to cap spend got exactly nothing.
+   */
+  maxTurns: number;
 }
 
 export const DEFAULT_RUNNER_CONFIG: RunnerConfig = {
@@ -50,6 +58,7 @@ export const DEFAULT_RUNNER_CONFIG: RunnerConfig = {
   leaseHeartbeatMs: 15_000,
   leaseTtlMs: 60_000,
   maxParallelNodes: 4,
+  maxTurns: 0,
 };
 
 export interface RunnerDeps {
@@ -403,6 +412,7 @@ export class WorkflowRunner {
       deniedTools: node.denied_tools,
       outputFormat: node.output_format,
       resumeSessionId: this.inheritedSession(node),
+      ...(this.deps.config.maxTurns > 0 ? { maxTurns: this.deps.config.maxTurns } : {}),
       idleTimeoutMs: node.idle_timeout ?? this.deps.config.nodeIdleTimeoutMs,
       signal: this.abort.signal,
       readOnly: this.ctx.dryRun,

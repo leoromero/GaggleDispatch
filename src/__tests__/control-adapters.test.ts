@@ -178,7 +178,6 @@ function adapter(
 }
 
 type Callbacks = {
-  onStarted: (pid: number) => void;
   onOutput: (line: string) => void;
   onRunId: (runId: string) => void;
   onGatePaused: (runId: string, message: string) => void;

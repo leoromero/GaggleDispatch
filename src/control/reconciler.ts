@@ -242,7 +242,23 @@ export class Reconciler {
         await this.deps.service.confirmCancel(target.id);
         return true;
       case 'paused': {
-        if (target.status !== 'running' || !observed.approval) return false;
+        if (!observed.approval) return false;
+        // A target already parked is normally nothing to do — except when the
+        // question itself changed. Startup recovery appends its `at_most_once`
+        // warning to a gate that was already pending, and without this the
+        // operator answers the pre-crash question. The message comparison is
+        // also a tighter guard than the grace window below: a gate mid-resume
+        // reports the *same* message, so it cannot trip this.
+        if (target.status === 'gate_waiting') {
+          if (observed.approval.message === target.gate_message) return false;
+          await this.deps.service.gateOpened(
+            target.id,
+            observed.approval.id,
+            observed.approval.message,
+          );
+          return true;
+        }
+        if (target.status !== 'running') return false;
         // An approved gate keeps reporting `paused` for a while: the executor is
         // resuming, but has not got there yet. Re-opening the gate on that window
         // would post a second comment and, on the following tick, approve a

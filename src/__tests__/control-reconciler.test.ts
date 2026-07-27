@@ -296,6 +296,66 @@ describe('Reconciler — run observation', () => {
     expect(gates[0]!.approval_id).toBe('appr-7');
   });
 
+  test('a gate whose question changed is re-asked, not silently updated', async () => {
+    // Startup recovery appends its `at_most_once` warning to a gate that was
+    // already pending — only one gate may be pending, so it cannot raise its
+    // own. Without this the control plane keeps the pre-crash question, and the
+    // operator approves having never been told that a node may already have
+    // opened a pull request. That is precisely what the marker exists to stop.
+    const { h, runs, writes, reconciler } = await rig();
+    const ticket = await startedTicket(h);
+    await reconciler.tick();
+    const target = (await h.store.listTargets(ticket.id))[0]!;
+
+    runs.observations.set(target.run_id!, {
+      status: 'paused',
+      approval: { id: 'appr-1', message: 'Approve the plan?' },
+    });
+    await reconciler.tick();
+    expect((await h.store.getTarget(target.id))!.status).toBe('gate_waiting');
+    const commentsBefore = writes.comments.length;
+
+    // Recovery rewrites the question.
+    runs.observations.set(target.run_id!, {
+      status: 'paused',
+      approval: {
+        id: 'appr-1',
+        message:
+          'Approve the plan?\n\n---\n\nAlso: create-pr was interrupted and may already have run.',
+      },
+    });
+    await reconciler.tick();
+
+    const gates = await h.store.listPendingGates(WS);
+    expect(gates).toHaveLength(1);
+    expect(gates[0]!.gate_message).toContain('may already have run');
+    // Told, not just recorded — the old question is already on the tracker.
+    expect(writes.comments.length).toBe(commentsBefore + 1);
+    expect(writes.comments.at(-1)!.body).toMatch(/question changed/i);
+    expect(writes.comments.at(-1)!.body).toContain('may already have run');
+  });
+
+  test('an unchanged question is not re-asked on every tick', async () => {
+    // The other half: the reconciler sees the same paused gate every tick, and
+    // must not post a comment each time.
+    const { h, runs, writes, reconciler } = await rig();
+    const ticket = await startedTicket(h);
+    await reconciler.tick();
+    const target = (await h.store.listTargets(ticket.id))[0]!;
+    runs.observations.set(target.run_id!, {
+      status: 'paused',
+      approval: { id: 'appr-1', message: 'Approve the plan?' },
+    });
+
+    await reconciler.tick();
+    const after = writes.comments.length;
+    await reconciler.tick();
+    await reconciler.tick();
+
+    expect(writes.comments.length).toBe(after);
+    expect(await h.store.listPendingGates(WS)).toHaveLength(1);
+  });
+
   test('a paused run with no approval detail does not open a gate', async () => {
     const { h, runs, reconciler } = await rig();
     const ticket = await startedTicket(h);

@@ -17,12 +17,13 @@ import { WorkspaceManager } from '../workspace/workspace-manager.ts';
 import { buildIssueMessage, buildGaggleEnv } from '../workspace/message.ts';
 
 export interface WorkerExitEvent {
-  type: 'run_succeeded' | 'run_failed' | 'run_timed_out' | 'run_stalled' | 'run_cancelled';
+  type: 'run_succeeded' | 'run_failed' | 'run_timed_out' | 'run_cancelled';
   exit_code?: number;
+  /** The engine's own message, when it gave one. Becomes the failure reason. */
+  error?: string;
 }
 
 export interface WorkerCallbacks {
-  onStarted: (pid: number) => void;
   onOutput: (line: string) => void;
   onGatePaused: (run_id: string, gate_message: string) => void;
   onExit: (event: WorkerExitEvent) => void;
@@ -100,7 +101,7 @@ export function toWorkerCallbacks(cb: WorkerCallbacks): (e: RunEvent) => void {
         cb.onExit({ type: 'run_succeeded' });
         break;
       case 'run_failed':
-        cb.onExit({ type: 'run_failed', exit_code: 1 });
+        cb.onExit({ type: 'run_failed', exit_code: 1, error: e.error });
         break;
       case 'run_cancelled':
         cb.onExit({ type: 'run_cancelled' });
@@ -201,7 +202,6 @@ export function buildLiveSession(args: {
     repo_alias: repo_target.repo_alias,
     repo_target,
     sub_issue_id,
-    run_pid: null,
     run_id: null,
     workflow: repo_target.workflow,
     last_event: null,

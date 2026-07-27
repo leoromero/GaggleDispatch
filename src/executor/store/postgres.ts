@@ -9,8 +9,7 @@
 
 import { SQL } from 'bun';
 import { logger } from '../../util/logger.ts';
-import { LATEST_VERSION, MIGRATIONS } from './migrations.ts';
-import { applyMigrations } from '../../store/migrate.ts';
+import { migrateAll } from '../../store/schema.ts';
 import type {
   ApprovalDecision,
   ApprovalRow,
@@ -190,19 +189,18 @@ export class PostgresStore implements Store {
   // ── migrations ────────────────────────────────────────────────────────────
 
   /**
-   * Apply the engine's migrations.
+   * Bring the database up to date — the whole schema, not just this module's.
    *
-   * Delegates to the shared runner rather than looping here: the database is
-   * shared with the control plane and hub history, `gaggle nest start` migrates
-   * from several processes at once, and the runner holds a transaction-scoped
-   * advisory lock across the whole run. The loop this replaced read the applied
-   * set outside any lock and died inside `CREATE TABLE` when two processes
-   * raced a virgin database.
+   * Authorship is per-owner (see `store/schema.ts`); application is not. A
+   * process that opens this database needs every table in it: the engine store
+   * reads `scaffold_jobs`, which the control plane creates, and the hub's
+   * history tables were reachable only from `nest start`. Applying one slice
+   * produced a database that looked migrated and could not be used.
    */
   async migrate(): Promise<void> {
-    await applyMigrations(this.sql as never, MIGRATIONS);
-    logger.debug('Engine schema up to date', { version: LATEST_VERSION });
+    await migrateAll(this.sql as never);
   }
+
 
   // ── runs ──────────────────────────────────────────────────────────────────
 

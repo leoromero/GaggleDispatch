@@ -152,7 +152,7 @@ scaffold
   });
 scaffold
   .command('cancel <slug>')
-  .description('Abandon a scaffold job and remove it from scaffold_jobs.yaml')
+  .description('Abandon a scaffold job and forget it')
   .action(async (slug: string) => {
     await runScaffoldCancel({ slug, cwd: program.opts().cwd });
   });

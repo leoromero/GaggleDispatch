@@ -34,7 +34,7 @@ export async function runStatus(opts: { cwd?: string; json?: boolean }): Promise
   console.log(chalk.bold('Source Registry (WORKFLOW.md):'));
   console.log(`  ${cfg.repositories.length} repositories registered.\n`);
 
-  console.log(chalk.bold('Synced Registry (registry.synced.yaml):'));
+  console.log(chalk.bold('Synced Registry:'));
   if (!synced) {
     console.log(chalk.gray('  (not synced — run `gaggle sync`)'));
   } else {
@@ -53,7 +53,7 @@ export async function runStatus(opts: { cwd?: string; json?: boolean }): Promise
   }
   console.log('');
 
-  console.log(chalk.bold('Scaffold Jobs (scaffold_jobs.yaml):'));
+  console.log(chalk.bold('Scaffold Jobs:'));
   if (jobs.jobs.length === 0) {
     console.log(chalk.gray('  (none)'));
   } else {

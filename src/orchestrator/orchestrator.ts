@@ -259,7 +259,6 @@ export class Orchestrator {
     repo_target: RepoTarget;
     analysis: IssueAnalysis;
     callbacks: {
-      onStarted: (pid: number) => void;
       onOutput: (line: string) => void;
       onRunId: (runId: string) => void;
       onGatePaused: (runId: string, message: string) => void;
@@ -303,14 +302,6 @@ export class Orchestrator {
           sub_issue_url: target.external_target_url,
         },
         {
-          onStarted: (pid) => {
-            const s = this.state.running.get(key);
-            if (s) {
-              s.run_pid = pid;
-              s.last_event_at = new Date().toISOString();
-            }
-            callbacks.onStarted(pid);
-          },
           onOutput: (line) => {
             const s = this.state.running.get(key);
             if (s) {

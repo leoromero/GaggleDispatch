@@ -102,8 +102,6 @@ async function rig(
     agent: {
       max_concurrent_agents: over.maxAgents ?? 5,
       max_turns: 20,
-      max_retry_backoff_ms: 1000,
-      max_concurrent_agents_by_state: {},
     },
   });
   cfg.tracker.mirror_labels = over.mirrorLabels ?? false;
@@ -392,11 +390,9 @@ describe('Orchestrator — Analyze, Start, run, complete', () => {
     await upToStart(r);
     await r.tick();
 
-    r.spawns[0]!.cb.onStarted(4242);
     r.spawns[0]!.cb.onOutput('thinking about the widget');
     const running = [...r.orchestrator.getState().running.values()];
     expect(running).toHaveLength(1);
-    expect(running[0]!.run_pid).toBe(4242);
     expect(running[0]!.last_message).toBe('thinking about the widget');
     expect(running[0]!.turn_count).toBe(1);
 

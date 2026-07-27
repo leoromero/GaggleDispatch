@@ -218,24 +218,6 @@ main {
   flex-wrap: wrap;
 }
 
-.target-chip {
-  padding: 1px 6px;
-  border-radius: 4px;
-  font-size: 10px;
-  background: var(--border);
-  color: var(--text-dim);
-}
-
-.target-chip.running {
-  background: rgba(16, 185, 129, 0.15);
-  color: var(--green);
-}
-
-.target-chip.gate {
-  background: rgba(245, 158, 11, 0.15);
-  color: var(--amber);
-}
-
 /* Workers */
 .workers-list {
   overflow-y: auto;

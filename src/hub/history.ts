@@ -12,7 +12,6 @@
  * is left on disk for archaeology; these tables start empty.
  */
 
-import { applyMigrations } from '../store/migrate.ts';
 import {
   int,
   isoRequired,
@@ -23,7 +22,7 @@ import {
   type Row,
   type Sql,
 } from '../store/sql.ts';
-import { HUB_MIGRATIONS } from './history-migrations.ts';
+import { migrateAll } from '../store/schema.ts';
 import { logger } from '../util/logger.ts';
 
 export interface WorkspaceRow {
@@ -107,8 +106,17 @@ export class HistoryStore {
     this.sql = openSql(databaseUrl);
   }
 
+  /**
+   * Bring the database up to date — the whole schema, not just this module's.
+   *
+   * Authorship is per-owner (see `store/schema.ts`); application is not. A
+   * process that opens this database needs every table in it: the engine store
+   * reads `scaffold_jobs`, which the control plane creates, and the hub's
+   * history tables were reachable only from `nest start`. Applying one slice
+   * produced a database that looked migrated and could not be used.
+   */
   async migrate(): Promise<void> {
-    await applyMigrations(this.sql, HUB_MIGRATIONS);
+    await migrateAll(this.sql as never);
   }
 
   async close(): Promise<void> {

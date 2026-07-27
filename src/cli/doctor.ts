@@ -11,10 +11,8 @@
 import chalk from 'chalk';
 import { loadHubConfig } from '../hub/config.ts';
 import { openSql } from '../store/sql.ts';
-import { applyMigrations, currentVersion, pendingVersions } from '../store/migrate.ts';
-import { CONTROL_MIGRATIONS } from '../control/store/migrations.ts';
-import { MIGRATIONS as ENGINE_MIGRATIONS } from '../executor/store/migrations.ts';
-import { HUB_MIGRATIONS } from '../hub/history-migrations.ts';
+import { currentVersion, pendingVersions } from '../store/migrate.ts';
+import { ALL_MIGRATIONS, migrateAll } from '../store/schema.ts';
 import { resolveBashPath } from '../executor/engine/shell.ts';
 import { loadConfig, type GlobalOptions } from './common.ts';
 import { commandExists } from '../util/subprocess.ts';
@@ -75,8 +73,8 @@ export async function runDoctor(opts: GlobalOptions & { json?: boolean } = {}): 
           detail: 'no bash found — every `bash:` workflow node will fail',
           fix:
             process.platform === 'win32'
-              ? 'Install Git for Windows (it ships Git Bash), or set executor.bash_path'
-              : 'Install bash, or set executor.bash_path',
+              ? 'Install Git for Windows (it ships Git Bash), or point GAGGLE_BASH at a bash.exe'
+              : 'Install bash, or point GAGGLE_BASH at it',
         },
   );
 
@@ -102,11 +100,10 @@ export async function runDoctor(opts: GlobalOptions & { json?: boolean } = {}): 
         detail: `connected to ${rows[0]?.db} (${server})`,
       });
 
-      // All three owners share one database and one schema_migrations table, so
-      // checking a single set would report "current" while another owner's
+      // Every owner: they share one database and one schema_migrations table,
+      // so checking a single set would report "current" while another owner's
       // tables are missing entirely.
-      const all = [...ENGINE_MIGRATIONS, ...CONTROL_MIGRATIONS, ...HUB_MIGRATIONS];
-      const pending = await pendingVersions(sql, all);
+      const pending = await pendingVersions(sql, ALL_MIGRATIONS);
       const applied = await currentVersion(sql);
       checks.push(
         pending.length === 0
@@ -115,7 +112,11 @@ export async function runDoctor(opts: GlobalOptions & { json?: boolean } = {}): 
               name: 'migrations',
               level: 'warn',
               detail: `${pending.length} migration(s) pending: ${pending.join(', ')}`,
-              fix: 'They apply automatically on `gaggle start`',
+              // Every command that opens the database migrates it, so this is
+              // rarely actionable — but naming the explicit command beats
+              // pointing at `gaggle start`, which a `gaggle sync` user is not
+              // about to run.
+              fix: 'Run `gaggle db migrate`, or just run any command — they all apply it',
             },
       );
     } catch (err) {
@@ -203,11 +204,7 @@ export async function runDbMigrate(opts: GlobalOptions = {}): Promise<void> {
   const sql = openSql(cfg.database.url);
   try {
     const before = await currentVersion(sql);
-    const applied = await applyMigrations(sql, [
-      ...ENGINE_MIGRATIONS,
-      ...CONTROL_MIGRATIONS,
-      ...HUB_MIGRATIONS,
-    ]);
+    const applied = await migrateAll(sql);
     console.log(
       applied.length === 0
         ? chalk.green(`✓ schema already current (at ${before})`)

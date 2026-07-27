@@ -534,6 +534,10 @@ describe('targetTransition', () => {
     );
     expect(t.to).toBe('failed');
     expect(t.patch.failure_reason).toMatch(/rework/i);
+    // The budget is spent, so there is nothing left to rework: stop the run
+    // instead of resuming it into `on_reject` one more time.
+    expect(kinds(t)).toContain('kill_run');
+    expect(kinds(t)).not.toContain('reject_gate');
   });
 
   test('a zero rework budget sends the first rejection straight to failed', () => {
@@ -556,7 +560,13 @@ describe('targetTransition', () => {
     );
     expect(t.to).toBe('blocked');
     expect(kinds(t)).toContain('create_blocker_issue');
-    expect(kinds(t)).toContain('reject_gate');
+    // `kill_run`, not `reject_gate`. Rejecting resumes the run so the workflow's
+    // `on_reject` can rework — meaningless for a target that is now waiting on
+    // someone else's work and will be dispatched fresh when it clears. The old
+    // effect left the run parked at its gate holding a worktree for the life of
+    // the blocker, while the board said blocked.
+    expect(kinds(t)).toContain('kill_run');
+    expect(kinds(t)).not.toContain('reject_gate');
   });
 
   test('gate_timed_out → failed', () => {
@@ -567,6 +577,11 @@ describe('targetTransition', () => {
     );
     expect(t.to).toBe('failed');
     expect(t.patch.failure_reason).toMatch(/timed out|timeout/i);
+    // A settled target does not rework: stop the run rather than resuming it
+    // into `on_reject`. `gaggle init` scaffolds a 24h gate timeout, so this is
+    // live in a default install.
+    expect(kinds(t)).toContain('kill_run');
+    expect(kinds(t)).not.toContain('reject_gate');
   });
 
   test('gate transitions restore the resume state when one is configured', () => {
@@ -582,6 +597,36 @@ describe('targetTransition', () => {
     expect(t.effects.find((e) => e.kind === 'tracker_set_state')).toMatchObject({
       state: 'In Progress',
     });
+  });
+
+  test('every way out of a gate leaves the waiting state behind', () => {
+    // Approval is the obvious one. The others matter more: a timeout or an
+    // exhausted rework budget settles the target, so nobody is waiting on a
+    // human any more and the issue must not be left sitting in the
+    // waiting-human state. Swapping `reject_gate` for `kill_run` on those paths
+    // is exactly the sort of edit that drops this silently.
+    const cases: Array<[string, TargetEvent, Partial<TargetRow>]> = [
+      ['approved', { kind: 'gate_approved', comment: null }, {}],
+      ['rejected with budget left', { kind: 'gate_rejected', reason: 'no' }, { gate_rework_attempts: 0 }],
+      ['rejected with budget spent', { kind: 'gate_rejected', reason: 'no' }, { gate_rework_attempts: 3 }],
+      ['timed out', { kind: 'gate_timed_out' }, {}],
+    ];
+    for (const [name, event, over] of cases) {
+      const t = targetTransition(
+        'gate_waiting',
+        event,
+        targetCtx({
+          target: target({ status: 'gate_waiting', ...over }),
+          gate_waiting_state: 'Blocked',
+          gate_resume_state: 'In Progress',
+          max_gate_rework_attempts: 3,
+        }),
+      );
+      expect(
+        t.effects.find((e) => e.kind === 'tracker_set_state'),
+        `${name} left the issue in the waiting state`,
+      ).toMatchObject({ state: 'In Progress' });
+    }
   });
 
   test('cancel_requested on a pre-dispatch target cancels immediately', () => {
@@ -759,6 +804,10 @@ const TARGET_ACCEPTS: Record<TargetStatus, readonly (typeof TARGET_EVENT_KINDS)[
     'gate_rejected',
     'gate_blocker_created',
     'gate_timed_out',
+    // A parked gate whose *question* changed. Startup recovery appends its
+    // at_most_once warning to a gate that was already pending, and the operator
+    // has to be told before answering.
+    'gate_opened',
     // A run can end while its gate is still open — see the note in transitions.ts.
     'run_succeeded',
     'run_failed',

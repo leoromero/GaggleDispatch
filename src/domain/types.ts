@@ -123,8 +123,6 @@ export interface HooksConfig {
 export interface AgentConfig {
   max_concurrent_agents: number;
   max_turns: number;
-  max_retry_backoff_ms: number;
-  max_concurrent_agents_by_state: Record<string, number>;
 }
 
 /**
@@ -146,7 +144,6 @@ export interface ExecutorConfig {
   /** Default total execution limit for `bash:` / `script:` nodes. Default: 2 min. */
   bash_timeout_ms: number;
   /** Informational stall threshold — no node activity for this long. 0 disables. */
-  stall_timeout_ms: number;
   /** Auto-reject a supervised gate after this long with no human reply. 0 disables. */
   gate_timeout_ms: number;
   /**
@@ -337,7 +334,6 @@ export interface LiveSession {
   repo_alias: string;
   repo_target: RepoTarget;
   sub_issue_id: string | null;
-  run_pid: number | null;
   /** Engine run id, known as soon as the run row is created. */
   run_id: string | null;
   workflow: string;

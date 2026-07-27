@@ -5,8 +5,7 @@
 import chalk from 'chalk';
 import { existsSync, mkdirSync } from 'node:fs';
 import { join, resolve as resolvePath } from 'node:path';
-import { loadConfig, fatal, info, success, withStore } from './common.ts';
-import { withLock } from '../util/lock.ts';
+import { buildExecutor, loadConfig, fatal, info, success, withStore } from './common.ts';
 import { run } from '../util/subprocess.ts';
 import { deriveRepoSlug, parseGithubOwnerRepo } from '../util/paths.ts';
 import { runSyncPass } from '../registry/repo-syncer.ts';
@@ -19,7 +18,6 @@ import {
 } from '../registry/scaffold-jobs.ts';
 import type { ScaffoldJob } from '../domain/types.ts';
 import { PostgresStore } from '../executor/store/postgres.ts';
-import { GaggleExecutor } from '../executor/engine/index.ts';
 import { syncWorkflowTemplates } from '../workspace/templates.ts';
 
 const DEFAULT_SCAFFOLD_WORKFLOW = 'gaggle/gaggle-scaffold';
@@ -105,10 +103,7 @@ export async function runRepoScaffold(args: ScaffoldArgs): Promise<void> {
 
   const store = new PostgresStore(cfg.database.url, { maxConnections: 3 });
   await store.migrate();
-  const executor = new GaggleExecutor({
-    store,
-    artifactsRoot: join(cfg.registry.base_folder, 'artifacts'),
-  });
+  const executor = buildExecutor(cfg, store);
 
   const job: ScaffoldJob = {
     slug,
@@ -185,17 +180,8 @@ export async function runScaffoldStatus(opts: { cwd?: string; json?: boolean; re
 
   // Run ids are recorded at launch, so status is a direct lookup rather than
   // the working-path-and-timestamp matching the CLI used to need.
-  const store = new PostgresStore(cfg.database.url, { maxConnections: 2 });
-  const executor = new GaggleExecutor({
-    store,
-    artifactsRoot: join(baseFolder, 'artifacts'),
-  });
-
   await withStore(cfg, async (store) => {
-    const executor = new GaggleExecutor({
-      store,
-      artifactsRoot: join(baseFolder, 'artifacts'),
-    });
+    const executor = buildExecutor(cfg, store);
     const fresh = await loadScaffoldJobs(store);
     const updated: typeof fresh.jobs = [];
 
@@ -257,10 +243,7 @@ export async function runScaffoldCancel(args: { slug: string; cwd?: string }): P
     if (!job) fatal(`No scaffold job for slug '${args.slug}'.`);
     if (job!.run_id) {
       try {
-        await new GaggleExecutor({
-          store,
-          artifactsRoot: join(cfg.registry.base_folder, 'artifacts'),
-        }).abandon(job!.run_id);
+        await buildExecutor(cfg, store).abandon(job!.run_id);
         info(`Abandoned run ${job!.run_id}.`);
       } catch (err) {
         console.log(chalk.yellow(`  Could not abandon run: ${(err as Error).message}`));

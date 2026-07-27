@@ -27,6 +27,7 @@ import { CONTROL_MIGRATIONS } from '../control/store/migrations.ts';
 import { MIGRATIONS as ENGINE_MIGRATIONS } from '../executor/store/migrations.ts';
 import { HUB_MIGRATIONS } from '../hub/history-migrations.ts';
 import { openSql, type Sql } from '../store/sql.ts';
+import { ALL_MIGRATIONS, migrateAll } from '../store/schema.ts';
 
 const PG_URL = process.env.TEST_DATABASE_URL ?? '';
 
@@ -224,6 +225,36 @@ if (PG_URL) {
       // A sanity floor: if the regex ever stops matching, the test above passes
       // vacuously and this is what notices.
       expect(created.size).toBeGreaterThan(5);
+    });
+
+    test('a store opened the way the CLI opens it can use every table', async () => {
+      // The regression: `withStore` applied only the engine set, but the engine
+      // store reads `scaffold_jobs`, which the control plane creates. A fresh
+      // database therefore migrated "successfully" and then died on step 4 of
+      // the documented setup with a raw `relation does not exist`.
+      //
+      // Asserted through a real store against real DDL, because the shape of
+      // the bug was exactly that every string-level check passed.
+      const sql = openSql(PG_URL, { maxConnections: 1 });
+      const schema = `cliopen_${process.pid}`;
+      try {
+        await sql.unsafe(`DROP SCHEMA IF EXISTS ${schema} CASCADE`);
+        await sql.unsafe(`CREATE SCHEMA ${schema}`);
+        await sql.unsafe(`SET search_path TO ${schema}`);
+
+        await migrateAll(sql);
+
+        // One table from each owner, so a future split fails here.
+        for (const table of ['workflow_runs', 'scaffold_jobs', 'tickets', 'hub_workspaces']) {
+          const rows = (await sql.unsafe(
+            `SELECT to_regclass('${schema}.${table}') AS t`,
+          )) as Array<{ t: string | null }>;
+          expect(rows[0]?.t, `${table} was not created`).not.toBeNull();
+        }
+      } finally {
+        await sql.unsafe(`DROP SCHEMA IF EXISTS ${schema} CASCADE`).catch(() => {});
+        await sql.close();
+      }
     });
 
     test('applying every set to a virgin schema succeeds', async () => {

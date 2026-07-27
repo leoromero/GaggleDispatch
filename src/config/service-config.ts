@@ -249,18 +249,9 @@ export function buildServiceConfig(def: WorkflowDefinition): ServiceConfig {
 
   // ── agent ────────────────────────────────────────────────────────────────
   const agentRaw = asObject(root.agent, 'agent');
-  const byStateRaw = asObject(agentRaw.max_concurrent_agents_by_state, 'agent.max_concurrent_agents_by_state');
-  const max_concurrent_agents_by_state: Record<string, number> = Object.fromEntries(
-    Object.entries(byStateRaw).map(([k, v]) => [
-      k.toLowerCase(),
-      asPositiveInt(v, `agent.max_concurrent_agents_by_state.${k}`, 1),
-    ]),
-  );
   const agent: AgentConfig = {
     max_concurrent_agents: asPositiveInt(agentRaw.max_concurrent_agents, 'agent.max_concurrent_agents', 10),
     max_turns: asPositiveInt(agentRaw.max_turns, 'agent.max_turns', 20),
-    max_retry_backoff_ms: asPositiveInt(agentRaw.max_retry_backoff_ms, 'agent.max_retry_backoff_ms', 300_000),
-    max_concurrent_agents_by_state,
   };
 
   // ── executor ─────────────────────────────────────────────────────────────
@@ -283,7 +274,6 @@ export function buildServiceConfig(def: WorkflowDefinition): ServiceConfig {
   const exec = (key: string): unknown => executorRaw[key] ?? archonRaw[key];
   const executor: ExecutorConfig = {
     default_workflow: asString(exec('default_workflow'), 'executor.default_workflow', 'gaggle/gaggle-fix-issue'),
-    stall_timeout_ms: asInt(exec('stall_timeout_ms'), 'executor.stall_timeout_ms', 300_000),
     gate_timeout_ms: asInt(exec('gate_timeout_ms'), 'executor.gate_timeout_ms', 0),
     startup_cleanup_age_days: asInt(exec('startup_cleanup_age_days'), 'executor.startup_cleanup_age_days', 7),
     // Engine timings. Idle and bash timeouts bound a single node; the run
