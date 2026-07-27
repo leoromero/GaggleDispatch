@@ -32,6 +32,7 @@ import type {
   AppendEventInput,
   ControlStore,
   EnqueueOutboxInput,
+  OutboxLease,
   TargetPatch,
   TargetSpec,
   TicketPatch,
@@ -512,16 +513,29 @@ export class MemoryControlStore implements ControlStore {
       last_error: null,
       created_at: now(),
       sent_at: null,
+      claimed_at: null,
+      claimed_by: null,
     });
   }
 
-  async claimOutbox(workspace: string, limit: number): Promise<OutboxRow[]> {
+  async claimOutbox(workspace: string, limit: number, lease?: OutboxLease): Promise<OutboxRow[]> {
     if (limit <= 0) return [];
-    return this.t.outbox
+    const cutoff = lease ? Date.parse(now()) - lease.lease_ms : 0;
+    const picked = this.t.outbox
       .filter((o) => o.sent_at === null && o.workspace === workspace)
+      // A held lease hides the row from other claimers. Without a lease this is a
+      // plain read and claims nothing, matching Postgres.
+      .filter((o) => !lease || o.claimed_at === null || Date.parse(o.claimed_at) <= cutoff)
       .sort((a, b) => a.id - b.id)
-      .slice(0, limit)
-      .map((o) => ({ ...o }));
+      .slice(0, limit);
+    if (lease) {
+      const at = now();
+      for (const o of picked) {
+        o.claimed_at = at;
+        o.claimed_by = lease.claimed_by;
+      }
+    }
+    return picked.map((o) => ({ ...o }));
   }
 
   async markOutboxSent(id: number): Promise<void> {
@@ -534,6 +548,10 @@ export class MemoryControlStore implements ControlStore {
     if (row) {
       row.attempts += 1;
       row.last_error = error;
+      // See the note in postgres.ts: the lease means "in flight", and a recorded
+      // failure ends that. Holding it would delay the retry by a whole window.
+      row.claimed_at = null;
+      row.claimed_by = null;
     }
   }
 

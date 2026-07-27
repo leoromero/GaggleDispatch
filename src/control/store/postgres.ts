@@ -60,6 +60,7 @@ import type {
   AppendEventInput,
   ControlStore,
   EnqueueOutboxInput,
+  OutboxLease,
   TargetPatch,
   TargetSpec,
   TicketPatch,
@@ -166,6 +167,8 @@ function mapOutbox(r: Row): OutboxRow {
     last_error: text(r.last_error),
     created_at: isoRequired(r.created_at),
     sent_at: iso(r.sent_at),
+    claimed_at: iso(r.claimed_at),
+    claimed_by: text(r.claimed_by),
   };
 }
 
@@ -532,16 +535,39 @@ export class PostgresControlStore implements ControlStore {
       VALUES (${input.workspace}, ${input.external_id}, ${input.op}, ${input.payload ?? {}})`;
   }
 
-  async claimOutbox(workspace: string, limit: number): Promise<OutboxRow[]> {
+  async claimOutbox(workspace: string, limit: number, lease?: OutboxLease): Promise<OutboxRow[]> {
     if (limit <= 0) return [];
-    // SKIP LOCKED so two drainers never take the same row. The lock lives for the
-    // caller's transaction; `OutboxDrainer` opens one per batch.
+
+    // Without a lease this is a plain read of what is pending — used by tests and
+    // by anything inspecting the queue. It takes no locks and claims nothing, so
+    // it can never be mistaken for a drain.
+    if (!lease) {
+      const rows = (await this.sql`
+        SELECT * FROM tracker_outbox
+         WHERE sent_at IS NULL AND workspace = ${workspace}
+         ORDER BY id
+         LIMIT ${limit}`) as Row[];
+      return rows.map(mapOutbox);
+    }
+
+    // One statement, so the claim commits on its own and the caller can send
+    // outside any transaction. `FOR UPDATE SKIP LOCKED` in the sub-select still
+    // does the work of picking disjoint rows for two concurrent claimers; the
+    // difference is that the *lease* outlives this statement, so exclusion no
+    // longer depends on the caller keeping a transaction open.
     const rows = (await this.sql`
-      SELECT * FROM tracker_outbox
-       WHERE sent_at IS NULL AND workspace = ${workspace}
-       ORDER BY id
-       FOR UPDATE SKIP LOCKED
-       LIMIT ${limit}`) as Row[];
+      UPDATE tracker_outbox SET claimed_at = now(), claimed_by = ${lease.claimed_by}
+       WHERE id IN (
+         SELECT id FROM tracker_outbox
+          WHERE sent_at IS NULL AND workspace = ${workspace}
+            -- Inclusive, so a lease_ms of 0 means not leased at all rather than
+            -- leased for an instant. The memory store matches.
+            AND (claimed_at IS NULL
+                 OR claimed_at <= now() - make_interval(secs => ${lease.lease_ms / 1000}))
+          ORDER BY id
+          FOR UPDATE SKIP LOCKED
+          LIMIT ${limit})
+      RETURNING *`) as Row[];
     return rows.map(mapOutbox);
   }
 
@@ -550,8 +576,14 @@ export class PostgresControlStore implements ControlStore {
   }
 
   async markOutboxFailed(id: number, error: string): Promise<void> {
+    // Releasing the lease is the point of the write, not tidying. The lease means
+    // "a drainer is sending this right now"; a recorded failure ends that, and
+    // leaving it set would make the next retry wait out the whole lease window
+    // instead of happening on the next tick.
     await this.sql`
-      UPDATE tracker_outbox SET attempts = attempts + 1, last_error = ${error} WHERE id = ${id}`;
+      UPDATE tracker_outbox
+         SET attempts = attempts + 1, last_error = ${error}, claimed_at = NULL, claimed_by = NULL
+       WHERE id = ${id}`;
   }
 
   async discardExhaustedOutbox(workspace: string, maxAttempts: number): Promise<number> {

@@ -137,7 +137,13 @@ CREATE TABLE tracker_outbox (
   attempts    INT NOT NULL DEFAULT 0,
   last_error  TEXT,
   created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
-  sent_at     TIMESTAMPTZ
+  sent_at     TIMESTAMPTZ,
+  -- A lease, so two drainers cannot send the same row without either of them
+  -- holding a transaction open across the network calls. Claiming writes these
+  -- and commits; sending happens outside any transaction. An expired lease is
+  -- reclaimable, which is what makes a crashed drainer self-healing.
+  claimed_at  TIMESTAMPTZ,
+  claimed_by  TEXT
 );
 
 CREATE INDEX idx_outbox_unsent ON tracker_outbox (id) WHERE sent_at IS NULL;

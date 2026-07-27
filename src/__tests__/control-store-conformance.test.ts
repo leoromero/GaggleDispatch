@@ -646,6 +646,46 @@ function suite(name: string, makeStore: () => Promise<ControlStore>, cleanup?: (
       expect(again[0]!.last_error).toBe('network down');
     });
 
+    // ── leases ────────────────────────────────────────────────────────────
+
+    test('a lease hides the row from another claimer until it expires', async () => {
+      await store.enqueueOutbox({ workspace: WS, external_id: 'lin-1', op: 'set_state' });
+      const mine = await store.claimOutbox(WS, 10, { claimed_by: 'a', lease_ms: 60_000 });
+      expect(mine).toHaveLength(1);
+      expect(mine[0]!.claimed_by).toBe('a');
+      expect(mine[0]!.claimed_at).not.toBeNull();
+
+      // A second drainer finds nothing while the lease holds…
+      expect(await store.claimOutbox(WS, 10, { claimed_by: 'b', lease_ms: 60_000 })).toHaveLength(0);
+      // …and takes it once the window has passed, which is what makes a drainer
+      // that died mid-batch self-healing rather than a stuck queue.
+      const later = await store.claimOutbox(WS, 10, { claimed_by: 'b', lease_ms: 0 });
+      expect(later.map((r) => r.claimed_by)).toEqual(['b']);
+    });
+
+    test('claiming without a lease is a plain read, and claims nothing', async () => {
+      // Tests and diagnostics inspect the queue this way. If it leased, looking at
+      // the queue would stop the drainer draining it.
+      await store.enqueueOutbox({ workspace: WS, external_id: 'lin-1', op: 'set_state' });
+      const peek = await store.claimOutbox(WS, 10);
+      expect(peek).toHaveLength(1);
+      expect(peek[0]!.claimed_at).toBeNull();
+      expect(await store.claimOutbox(WS, 10, { claimed_by: 'a', lease_ms: 60_000 })).toHaveLength(1);
+    });
+
+    test('a recorded failure releases the lease, so the retry is not delayed by it', async () => {
+      // The lease means "a drainer is sending this right now". A failure ends that,
+      // and holding it would push the retry out by a whole lease window — with a
+      // 30-minute default, a transient blip would look like a lost write.
+      await store.enqueueOutbox({ workspace: WS, external_id: 'lin-1', op: 'set_state' });
+      const [row] = await store.claimOutbox(WS, 10, { claimed_by: 'a', lease_ms: 60_000 });
+      await store.markOutboxFailed(row!.id, 'tracker unreachable');
+
+      const retry = await store.claimOutbox(WS, 10, { claimed_by: 'a', lease_ms: 60_000 });
+      expect(retry).toHaveLength(1);
+      expect(retry[0]!.attempts).toBe(1);
+    });
+
     test('discardExhaustedOutbox drops rows at or past the attempt ceiling', async () => {
       await store.enqueueOutbox({ workspace: WS, external_id: 'lin-1', op: 'set_state' });
       await store.enqueueOutbox({ workspace: WS, external_id: 'lin-2', op: 'set_state' });

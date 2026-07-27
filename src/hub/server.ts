@@ -15,6 +15,7 @@ import { HubProcessManager } from './process-manager.ts';
 import type { HistoryStore } from './history.ts';
 import type { ArchonSupervisor } from './archon-supervisor.ts';
 import type { ControlApi } from '../control/api.ts';
+import { crossSiteWrite } from './cross-site.ts';
 import { logger } from '../util/logger.ts';
 
 interface DashWsData {
@@ -226,6 +227,11 @@ export function startHubServer(opts: HubServerOptions): HubServerHandle {
     hostname: opts.cfg.ui.host ?? '127.0.0.1',
     async fetch(req, srv) {
       const url = new URL(req.url);
+      // Before routing, so it covers the process controls too — those start and
+      // stop daemons, which is no less consequential than the board's verbs.
+      if (crossSiteWrite(req)) {
+        return Response.json({ error: 'cross-site requests are not accepted' }, { status: 403 });
+      }
       if (url.pathname === '/api/ws') {
         const id = nextClientId++;
         const ok = srv.upgrade(req, { data: { id } });

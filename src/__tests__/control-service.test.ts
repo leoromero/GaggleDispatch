@@ -781,10 +781,15 @@ describe('OutboxDrainer', () => {
 
 // ─── concurrent drainers ────────────────────────────────────────────────────
 //
-// Two gaggles in one workspace both drain the outbox. The claim's row locks have
-// to be held for as long as the row is in flight, or both send it and every
-// comment is posted twice. Only real Postgres has row locks, so this needs a
-// database — MemoryControlStore's snapshot transactions cannot model the race.
+// Two gaggles in one workspace both drain the outbox. Exclusion has to survive the
+// claim's own transaction, or both send every row and each comment is posted
+// twice. This is the test that pins *why* the exclusion is a lease and not a row
+// lock: a lock would work here too, but only by keeping a transaction — and a
+// pooled connection — open across every network call in the batch, which is what
+// let a stalled Linear hold both indefinitely.
+//
+// Needs real Postgres: MemoryControlStore's snapshot transactions cannot model
+// two callers at once.
 
 const PG_URL = process.env.TEST_DATABASE_URL ?? '';
 
@@ -830,8 +835,9 @@ if (PG_URL) {
         resume.resolve();
         const firstResult = await first;
 
-        // The whole batch belongs to the first drainer for as long as it holds the
-        // transaction, so the second finds nothing to do rather than re-sending.
+        // The batch is leased to the first drainer, so the second finds nothing to
+        // do rather than re-sending — and the first is *not* holding a transaction
+        // while it works, which is the whole point of the lease.
         expect(second.sent).toBe(0);
         expect(b.comments).toEqual([]);
         expect(firstResult.sent).toBe(8);

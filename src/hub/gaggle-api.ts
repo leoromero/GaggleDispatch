@@ -20,6 +20,7 @@ import type { Server, ServerWebSocket } from 'bun';
 import type { LiveSession, OrchestratorState } from '../domain/types.ts';
 import { subscribeLogs, type LogEvent } from '../util/logger.ts';
 import type { ControlApi } from '../control/api.ts';
+import { crossSiteWrite } from './cross-site.ts';
 
 export interface GaggleApiOptions {
   port: number;
@@ -111,6 +112,11 @@ export function startGaggleApi(opts: GaggleApiOptions): GaggleApiHandle {
     hostname: host,
     async fetch(req, srv) {
       const url = new URL(req.url);
+      // Same reasoning as the hub's: this surface also mounts /api/control/*, and
+      // it binds loopback with no auth in front of it. See `crossSiteWrite`.
+      if (crossSiteWrite(req)) {
+        return Response.json({ error: 'cross-site requests are not accepted' }, { status: 403 });
+      }
       if (url.pathname === '/api/stream') {
         const ok = srv.upgrade(req, { data: { kind: 'stream' } });
         if (ok) return undefined;

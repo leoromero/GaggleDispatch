@@ -13,7 +13,7 @@
 
 import { logger } from '../util/logger.ts';
 import type { TrackerWritePort } from './ports.ts';
-import type { ControlStore } from './store/types.ts';
+import { DEFAULT_OUTBOX_LEASE_MS, type ControlStore, type OutboxLease } from './store/types.ts';
 import type { OutboxRow } from './types.ts';
 
 export interface OutboxDrainerConfig {
@@ -23,6 +23,10 @@ export interface OutboxDrainerConfig {
   batch_size: number;
   /** Attempts before a row is discarded. */
   max_attempts: number;
+  /** Identifies this drainer on the rows it claims. Diagnostic only. */
+  claimed_by?: string;
+  /** Lease window. Must exceed `batch_size` × the HTTP deadline — see {@link OutboxLease}. */
+  lease_ms?: number;
 }
 
 export interface OutboxDrainResult {
@@ -55,31 +59,37 @@ export class OutboxDrainer {
     let sent = 0;
     let failed = 0;
 
-    // The whole batch runs in one transaction so `claimOutbox`'s row locks are
-    // still held while each row is being sent. Without that, a second drainer
-    // could claim and re-send rows this one is mid-flight on, posting every
-    // comment twice.
-    await this.store.tx(async (tr) => {
-      const rows = await tr.claimOutbox(this.cfg.workspace, this.cfg.batch_size);
-      for (const row of rows) {
-        try {
-          await this.send(row);
-          await tr.markOutboxSent(row.id);
-          sent++;
-        } catch (err) {
-          const message = (err as Error).message;
-          await tr.markOutboxFailed(row.id, message);
-          failed++;
-          logger.warn('Tracker write failed; will retry', {
-            outbox_id: row.id,
-            op: row.op,
-            external_id: row.external_id,
-            attempts: row.attempts + 1,
-            error: message,
-          });
-        }
-      }
+    // Claim first, commit the claim, then send — deliberately *not* in one
+    // transaction. Batching the sends inside the claim's transaction also stops
+    // two drainers double-posting, and that is how this was first written, but it
+    // holds a pooled connection and N row locks for as long as the tracker takes
+    // to answer. Against a Linear that accepted connections and never replied,
+    // that was forever. The lease gives the same exclusion with none of that: it
+    // survives the commit, and it expires, so a drainer that dies mid-batch
+    // releases its rows on its own.
+    const rows = await this.store.claimOutbox(this.cfg.workspace, this.cfg.batch_size, {
+      claimed_by: this.cfg.claimed_by ?? 'gaggle',
+      lease_ms: this.cfg.lease_ms ?? DEFAULT_OUTBOX_LEASE_MS,
     });
+
+    for (const row of rows) {
+      try {
+        await this.send(row);
+        await this.store.markOutboxSent(row.id);
+        sent++;
+      } catch (err) {
+        const message = (err as Error).message;
+        await this.store.markOutboxFailed(row.id, message);
+        failed++;
+        logger.warn('Tracker write failed; will retry', {
+          outbox_id: row.id,
+          op: row.op,
+          external_id: row.external_id,
+          attempts: row.attempts + 1,
+          error: message,
+        });
+      }
+    }
 
     return { sent, failed, discarded };
   }

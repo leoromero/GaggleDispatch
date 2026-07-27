@@ -21,6 +21,7 @@ import {
   pendingVersions,
   MIGRATION_RANGES,
   type Migration,
+  type MigrationOwner,
 } from '../store/migrate.ts';
 import { CONTROL_MIGRATIONS } from '../control/store/migrations.ts';
 import { HUB_MIGRATIONS } from '../hub/history-migrations.ts';
@@ -182,3 +183,73 @@ describe('migration range ownership', () => {
     }
   });
 });
+
+// ─── every set together, on one fresh database ───────────────────────────────
+//
+// The check that was actually missing. `assertInRange` constrains *numbers*; the
+// collision was over *tables* — two owners each running `CREATE TABLE
+// scaffold_jobs`, at 100 and at 2, neither with IF NOT EXISTS. Numbering was
+// never the problem, and a comment saying "a range is a claim on tables" is not a
+// check.
+//
+// Applying every set the repo knows about to a virgin database is. It is also the
+// one test that will still be true after the engine branch merges — adding
+// `ENGINE_MIGRATIONS` to the list below is the whole change, and if its tables
+// overlap these, this fails on the spot instead of on someone's first boot.
+
+if (PG_URL) {
+  describe('all migration sets on one database', () => {
+    const OWNED: Array<{ owner: MigrationOwner; set: readonly Migration[] }> = [
+      { owner: 'control', set: CONTROL_MIGRATIONS },
+      { owner: 'hub', set: HUB_MIGRATIONS },
+      // When the workflow engine lands: { owner: 'engine', set: ENGINE_MIGRATIONS }
+    ];
+
+    test('no two owners create the same table', async () => {
+      const created = new Map<string, MigrationOwner>();
+      const clashes: string[] = [];
+      for (const { owner, set } of OWNED) {
+        for (const m of set) {
+          for (const [, table] of m.sql.matchAll(/CREATE TABLE (?:IF NOT EXISTS )?(\w+)/g)) {
+            const prior = created.get(table!);
+            if (prior && prior !== owner) clashes.push(`${table} (${prior} and ${owner})`);
+            created.set(table!, owner);
+          }
+        }
+      }
+      expect(clashes).toEqual([]);
+      // A sanity floor: if the regex ever stops matching, the test above passes
+      // vacuously and this is what notices.
+      expect(created.size).toBeGreaterThan(5);
+    });
+
+    test('applying every set to a virgin schema succeeds', async () => {
+      // Real DDL against a real server, because the failure mode is a Postgres
+      // error on the second CREATE TABLE — no string comparison reaches that.
+      //
+      // A schema rather than a database: `CREATE DATABASE` copies a template and
+      // takes server-wide locks, so under `bun test`'s parallelism it contended
+      // with the other Postgres suites and timed out. A schema is cheap, and one
+      // connection with `search_path` pointed at it gives the same isolation.
+      const sql = openSql(PG_URL, { maxConnections: 1 });
+      const schema = `allsets_${process.pid}`;
+      try {
+        await sql.unsafe(`DROP SCHEMA IF EXISTS ${schema} CASCADE`);
+        await sql.unsafe(`CREATE SCHEMA ${schema}`);
+        await sql.unsafe(`SET search_path TO ${schema}`);
+
+        for (const { set } of OWNED) {
+          const applied = await applyMigrations(sql, set);
+          expect(applied).toEqual(set.map((m) => m.version).sort((a, b) => a - b));
+        }
+        // Again, to prove each set stays idempotent over the others' schema.
+        for (const { set } of OWNED) {
+          expect(await applyMigrations(sql, set)).toEqual([]);
+        }
+      } finally {
+        await sql.unsafe(`DROP SCHEMA IF EXISTS ${schema} CASCADE`).catch(() => {});
+        await sql.close();
+      }
+    });
+  });
+}

@@ -22,16 +22,43 @@ export interface HttpClient {
 
 // ─── production impl ───────────────────────────────────────────────────────
 
-/** Wraps the runtime's global `fetch`. Used in production. */
+/**
+ * How long a single request may take before it is abandoned.
+ *
+ * There has to be a number here because Bun applies no response deadline of its
+ * own: against a server that accepts the connection and never answers,
+ * `globalThis.fetch` simply never settles. A tracker that is *down* is easy —
+ * the connection is refused and the call throws. A tracker that is *degraded*
+ * accepts and stalls, and that is the case that used to wedge the daemon: the
+ * outbox drainer awaited it inside a transaction, and the orchestrator only
+ * rescheduled its next tick in a `finally` that therefore never ran.
+ *
+ * 30s is well past a healthy Linear response and well short of a poll interval.
+ */
+export const DEFAULT_HTTP_TIMEOUT_MS = 30_000;
+
+/** Wraps the runtime's global `fetch`, with a deadline it does not supply. */
 export class FetchHttpClient implements HttpClient {
+  constructor(private readonly timeoutMs: number = DEFAULT_HTTP_TIMEOUT_MS) {}
+
   async fetch(url: string, init?: RequestInit): Promise<HttpResponse> {
-    const res = await globalThis.fetch(url, init);
+    const res = await globalThis.fetch(url, { ...init, signal: this.deadline(init?.signal) });
     return {
       ok: res.ok,
       status: res.status,
       json: () => res.json() as Promise<unknown>,
       text: () => res.text(),
     };
+  }
+
+  /**
+   * The caller's signal, if any, *plus* the deadline — never instead of it.
+   * Overwriting a caller's abort signal would silently disable their
+   * cancellation, which is a worse bug than the one being fixed.
+   */
+  private deadline(caller?: AbortSignal | null): AbortSignal {
+    const timeout = AbortSignal.timeout(this.timeoutMs);
+    return caller ? AbortSignal.any([caller, timeout]) : timeout;
   }
 }
 

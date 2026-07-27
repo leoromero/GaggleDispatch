@@ -255,6 +255,10 @@ export interface OutboxRow {
   last_error: string | null;
   created_at: string;
   sent_at: string | null;
+  /** When a drainer last leased this row. Null means unclaimed. */
+  claimed_at: string | null;
+  /** Which drainer holds the lease. Diagnostic only; the timestamp excludes. */
+  claimed_by: string | null;
 }
 
 export interface ScaffoldJobRow {

@@ -124,6 +124,29 @@ export interface EnqueueOutboxInput {
   payload?: Record<string, unknown>;
 }
 
+/** How a drainer marks a batch as its own. See {@link OutboxRepo.claimOutbox}. */
+export interface OutboxLease {
+  /** Identifies the drainer, for diagnosis. Not used for exclusion. */
+  claimed_by: string;
+  /**
+   * How long the claim holds before another drainer may take the rows.
+   *
+   * Long enough that a healthy batch finishes inside it, short enough that a
+   * crashed drainer's rows do not sit unsendable for long. It has to exceed the
+   * worst-case batch — `batch_size` × the HTTP deadline — or a slow batch's rows
+   * get taken and sent twice while the first drainer is still working.
+   */
+  lease_ms: number;
+}
+
+/**
+ * Default lease window: 50 rows × a 30s HTTP deadline, plus room.
+ *
+ * Derived from those two numbers rather than picked, because the relationship is
+ * the part that matters — see {@link OutboxLease.lease_ms}.
+ */
+export const DEFAULT_OUTBOX_LEASE_MS = 30 * 60 * 1000;
+
 // ─── Role interfaces ────────────────────────────────────────────────────────
 
 export interface TicketRepo {
@@ -216,11 +239,17 @@ export interface OutboxRepo {
    *
    * `workspace` is required, not optional: a drainer sends through *its own*
    * tracker client with its own state names, so draining another workspace's rows
-   * would write the wrong thing to the wrong tracker. Rows are locked with
-   * `FOR UPDATE SKIP LOCKED` for the caller's transaction, so two drainers cannot
-   * both send the same comment.
+   * would write the wrong thing to the wrong tracker.
+   *
+   * Exclusion is a **lease**, not a row lock. Both work, but a lock only holds for
+   * the claiming transaction, which forced the drainer to keep that transaction
+   * open across every network call in the batch — a pooled connection and N rows
+   * locked for as long as a degraded tracker took to answer. A lease is written and
+   * committed immediately, so sending happens outside any transaction, and a
+   * drainer that crashes mid-batch releases its rows when the lease expires
+   * instead of holding them until someone notices.
    */
-  claimOutbox(workspace: string, limit: number): Promise<OutboxRow[]>;
+  claimOutbox(workspace: string, limit: number, lease?: OutboxLease): Promise<OutboxRow[]>;
   markOutboxSent(id: number): Promise<void>;
   /** Records the failure and bumps `attempts`. */
   markOutboxFailed(id: number, error: string): Promise<void>;

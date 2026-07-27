@@ -93,7 +93,9 @@ interface Rig {
   tick: () => Promise<void>;
 }
 
-async function rig(over: { mirrorLabels?: boolean; maxAgents?: number } = {}): Promise<Rig> {
+async function rig(
+  over: { mirrorLabels?: boolean; maxAgents?: number; phaseTimeoutMs?: number } = {},
+): Promise<Rig> {
   const cfg = makeServiceConfig({
     agent: {
       max_concurrent_agents: over.maxAgents ?? 5,
@@ -202,6 +204,7 @@ async function rig(over: { mirrorLabels?: boolean; maxAgents?: number } = {}): P
       spawns.push({ args, cb });
       return { cancel: (r?: string) => cancels.push(r ?? 'cancelled'), done: Promise.resolve() };
     },
+    phaseTimeoutMs: over.phaseTimeoutMs,
   });
 
   await orchestrator.start();
@@ -669,3 +672,58 @@ describe('Orchestrator — sync and recovery', () => {
     expect(r.spawns).toHaveLength(1);
   });
 });
+
+// ─── surviving a hang ───────────────────────────────────────────────────────
+
+describe('Orchestrator — a wedged phase does not stop the loop', () => {
+  test('a sync that never returns is abandoned, and the rest of the tick runs', async () => {
+    // The failure this replaces: `tick()` awaited a stalled Linear forever, so the
+    // `finally` that reschedules never ran and the daemon stopped ticking for good
+    // — no dispatch, no reconciliation, no gates applied, and a single log line to
+    // explain it. A throw was always survivable; a hang was not.
+    const r = await rig({ phaseTimeoutMs: 150 });
+    const started = await startedTicketVia(r);
+
+    (r.orchestrator as unknown as { control: { sync: { sync: () => Promise<unknown> } } }).control.sync.sync =
+      () => new Promise(() => {});
+
+    await r.tick();
+
+    // Reconcile ran even though sync never answered, so the target was dispatched.
+    const targets = await r.store.listTargets(started.id);
+    expect(targets[0]!.status).toBe('running');
+    expect(r.spawns).toHaveLength(1);
+  });
+
+  test('a tick whose phase hangs still schedules the next one', async () => {
+    const r = await rig({ phaseTimeoutMs: 150 });
+    (r.orchestrator as unknown as { control: { sync: { sync: () => Promise<unknown> } } }).control.sync.sync =
+      () => new Promise(() => {});
+
+    // Two ticks in a row: if the first had wedged, the second could not complete.
+    await r.tick();
+    await r.tick();
+
+    const timer = (r.orchestrator as unknown as { tickTimer: unknown }).tickTimer;
+    expect(timer).not.toBeNull();
+  });
+});
+
+/** Import → analyze → start, driven through the orchestrator's own control plane. */
+async function startedTicketVia(r: Rig): Promise<{ id: string }> {
+  const control = (r.orchestrator as unknown as {
+    control: { service: { requestAnalysis(id: string): Promise<unknown>; claimAnalysisWork(n: number): Promise<unknown>; runAnalysis(t: unknown): Promise<unknown>; start(id: string): Promise<unknown> } };
+  }).control;
+  const ticket = await r.store.upsertTicket({
+    workspace: 'acme',
+    external_id: 'lin-hang',
+    identifier: 'GAG-H',
+    title: 'Hang test',
+    external_state: 'Todo',
+  });
+  await control.service.requestAnalysis(ticket.id);
+  await control.service.claimAnalysisWork(10);
+  await control.service.runAnalysis(await r.store.getTicket(ticket.id));
+  await control.service.start(ticket.id);
+  return ticket;
+}

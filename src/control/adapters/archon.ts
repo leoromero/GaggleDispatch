@@ -30,6 +30,7 @@ import type {
   RunStatusPort,
   SpawnResult,
 } from '../ports.ts';
+import { InvalidControlTransitionError } from '../transitions.ts';
 import type { TargetRow, TicketRow } from '../types.ts';
 
 /**
@@ -229,10 +230,24 @@ export class ArchonExecutorAdapter implements ExecutorPort {
     // then kills the process, which exits and reports `run_cancelled` — and
     // `run_failed` is not accepted from `cancelled`. A refused transition here
     // means the outcome was already recorded, which is not an error.
+    //
+    // Only *that* is benign, so only that is downgraded. Catching everything here
+    // would report a store outage, or a bug in `translateExit` itself, as a
+    // routine race — the log line would say the outcome was already recorded when
+    // in fact nothing recorded it, and the target would sit `running` with no
+    // explanation anywhere.
     try {
       await this.translateExit(targetId, event, runId);
     } catch (err) {
-      logger.warn('Ignoring a worker exit the control plane had already accounted for', {
+      if (err instanceof InvalidControlTransitionError) {
+        logger.warn('Ignoring a worker exit the control plane had already accounted for', {
+          target_id: targetId,
+          event: event.type,
+          error: err.message,
+        });
+        return;
+      }
+      logger.error('Could not record a worker exit; the reconciler will have to settle it', {
         target_id: targetId,
         event: event.type,
         error: (err as Error).message,

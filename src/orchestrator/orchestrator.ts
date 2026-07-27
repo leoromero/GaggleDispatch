@@ -60,6 +60,26 @@ export interface OrchestratorDeps {
    * only be verified by hand.
    */
   spawn?: typeof spawnWorker;
+  /**
+   * How long one tick phase may run before it is abandoned and the tick moves on.
+   *
+   * Deliberately generous: this is not a performance budget, it is the guarantee
+   * that the loop survives. Every network call already carries its own deadline;
+   * this catches the hang nobody predicted — a query with no statement timeout, a
+   * subprocess that never exits — because the cost of being wrong is that the
+   * daemon stops ticking entirely and reports nothing about why.
+   */
+  phaseTimeoutMs?: number;
+}
+
+/** See {@link OrchestratorDeps.phaseTimeoutMs}. */
+export const DEFAULT_PHASE_TIMEOUT_MS = 600_000;
+
+class PhaseTimeoutError extends Error {
+  constructor(phase: string, ms: number) {
+    super(`phase '${phase}' exceeded ${ms}ms and was abandoned`);
+    this.name = 'PhaseTimeoutError';
+  }
 }
 
 export class Orchestrator {
@@ -184,12 +204,36 @@ export class Orchestrator {
     }
   }
 
+  /**
+   * Run one phase, surviving both a throw and a hang.
+   *
+   * The hang half is the one that was missing, and it was not hypothetical: a
+   * Linear that accepted connections and stalled left `tick()` awaiting forever,
+   * so the `finally` that reschedules never ran and the daemon stopped ticking
+   * for good — no dispatch, no reconciliation, no gates applied, and one log
+   * line's worth of explanation. A throw was always handled; a hang is not a
+   * throw.
+   *
+   * Abandoning a phase does not cancel it — nothing here can. It bounds the
+   * *loop*, and the per-request deadlines bound the abandoned work itself.
+   */
   private async safely<T>(phase: string, fn: () => Promise<T>): Promise<T | null> {
+    const budget = this.deps.phaseTimeoutMs ?? DEFAULT_PHASE_TIMEOUT_MS;
+    let timer: ReturnType<typeof setTimeout> | undefined;
     try {
-      return await fn();
+      return await Promise.race([
+        fn(),
+        new Promise<never>((_, reject) => {
+          timer = setTimeout(() => reject(new PhaseTimeoutError(phase, budget)), budget);
+        }),
+      ]);
     } catch (err) {
       logger.error('Tick phase failed', { phase, error: (err as Error).message });
       return null;
+    } finally {
+      // Without this the pending timer keeps the process alive for the whole
+      // budget after a fast, healthy tick.
+      if (timer) clearTimeout(timer);
     }
   }
 
