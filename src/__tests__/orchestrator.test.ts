@@ -387,7 +387,7 @@ describe('Orchestrator analysis-cache invalidation', () => {
 });
 
 describe('Orchestrator.stop', () => {
-  test('cancels every running session', async () => {
+  test('stops the pollers and suspends the runs the executor is driving', async () => {
     const { tracker } = makeFakeTracker();
     const reg = makeFakeRegistry();
     const cfg = makeServiceConfig();
@@ -403,7 +403,14 @@ describe('Orchestrator.stop', () => {
     });
     orchestrators.push(o);
 
+    // A live run must NOT be cancelled on shutdown: that would mark it
+    // `cancelled` and abandon work a restart could finish. It is suspended by
+    // the executor instead, and the poller is stopped here.
     let cancelled = 0;
+    let pollerStopped = 0;
+    const deps = makeEngineDeps();
+    let suspended = 0;
+    deps.executor.shutdown = (async () => { suspended += 1; }) as typeof deps.executor.shutdown;
     o.getState().running.set('k1', {
       session_id: 'k1',
       issue: makeIssue(),
@@ -426,10 +433,15 @@ describe('Orchestrator.stop', () => {
       cancel: () => {
         cancelled++;
       },
+      stopPoller: () => {
+        pollerStopped++;
+      },
     });
 
     await o.stop();
-    expect(cancelled).toBe(1);
+    expect(pollerStopped).toBe(1);
+    expect(suspended).toBe(1);
+    expect(cancelled).toBe(0);
   });
 });
 

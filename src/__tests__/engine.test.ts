@@ -58,6 +58,16 @@ function stubAi(replies: Array<{ when: (p: string) => boolean; reply: Partial<Ai
 
 const always = () => true;
 
+/** Poll until a condition holds — for assertions about a run still in flight. */
+async function until(cond: () => Promise<boolean>, timeoutMs = 5_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (await cond()) return;
+    await Bun.sleep(10);
+  }
+  throw new Error('condition never became true');
+}
+
 function writeWorkflow(name: string, yaml: string): void {
   writeFileSync(join(repo, '.gaggle', 'workflows', `${name}.yaml`), yaml);
 }
@@ -717,6 +727,61 @@ describe('cancellation', () => {
     const { runId } = await runToCompletion(exec, 'simple');
     await exec.abandon(runId);
     expect(await statusOf(exec, runId)).toBe('completed');
+  });
+});
+
+// ── shutdown ────────────────────────────────────────────────────────────────
+
+describe('shutdown', () => {
+  /** A workflow whose only node blocks until the test lets it go. */
+  const blockingExecutor = () => {
+    let release!: () => void;
+    const blocked = new Promise<void>((r) => { release = r; });
+    writeWorkflow(
+      'long', `name: long\ndescription: d\nnodes:\n  - id: pr\n    prompt: "x"\n    side_effects: at_most_once`,
+    );
+    const exec = makeExecutor(async (req) => {
+      await Promise.race([blocked, new Promise((r) => req.signal?.addEventListener('abort', r))]);
+      return {
+        text: 'done', sessionId: null, inputTokens: 0, outputTokens: 0,
+        timedOut: false, cancelled: req.signal?.aborted ?? false,
+      } as AiResult;
+    });
+    return { exec, release };
+  };
+
+  test('leaves a suspended run exactly where recovery can find it', async () => {
+    // Review finding: exiting while runs hold a live lease hides them from
+    // recovery for the whole TTL — and recovery only sweeps at startup, so
+    // nothing picks them up afterwards either.
+    const { exec } = blockingExecutor();
+    const handle = await exec.startRun({ workflow: 'long', cwd: repo, message: 'm' }, () => {});
+    await until(async () => (await store.getNode(handle.run_id, 'pr'))?.status === 'running');
+
+    await exec.shutdown(5_000);
+
+    const run = (await store.getRun(handle.run_id))!;
+    expect(run.status).toBe('running');
+    expect(run.lease_owner).toBeNull();
+    expect(await store.findExpiredRuns()).toHaveLength(1);
+    // The node stays `running` too, so recovery marks it interrupted and the
+    // at_most_once gate still gets raised.
+    expect((await store.getNode(handle.run_id, 'pr'))!.status).toBe('running');
+  });
+
+  test('a cancel, unlike a suspend, does settle the run', async () => {
+    const { exec } = blockingExecutor();
+    const handle = await exec.startRun({ workflow: 'long', cwd: repo, message: 'm' }, () => {});
+    await until(async () => (await store.getNode(handle.run_id, 'pr'))?.status === 'running');
+
+    await exec.cancel(handle.run_id, 'user asked');
+    await handle.done;
+    expect(await statusOf(exec, handle.run_id)).toBe('cancelled');
+  });
+
+  test('shutdown with nothing running is a no-op', async () => {
+    const exec = makeExecutor(stubAi([]));
+    await exec.shutdown(100);
   });
 });
 

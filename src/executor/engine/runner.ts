@@ -81,7 +81,7 @@ export type RunnerStop =
   | { kind: 'cancelled'; reason: string }
   | { kind: 'paused'; node_id: string; message: string };
 
-const LEASE_OWNER = `${hostname()}:${process.pid}`;
+export const LEASE_OWNER = `${hostname()}:${process.pid}`;
 
 /** A gate decision made while the run was parked, replayed on resume. */
 export interface PendingDecision {
@@ -150,6 +150,7 @@ export class WorkflowRunner {
   private readonly abort = new AbortController();
 
   private stopped: RunnerStop | null = null;
+  private suspended = false;
   private heartbeat: ReturnType<typeof setInterval> | null = null;
   private runDeadline: ReturnType<typeof setTimeout> | null = null;
   private pendingDecision: PendingDecision | null = null;
@@ -175,6 +176,22 @@ export class WorkflowRunner {
   cancel(reason = 'cancelled by caller'): void {
     if (this.stopped) return;
     this.stopped = { kind: 'cancelled', reason };
+    this.abort.abort();
+  }
+
+  /**
+   * Stop for a restart, without settling the run.
+   *
+   * Cancelling would mark the run `cancelled` and throw away work that is only
+   * interrupted by a shutdown. This leaves the row `running` and its in-flight
+   * nodes `running`, then drops the lease on the way out — precisely the state
+   * startup recovery looks for, so the run is picked up again and an
+   * `at_most_once` node still gets its human.
+   */
+  suspend(): void {
+    if (this.suspended) return;
+    this.suspended = true;
+    this.stopped = { kind: 'cancelled', reason: 'executor shutting down' };
     this.abort.abort();
   }
 
@@ -776,6 +793,10 @@ export class WorkflowRunner {
       };
       logger.warn('Refusing to run: lease held elsewhere', { run_id: this.ctx.runId });
       this.stopped = stop;
+      // Tell the caller. The run row is deliberately left alone — the other
+      // executor owns it — but without an event the orchestrator's session
+      // never sees an exit and holds its concurrency slot forever.
+      this.emit({ type: 'run_failed', run_id: this.ctx.runId, error: stop.error });
       return stop;
     }
 
@@ -868,6 +889,13 @@ export class WorkflowRunner {
       const stop: RunnerStop = { kind: 'failed', error: `run loop failed: ${(err as Error).message}` };
       logger.error('Run loop threw', { run_id: this.ctx.runId, error: (err as Error).message });
       this.stopped = stop;
+      // Stop and drain before finalizing. The throw came from the loop, not
+      // from the nodes, so anything in flight is still running: finalizing
+      // now would resolve `done` as failed while nodes keep writing rows, and
+      // the orchestrator would free the slot and start the next run against a
+      // repository this one is still working in.
+      this.abort.abort();
+      await Promise.allSettled(inFlight.values());
       await this.finalize(stop).catch((e) =>
         logger.error('Could not finalize a failed run', {
           run_id: this.ctx.runId,
@@ -906,6 +934,11 @@ export class WorkflowRunner {
     } catch (err) {
       result = { status: 'failed', output: '', error: (err as Error).message };
     }
+
+    // A suspended node was not cancelled, it was interrupted. Recording an
+    // outcome here would hide it from recovery — which looks for `running`
+    // nodes — and an at_most_once node would then re-run unasked.
+    if (this.suspended) return;
 
     // A gate stops the whole run; it is not a node outcome.
     if (result.pause) {
@@ -966,6 +999,15 @@ export class WorkflowRunner {
   }
 
   private async finalize(stop: RunnerStop): Promise<void> {
+    // Suspended runs are deliberately left `running` and unsettled; see
+    // `suspend()`. The lease is dropped by run()'s finally.
+    if (this.suspended) {
+      logger.info('Run suspended for shutdown; leaving it for recovery', {
+        run_id: this.ctx.runId,
+      });
+      return;
+    }
+
     const now = new Date().toISOString();
     switch (stop.kind) {
       case 'succeeded':

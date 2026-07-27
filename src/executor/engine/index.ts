@@ -26,6 +26,7 @@ import { resolveWorkflow, workflowSearchPaths } from './registry.ts';
 import type { WorkflowDef } from './schema.ts';
 import {
   DEFAULT_RUNNER_CONFIG,
+  LEASE_OWNER,
   WorkflowRunner,
   type PendingDecision,
   type RunnerConfig,
@@ -81,7 +82,7 @@ export class GaggleExecutor implements WorkflowExecutor {
   private readonly extraWorkflowDirs: string[];
   private readonly bashPath?: string;
   /** Live runners, so cancel can reach an in-flight run. */
-  private readonly active = new Map<string, WorkflowRunner>();
+  private readonly active = new Map<string, { runner: WorkflowRunner; done: Promise<void> }>();
 
   constructor(opts: GaggleExecutorOptions) {
     this.store = opts.store;
@@ -292,7 +293,6 @@ export class GaggleExecutor implements WorkflowExecutor {
   }
 
   private launch(runId: string, runner: WorkflowRunner): RunHandle {
-    this.active.set(runId, runner);
     const done = runner
       .run()
       .then(() => undefined)
@@ -302,6 +302,7 @@ export class GaggleExecutor implements WorkflowExecutor {
       .finally(() => {
         this.active.delete(runId);
       });
+    this.active.set(runId, { runner, done });
 
     return {
       run_id: runId,
@@ -390,10 +391,42 @@ export class GaggleExecutor implements WorkflowExecutor {
 
   // ── termination ───────────────────────────────────────────────────────────
 
+  /**
+   * Stop every run this process is driving, and make sure the database says so.
+   *
+   * Exiting without this leaves rows `running` under a lease that stays live
+   * for its full TTL. Startup recovery only looks for runs whose lease has
+   * *lapsed*, and only at startup — so a restart inside that window walks
+   * straight past them and nothing picks them up afterwards either.
+   *
+   * The runs are suspended rather than cancelled: a restart should not throw
+   * away work, and leaving the row `running` with no lease is exactly what
+   * recovery is looking for.
+   */
+  async shutdown(timeoutMs = 15_000): Promise<void> {
+    const entries = [...this.active.entries()];
+    if (entries.length === 0) return;
+
+    logger.info('Suspending in-flight runs', { count: entries.length });
+    for (const [, e] of entries) e.runner.suspend();
+    await Promise.race([
+      Promise.allSettled(entries.map(([, e]) => e.done)),
+      Bun.sleep(timeoutMs),
+    ]);
+
+    // A run that would not unwind in time must still lose its lease, or it
+    // stays invisible to recovery for the rest of the TTL.
+    for (const [id] of entries) {
+      if (!this.active.has(id)) continue;
+      logger.warn('Run did not unwind in time; releasing its lease anyway', { run_id: id });
+      await this.store.releaseLease(id, LEASE_OWNER).catch(() => {});
+    }
+  }
+
   async cancel(runId: string, reason = 'cancelled'): Promise<void> {
-    const runner = this.active.get(runId);
-    if (runner) {
-      runner.cancel(reason);
+    const entry = this.active.get(runId);
+    if (entry) {
+      entry.runner.cancel(reason);
       return;
     }
     // Not running here — record the intent so the row stops looking alive.

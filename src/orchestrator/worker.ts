@@ -165,7 +165,9 @@ export async function spawnWorker(args: WorkerStartArgs, cb: WorkerCallbacks): P
     return { cancel: () => {}, done: Promise.resolve() };
   }
 
-  cb.onRunId?.(handle.run_id);
+  // The run id reaches the caller through the `run_started` event, which
+  // `toWorkerCallbacks` turns into onRunId. Announcing it here as well fired
+  // the callback twice for one run.
 
   // Run the after_run hook upon completion (best-effort).
   void handle.done.then(async () => {

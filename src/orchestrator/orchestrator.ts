@@ -109,6 +109,8 @@ export class Orchestrator {
   private tickTimer: ReturnType<typeof setTimeout> | null = null;
   private stopped = false;
   private analyzing = new Set<string>();
+  /** Live pollers by worker key, so attaching twice cannot leak one. */
+  private pollers = new Map<string, { run_id: string; stop: () => void }>();
 
   constructor(deps: OrchestratorDeps) {
     this.cfg = deps.cfg;
@@ -295,11 +297,14 @@ export class Orchestrator {
     for (const [, session] of this.state.running) {
       try {
         session.stopPoller?.();
-        session.cancel?.();
       } catch {
         /* ignore */
       }
     }
+    // Awaited, not fired and forgotten: the runs hold database leases, and
+    // the process exits the moment this returns. `shutdown` suspends them so
+    // a restart resumes the work instead of abandoning it.
+    await this.executor.shutdown();
   }
 
   private scheduleTick(delayMs: number): void {
@@ -945,6 +950,14 @@ export class Orchestrator {
     attempt: number | null,
     initialDelayMs?: number,
   ): void {
+    // Attaching twice for one run would double every gate comment and leak
+    // the first poller, because the session only ever holds the newest
+    // `stopPoller`. Callers legitimately arrive here more than once: a resumed
+    // run emits `run_started` again.
+    const current = this.pollers.get(key);
+    if (current?.run_id === runId) return;
+    current?.stop();
+
     const poller = new RunPoller(
       this.executorClient,
       runId,
@@ -1012,8 +1025,13 @@ export class Orchestrator {
       },
     );
 
+    const stop = () => {
+      this.pollers.delete(key);
+      poller.stop();
+    };
+    this.pollers.set(key, { run_id: runId, stop });
     const session = this.state.running.get(key);
-    if (session) session.stopPoller = () => poller.stop();
+    if (session) session.stopPoller = stop;
 
     poller.start();
   }
