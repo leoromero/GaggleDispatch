@@ -604,7 +604,7 @@ been applied to any database outside the test one.
 **Known collision:** another branch has its own `control_plane` migration
 (version 100) and its own `scaffold_jobs` table, with a `workspace` column this
 one does not have. The two need reconciling before both land. The conformance
-suite now uses a dedicated `gaggle_exec_test` database so they stop colliding
+suite shares `gaggle_test` with the control plane's; the branches' schemas were merged, so the collision that forced them apart is gone
 during development.
 
 
